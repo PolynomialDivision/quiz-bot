@@ -4,6 +4,7 @@
 //! exhausted, then resets the token automatically.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -11,6 +12,29 @@ use crate::{BotContext, state::FetchedQuestion};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
 const API_URL:   &str = "https://opentdb.com/api.php";
+
+/// Category groups for balanced random selection.
+///
+/// A random group is picked first, then a random category within it.
+/// This prevents over-represented super-categories (Entertainment has 9
+/// sub-categories; without grouping it would be chosen ~37% of the time).
+///
+/// Each group has equal probability; sub-categories within a group have
+/// equal probability among themselves.
+const CATEGORY_GROUPS: &[&[u32]] = &[
+    &[9],                              // General Knowledge
+    &[10, 11, 12, 13, 14, 15, 16, 29, 31, 32], // Entertainment (all variants)
+    &[17, 18, 19, 30],                 // Science & Technology
+    &[20],                             // Mythology
+    &[21],                             // Sports
+    &[22],                             // Geography
+    &[23],                             // History
+    &[24],                             // Politics
+    &[25],                             // Art
+    &[26],                             // Celebrities
+    &[27],                             // Animals
+    &[28],                             // Vehicles
+];
 
 // ── OpenTDB response shapes ───────────────────────────────────────────────────
 
@@ -99,12 +123,19 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     for attempt in 0u8..2 {
         let token = ensure_token(ctx).await?;
 
+        // Use the configured category if set; otherwise pick a random group
+        // then a random sub-category within it.  Two-level selection gives
+        // each thematic group equal probability regardless of how many
+        // sub-categories it contains.
+        let category: u32 = trivia.category.unwrap_or_else(|| {
+            let mut rng = rand::thread_rng();
+            let group = CATEGORY_GROUPS.choose(&mut rng).expect("non-empty");
+            *group.choose(&mut rng).expect("non-empty")
+        });
+
         let mut url = format!(
-            "{API_URL}?amount={amount}&type=multiple&encode=base64&token={token}"
+            "{API_URL}?amount={amount}&type=multiple&encode=base64&token={token}&category={category}"
         );
-        if let Some(cat) = trivia.category {
-            url.push_str(&format!("&category={cat}"));
-        }
         if let Some(diff) = &trivia.difficulty {
             url.push_str(&format!("&difficulty={diff}"));
         }
@@ -130,7 +161,7 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 state.cached_questions.extend(questions);
                 state.save(&ctx.state_path).await?;
                 let total = state.cached_questions.len();
-                info!("Prefetched {n} questions from OpenTDB ({total} in cache)");
+                info!("Prefetched {n} questions from OpenTDB category {category} ({total} in cache)");
                 return Ok(n);
             }
             4 if attempt == 0 => {
@@ -146,35 +177,191 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     anyhow::bail!("OpenTDB prefetch failed after token reset")
 }
 
-/// Pop the next question from the cache, fetching a fresh batch if empty.
-/// Also triggers a background refill when the cache runs low.
-pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> {
-    // Pop from cache
-    let question = {
-        let mut state = ctx.state.lock().await;
-        state.cached_questions.pop_front()
-    };
+/// Pick `n` category IDs from distinct groups.
+/// Groups are shuffled; if n > num_groups we wrap around (some groups used twice).
+fn pick_round_categories(n: usize) -> Vec<u32> {
+    let mut rng = rand::thread_rng();
+    let mut groups: Vec<&[u32]> = CATEGORY_GROUPS.to_vec();
+    groups.shuffle(&mut rng);
+    groups
+        .iter()
+        .cycle()
+        .take(n)
+        .map(|g| *g.choose(&mut rng).unwrap())
+        .collect()
+}
 
-    if let Some(q) = question {
-        // If the cache is getting low, refill in the background.
-        let remaining = ctx.state.lock().await.cached_questions.len();
-        if remaining < 3 {
-            let ctx2 = ctx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = prefetch(&ctx2).await {
-                    warn!("Background prefetch failed: {e}");
+/// Fetch exactly one question from a specific OpenTDB category, skipping
+/// already-asked questions.  Does not touch the shared cache.
+async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQuestion> {
+    const MAX_SKIP: usize = 5;
+    let difficulty = ctx.config.trivia.difficulty.clone();
+
+    for attempt in 0..=MAX_SKIP {
+        // At most one token-reset per call.
+        for token_try in 0u8..2 {
+            let token = ensure_token(ctx).await?;
+            let mut url = format!(
+                "{API_URL}?amount=1&type=multiple&encode=base64&token={token}&category={category}"
+            );
+            if let Some(ref diff) = difficulty {
+                url.push_str(&format!("&difficulty={diff}"));
+            }
+
+            let resp: ApiResponse = reqwest::get(&url).await?.json().await?;
+            match resp.response_code {
+                0 => {
+                    if let Some(q) = resp.results.unwrap_or_default().into_iter().next() {
+                        let fetched = FetchedQuestion {
+                            category:          decode(&q.category),
+                            difficulty:        decode(&q.difficulty),
+                            question:          decode(&q.question),
+                            correct_answer:    decode(&q.correct_answer),
+                            incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
+                        };
+                        let already_asked =
+                            ctx.db.question_exists(&fetched.question).await.unwrap_or(false);
+                        if !already_asked || attempt == MAX_SKIP {
+                            if attempt == MAX_SKIP && already_asked {
+                                warn!("Reusing duplicate question for category {category} — pool may be exhausted");
+                            }
+                            return Ok(fetched);
+                        }
+                        // Duplicate — retry with the same category.
+                        break;
+                    }
+                    anyhow::bail!("OpenTDB returned empty results for category {category}");
                 }
-            });
+                4 if token_try == 0 => {
+                    warn!("OpenTDB token exhausted while fetching category {category}, resetting");
+                    reset_token(ctx, &token).await?;
+                    let mut state = ctx.state.lock().await;
+                    state.opentdb_token = None;
+                    state.save(&ctx.state_path).await?;
+                }
+                4 => anyhow::bail!("OpenTDB token still exhausted after reset"),
+                5 => anyhow::bail!("OpenTDB rate-limited"),
+                c => anyhow::bail!("OpenTDB API error (code {c})"),
+            }
         }
-        return Ok(q);
+        if attempt < MAX_SKIP {
+            info!("Skipping duplicate for category {category} ({}/{})", attempt + 1, MAX_SKIP);
+        }
+    }
+    unreachable!()
+}
+
+/// Pre-fetch one question per category for an upcoming round.
+///
+/// Categories are drawn from distinct groups so every question in the round
+/// comes from a different thematic area.  All API calls happen here, before
+/// the round starts, so there are no delays between questions.
+///
+/// Falls back to the generic cache path for any category that fails.
+pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQuestion> {
+    // If a category is locked in config, use that for every question and rely
+    // on the old next_question path (no per-category pre-fetch needed).
+    if ctx.config.trivia.category.is_some() {
+        let mut questions = Vec::with_capacity(n);
+        for _ in 0..n {
+            match next_question(ctx).await {
+                Ok(q)  => questions.push(q),
+                Err(e) => { warn!("next_question fallback failed: {e}"); break; }
+            }
+        }
+        return questions;
     }
 
-    // Cache was empty — fetch synchronously.
-    prefetch(ctx).await?;
-    ctx.state
-        .lock()
-        .await
-        .cached_questions
-        .pop_front()
-        .ok_or_else(|| anyhow::anyhow!("OpenTDB returned no questions"))
+    let categories = pick_round_categories(n);
+    info!(
+        "Pre-fetching {} round questions from categories: {:?}",
+        n, categories
+    );
+
+    // OpenTDB enforces ~1 request per 5 s per IP (response_code 5).
+    // We wait between calls so we don't get rate-limited mid-prefetch.
+    const RATE_LIMIT_SECS: u64 = 6;
+
+    let mut questions = Vec::with_capacity(n);
+    for (i, category) in categories.into_iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(RATE_LIMIT_SECS)).await;
+        }
+        match fetch_one(ctx, category).await {
+            Ok(q) => {
+                info!("Round question ready: category {category} (\"{}\")", q.category);
+                questions.push(q);
+            }
+            Err(e) => {
+                warn!("fetch_one failed for category {category}: {e} — falling back to cache");
+                match next_question(ctx).await {
+                    Ok(q)  => questions.push(q),
+                    Err(e2) => warn!("Cache fallback also failed: {e2}"),
+                }
+            }
+        }
+    }
+    questions
+}
+
+/// Pop the next question from the cache, skipping any already asked in a
+/// previous round.  Fetches a fresh batch if the cache runs empty.
+///
+/// After MAX_SKIP consecutive duplicates we give up deduplication and return
+/// the next available question — this prevents an infinite loop when the entire
+/// OpenTDB pool has been exhausted.
+pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> {
+    const MAX_SKIP: usize = 30;
+
+    for attempt in 0..=MAX_SKIP {
+        // Ensure the cache has at least one item.
+        {
+            let is_empty = ctx.state.lock().await.cached_questions.is_empty();
+            if is_empty {
+                prefetch(ctx).await?;
+            }
+        }
+
+        let q = ctx.state
+            .lock()
+            .await
+            .cached_questions
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("OpenTDB returned no questions"))?;
+
+        // Trigger a background refill when the cache is getting low.
+        {
+            let remaining = ctx.state.lock().await.cached_questions.len();
+            if remaining < 3 {
+                let ctx2 = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = prefetch(&ctx2).await {
+                        warn!("Background prefetch failed: {e}");
+                    }
+                });
+            }
+        }
+
+        // Check whether this question has already been asked in a past round.
+        let already_asked = ctx.db.question_exists(&q.question).await.unwrap_or(false);
+        if !already_asked {
+            return Ok(q);
+        }
+
+        if attempt == MAX_SKIP {
+            // Entire reachable pool seems exhausted — reuse rather than hang.
+            warn!(
+                "Skipped {MAX_SKIP} duplicate questions — \
+                 OpenTDB pool may be exhausted, reusing a question."
+            );
+            return Ok(q);
+        }
+
+        info!(
+            "Skipping already-asked question ({}/{MAX_SKIP})",
+            attempt + 1
+        );
+    }
+
+    unreachable!()
 }

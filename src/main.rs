@@ -26,6 +26,7 @@ use tracing::{error, info, warn};
 
 mod commands;
 mod config;
+mod db;
 mod fetcher;
 mod format;
 mod quiz;
@@ -35,8 +36,6 @@ mod state;
 use config::Config;
 use state::State;
 
-/// Wrap a reply in an `m.thread` relation.  Any `@user:server` patterns in
-/// `text` are automatically converted to Matrix mention pills.
 fn thread_reply(text: &str, root: OwnedEventId) -> RoomMessageEventContent {
     let mut content = format::mentionify(text);
     content.relates_to = Some(Relation::Thread(Thread::reply(root.clone(), root)));
@@ -50,10 +49,9 @@ pub struct BotContext {
     pub config:      Arc<Config>,
     pub admin_users: HashSet<OwnedUserId>,
     pub room_id:     OwnedRoomId,
-    /// Shared in-memory state for the currently running quiz round.
     pub active_quiz: Arc<Mutex<Option<quiz::ActiveQuiz>>>,
-    /// Matrix client — needed by commands that spawn a quiz task.
     pub client:      Client,
+    pub db:          Arc<db::Db>,
 }
 
 #[tokio::main]
@@ -80,14 +78,18 @@ async fn main() -> Result<()> {
     );
     tokio::fs::create_dir_all(&store_path).await?;
 
+    // ── Database (SQLite, lives in store dir) ────────────────────────────────
+    let db = db::Db::open(&store_path.join("quiz.db")).await?;
+    db.migrate().await?;
+    let db = Arc::new(db);
+
+    // ── State (operational, non-analytics data) ───────────────────────────────
     let state_path = store_path.join("state.json");
     let mut st = State::load(&state_path).await?;
-
     if st.created_at.is_none() {
         st.created_at = Some(chrono::Utc::now());
         st.save(&state_path).await?;
     }
-
     let state = Arc::new(Mutex::new(st));
 
     let admin_users: HashSet<OwnedUserId> = config.security.admin_users
@@ -111,7 +113,6 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // BotContext (client filled in after build_and_restore)
     let ctx = BotContext {
         state,
         state_path,
@@ -120,6 +121,7 @@ async fn main() -> Result<()> {
         room_id:     room_id.clone(),
         active_quiz: Arc::new(Mutex::new(None)),
         client:      client.clone(),
+        db,
     };
 
     // ── Invite handler ────────────────────────────────────────────────────────
@@ -169,13 +171,12 @@ async fn main() -> Result<()> {
                 let body = text.body.trim();
                 if !body.starts_with('!') { return; }
 
-                // Stay in an existing thread if the command was sent inside one.
                 let thread_root = match &ev.content.relates_to {
                     Some(Relation::Thread(t)) => t.event_id.clone(),
                     _                         => ev.event_id.clone(),
                 };
 
-                // ── Quiz answer shorthand (!a / !b / !c / !d) ────────────────
+                // Quiz answer shorthand: !a / !b / !c / !d
                 let answer_index: Option<u8> = match body.to_lowercase().as_str() {
                     "!a" => Some(0),
                     "!b" => Some(1),
@@ -187,12 +188,12 @@ async fn main() -> Result<()> {
                     let user = ev.sender.as_str().to_owned();
                     let mut aq = ctx.active_quiz.lock().await;
                     if let Some(quiz) = aq.as_mut() {
-                        quiz.answers.insert(user, choice_index);
+                        quiz.record_answer(user, choice_index, "text");
                     }
                     return;
                 }
 
-                // ── Regular bot commands ──────────────────────────────────────
+                // Regular commands.
                 match commands::handle(&ctx, &ev.sender, body).await {
                     Ok(Some(reply)) => {
                         if let Some(r) = client.get_room(&ctx.room_id) {
@@ -204,9 +205,7 @@ async fn main() -> Result<()> {
                             r.send(thread_reply(
                                 "❌ This command requires admin privileges.",
                                 thread_root,
-                            ))
-                            .await
-                            .ok();
+                            )).await.ok();
                         }
                     }
                     Ok(None) => {}
@@ -228,13 +227,8 @@ async fn main() -> Result<()> {
                 if room.state() != RoomState::Joined { return; }
                 if room.room_id() != ctx.room_id     { return; }
 
-                // Map the reaction emoji to a choice index.
                 let choice_index = match ev.content.relates_to.key.as_str() {
-                    "🇦" => 0u8,
-                    "🇧" => 1,
-                    "🇨" => 2,
-                    "🇩" => 3,
-                    _    => return, // unrelated reaction
+                    "🇦" => 0u8, "🇧" => 1, "🇨" => 2, "🇩" => 3, _ => return,
                 };
 
                 let reacted_to = ev.content.relates_to.event_id.as_str().to_owned();
@@ -243,7 +237,7 @@ async fn main() -> Result<()> {
                 let mut aq = ctx.active_quiz.lock().await;
                 if let Some(quiz) = aq.as_mut() {
                     if quiz.event_id.as_str() == reacted_to {
-                        quiz.answers.insert(user, choice_index);
+                        quiz.record_answer(user, choice_index, "reaction");
                     }
                 }
             }
@@ -278,10 +272,8 @@ async fn main() -> Result<()> {
         .context("Initial sync failed")?;
     info!("Initial sync complete");
 
-    // ── Scheduler ─────────────────────────────────────────────────────────────
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
-    // ── Continuous sync ───────────────────────────────────────────────────────
     loop {
         match client.sync(SyncSettings::default()).await {
             Ok(()) => warn!("Sync loop exited — reconnecting"),

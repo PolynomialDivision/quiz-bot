@@ -53,3 +53,6 @@ timezone = "Europe/Berlin"
 
 # How many questions to fetch per API call (1–50, default 10).
 batch_size = 10
+
+# Data is stored in SQLite at $STORE_PATH/quiz.db — no separate database
+# process or configuration required.
