@@ -174,10 +174,15 @@ async fn reconcile_reactions(
     }
 
     if query_succeeded {
-        // Server is the complete truth — replace in-memory state entirely.
+        // Server reactions are the ground truth for anyone who reacted.
+        // For users who answered via !a/!b/!c/!d text but did not react,
+        // keep their in-memory answer so text-based votes are not lost.
+        for (user, choice) in answers.iter() {
+            server_answers.entry(user.clone()).or_insert(*choice);
+        }
         *answers = server_answers;
     }
-    // If query failed, answers is unchanged (in-memory fallback).
+    // If query failed entirely, answers is unchanged (in-memory fallback).
 }
 
 // ── Quiz runner ───────────────────────────────────────────────────────────────
