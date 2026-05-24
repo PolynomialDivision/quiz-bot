@@ -1,0 +1,55 @@
+[matrix]
+homeserver    = "https://matrix.example.org"
+user_id       = "@quizbot:example.org"
+access_token  = "syt_REPLACE_ME"
+device_id     = "REPLACE_ME"
+# recovery_key = "OPTIONAL RECOVERY KEY"
+
+[security]
+# Only these users may invite the bot to rooms.
+allowed_inviters = ["@admin:example.org"]
+# Only these users may run admin commands (!startquiz, !prefetch).
+admin_users = ["@admin:example.org"]
+# encryption_strategy = "identity_based"  # AllDevices | IdentityBased (default) | OnlyTrusted
+
+[schedule]
+# Matrix room where all quiz messages and bot replies are posted.
+room_id = "!REPLACE_ME:example.org"
+
+# Times to post the daily quiz (HH:MM, in the configured timezone).
+# Add multiple entries to run more than one quiz per day.
+quiz_times = ["18:00"]
+# quiz_times = ["12:00", "18:00", "21:30"]
+
+# How many questions per quiz round (default 5).
+questions_per_round = 5
+
+# How long (seconds) to collect reactions per question.
+answer_timeout_secs = 60
+
+# Pause in seconds between questions (default 10).
+inter_question_secs = 10
+
+# Seconds before quiz_hour:quiz_minute to post a "starting soon" reminder.
+# The scheduler fires this early and sleeps before posting the first question.
+# Set to 0 to disable.  Default: 300 (5 minutes).
+reminder_before_secs = 300
+
+# IANA timezone for quiz scheduling.
+timezone = "Europe/Berlin"
+
+[trivia]
+# Questions are fetched automatically from https://opentdb.com/ — no manual
+# setup needed.  The bot pre-caches batches of questions and uses a session
+# token to avoid repeats until the full pool is exhausted.
+
+# Optional: restrict to a specific category.
+# See https://opentdb.com/api_category.php for IDs.
+# category = 9    # General Knowledge
+# category = 18   # Science: Computers
+
+# Optional: restrict difficulty.  One of: easy, medium, hard.
+# difficulty = "medium"
+
+# How many questions to fetch per API call (1–50, default 10).
+batch_size = 10

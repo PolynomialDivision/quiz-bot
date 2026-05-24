@@ -1,0 +1,24 @@
+[package]
+name        = "quiz-bot"
+version     = "0.1.0"
+edition     = "2021"
+
+[[bin]]
+name = "quiz-bot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow             = "1"
+base64             = "0.22"
+chrono             = { version = "0.4", features = ["serde"] }
+chrono-tz          = "0.9"
+mxbot-common       = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+matrix-sdk         = { version = "0.17", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+rand               = "0.8"
+reqwest            = { version = "0.13", features = ["json"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tokio              = { version = "1", features = ["full"] }
+toml               = "0.8"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
