@@ -17,6 +17,8 @@ use tracing::{error, info, warn};
 
 use crate::{BotContext, fetcher, state};
 
+use matrix_sdk::ruma::events::Mentions;
+
 /// Look up the display names of `user_ids` from room state.
 /// Falls back to the localpart when no display name is set.
 async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
@@ -215,11 +217,18 @@ pub async fn start_quiz(
         } else {
             format!("{} seconds", reminder_secs)
         };
-        room.send(RoomMessageEventContent::text_plain(&format!(
-            "🧠 Quiz starting in {time_str}!  Get ready — {n_questions} questions incoming.",
-        )))
-        .await
-        .ok();
+        let qs = if n_questions == 1 { "question" } else { "questions" };
+        let plain = format!(
+            "🧠 Quiz starting in {time_str}! @room\nGet ready — {n_questions} {qs} incoming.",
+        );
+        let html = format!(
+            "🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>Get ready — {n_questions} {qs} incoming.",
+        );
+        let mut mentions = Mentions::new();
+        mentions.room = true;
+        let content = RoomMessageEventContent::text_html(plain, html)
+            .add_mentions(mentions);
+        room.send(content).await.ok();
         tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
     }
 
