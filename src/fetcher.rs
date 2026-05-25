@@ -36,6 +36,40 @@ const CATEGORY_GROUPS: &[&[u32]] = &[
     &[28],                             // Vehicles
 ];
 
+// ── Resilient HTTP helper ─────────────────────────────────────────────────────
+
+/// GET `url`, parse as `ApiResponse`, retrying on network/parse errors.
+/// Gives up after `MAX_NET_RETRIES` attempts with exponential backoff.
+/// Response-code errors (e.g. rate-limit, bad token) are returned as-is
+/// for the caller to handle — only transport-level failures are retried here.
+async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
+    const MAX_NET_RETRIES: u32 = 5;
+    let mut last_err = anyhow::anyhow!("no attempts made");
+
+    for attempt in 0..MAX_NET_RETRIES {
+        if attempt > 0 {
+            let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s, 8 s, 16 s
+            warn!("OpenTDB: network retry {attempt}/{MAX_NET_RETRIES} in {delay}s");
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        }
+        match reqwest::get(url).await {
+            Ok(resp) => match resp.json::<ApiResponse>().await {
+                Ok(api) => return Ok(api),
+                Err(e)  => {
+                    warn!("OpenTDB: response parse error: {e}");
+                    last_err = e.into();
+                }
+            },
+            Err(e) => {
+                warn!("OpenTDB: request error: {e}");
+                last_err = e.into();
+            }
+        }
+    }
+
+    Err(last_err.context(format!("OpenTDB unreachable after {MAX_NET_RETRIES} attempts")))
+}
+
 // ── OpenTDB response shapes ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -119,9 +153,20 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     let trivia = &ctx.config.trivia;
     let amount = trivia.batch_size.clamp(1, 50);
 
-    // At most one token reset retry — avoids infinite loops.
-    for attempt in 0u8..2 {
-        let token = ensure_token(ctx).await?;
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut token_refreshed = false;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s, 8 s, …
+            warn!("OpenTDB prefetch retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        }
+
+        let token = match ensure_token(ctx).await {
+            Ok(t)  => t,
+            Err(e) => { warn!("ensure_token failed: {e}"); continue; }
+        };
 
         // Use the configured category if set; otherwise pick a random group
         // then a random sub-category within it.  Two-level selection gives
@@ -140,7 +185,13 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
             url.push_str(&format!("&difficulty={diff}"));
         }
 
-        let resp: ApiResponse = reqwest::get(&url).await?.json().await?;
+        let resp = match api_get_with_retry(&url).await {
+            Ok(r)  => r,
+            Err(e) => {
+                warn!("OpenTDB prefetch network error (attempt {attempt}): {e}");
+                continue;
+            }
+        };
 
         match resp.response_code {
             0 => {
@@ -164,25 +215,29 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 info!("Prefetched {n} questions from OpenTDB category {category} ({total} in cache)");
                 return Ok(n);
             }
-            // Code 3: token expired after 6 h inactivity — request a fresh one.
-            3 if attempt == 0 => {
+            // Code 3: token expired after 6 h inactivity — clear it and retry.
+            3 if !token_refreshed => {
                 warn!("OpenTDB session token expired, requesting a new one");
                 let mut state = ctx.state.lock().await;
                 state.opentdb_token = None;
                 state.save(&ctx.state_path).await?;
+                token_refreshed = true;
             }
-            3 => anyhow::bail!("OpenTDB token still not found after refresh"),
+            3 => warn!("OpenTDB token still not found after refresh — retrying"),
             // Code 4: every question for the current query has been seen — reset.
-            4 if attempt == 0 => {
+            4 if !token_refreshed => {
                 warn!("OpenTDB token exhausted, resetting");
                 reset_token(ctx, &token).await?;
+                token_refreshed = true;
             }
-            5 => anyhow::bail!("OpenTDB rate-limited — wait a few seconds and try again"),
-            c => anyhow::bail!("OpenTDB API error (response_code {c})"),
+            4 => warn!("OpenTDB token still exhausted after reset — retrying"),
+            // Code 5: rate-limited — the backoff delay at loop top handles the wait.
+            5 => warn!("OpenTDB rate-limited — will retry after backoff"),
+            c => warn!("OpenTDB API error (response_code {c}) — retrying"),
         }
     }
 
-    anyhow::bail!("OpenTDB prefetch failed after token reset")
+    anyhow::bail!("OpenTDB prefetch failed after {MAX_ATTEMPTS} attempts")
 }
 
 /// Pick `n` category IDs from distinct groups.
@@ -205,67 +260,94 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
     const MAX_SKIP: usize = 5;
     let difficulty = ctx.config.trivia.difficulty.clone();
 
-    for attempt in 0..=MAX_SKIP {
-        // At most one token-reset per call.
-        for token_try in 0u8..2 {
-            let token = ensure_token(ctx).await?;
-            let mut url = format!(
-                "{API_URL}?amount=1&type=multiple&encode=base64&token={token}&category={category}"
-            );
-            if let Some(ref diff) = difficulty {
-                url.push_str(&format!("&difficulty={diff}"));
-            }
+    let mut token_refreshed = false;
 
-            let resp: ApiResponse = reqwest::get(&url).await?.json().await?;
-            match resp.response_code {
-                0 => {
-                    if let Some(q) = resp.results.unwrap_or_default().into_iter().next() {
-                        let fetched = FetchedQuestion {
-                            category:          decode(&q.category),
-                            difficulty:        decode(&q.difficulty),
-                            question:          decode(&q.question),
-                            correct_answer:    decode(&q.correct_answer),
-                            incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
-                        };
-                        let already_asked =
-                            ctx.db.question_exists(&fetched.question).await.unwrap_or(false);
-                        if !already_asked || attempt == MAX_SKIP {
-                            if attempt == MAX_SKIP && already_asked {
-                                warn!("Reusing duplicate question for category {category} — pool may be exhausted");
-                            }
-                            return Ok(fetched);
-                        }
-                        // Duplicate — retry with the same category.
-                        break;
-                    }
-                    anyhow::bail!("OpenTDB returned empty results for category {category}");
+    for attempt in 0..=MAX_SKIP {
+        // At most one token-reset per call; network errors get their own retry inside api_get_with_retry.
+        let token = match ensure_token(ctx).await {
+            Ok(t)  => t,
+            Err(e) => {
+                warn!("fetch_one: ensure_token failed (attempt {attempt}): {e}");
+                if attempt < MAX_SKIP {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
                 }
-                // Code 3: token expired after 6 h inactivity — clear it so
-                // ensure_token() will request a fresh one on the next try.
-                3 if token_try == 0 => {
-                    warn!("OpenTDB token not found (expired) for category {category}, refreshing");
-                    let mut state = ctx.state.lock().await;
-                    state.opentdb_token = None;
-                    state.save(&ctx.state_path).await?;
-                }
-                3 => anyhow::bail!("OpenTDB token not found even after refresh"),
-                4 if token_try == 0 => {
-                    warn!("OpenTDB token exhausted for category {category}, resetting");
-                    reset_token(ctx, &token).await?;
-                    let mut state = ctx.state.lock().await;
-                    state.opentdb_token = None;
-                    state.save(&ctx.state_path).await?;
-                }
-                4 => anyhow::bail!("OpenTDB token still exhausted after reset"),
-                5 => anyhow::bail!("OpenTDB rate-limited"),
-                c => anyhow::bail!("OpenTDB API error (code {c})"),
+                anyhow::bail!("ensure_token failed after all retries: {e}");
             }
+        };
+
+        let mut url = format!(
+            "{API_URL}?amount=1&type=multiple&encode=base64&token={token}&category={category}"
+        );
+        if let Some(ref diff) = difficulty {
+            url.push_str(&format!("&difficulty={diff}"));
         }
-        if attempt < MAX_SKIP {
-            info!("Skipping duplicate for category {category} ({}/{})", attempt + 1, MAX_SKIP);
+
+        let resp = match api_get_with_retry(&url).await {
+            Ok(r)  => r,
+            Err(e) => {
+                warn!("fetch_one: network error (attempt {attempt}): {e}");
+                if attempt < MAX_SKIP {
+                    continue;
+                }
+                anyhow::bail!("fetch_one network error after all retries: {e}");
+            }
+        };
+
+        match resp.response_code {
+            0 => {
+                if let Some(q) = resp.results.unwrap_or_default().into_iter().next() {
+                    let fetched = FetchedQuestion {
+                        category:          decode(&q.category),
+                        difficulty:        decode(&q.difficulty),
+                        question:          decode(&q.question),
+                        correct_answer:    decode(&q.correct_answer),
+                        incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
+                    };
+                    let already_asked =
+                        ctx.db.question_exists(&fetched.question).await.unwrap_or(false);
+                    if !already_asked || attempt == MAX_SKIP {
+                        if attempt == MAX_SKIP && already_asked {
+                            warn!("Reusing duplicate question for category {category} — pool may be exhausted");
+                        }
+                        return Ok(fetched);
+                    }
+                    // Duplicate — try again.
+                    info!("Skipping duplicate for category {category} ({}/{})", attempt + 1, MAX_SKIP);
+                    continue;
+                }
+                anyhow::bail!("OpenTDB returned empty results for category {category}");
+            }
+            // Code 3: token expired — clear and retry once.
+            3 if !token_refreshed => {
+                warn!("OpenTDB token not found (expired) for category {category}, refreshing");
+                let mut state = ctx.state.lock().await;
+                state.opentdb_token = None;
+                state.save(&ctx.state_path).await?;
+                token_refreshed = true;
+            }
+            3 => anyhow::bail!("OpenTDB token not found even after refresh"),
+            // Code 4: token exhausted — reset and retry once.
+            4 if !token_refreshed => {
+                warn!("OpenTDB token exhausted for category {category}, resetting");
+                reset_token(ctx, &token).await?;
+                let mut state = ctx.state.lock().await;
+                state.opentdb_token = None;
+                state.save(&ctx.state_path).await?;
+                token_refreshed = true;
+            }
+            4 => anyhow::bail!("OpenTDB token still exhausted after reset"),
+            // Code 5: rate-limited — wait and retry.
+            5 => {
+                warn!("OpenTDB rate-limited on category {category} — waiting 6s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+            }
+            c => {
+                warn!("OpenTDB API error (code {c}) for category {category} — retrying");
+            }
         }
     }
-    unreachable!()
+    anyhow::bail!("fetch_one failed after all retries for category {category}")
 }
 
 /// Pre-fetch one question per category for an upcoming round.

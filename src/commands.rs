@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Result};
+use chrono::Timelike as _;
+use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
 use tracing::error;
 
-use crate::{BotContext, fetcher};
+use crate::{BotContext, config::ScheduleConfig, fetcher, state::ScheduledOnce};
 
 pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     let cmd = body.split_whitespace().next().unwrap_or("").to_lowercase();
 
     match cmd.as_str() {
         "!startquiz"     => cmd_startquiz(ctx, sender).await,
+        "!schedulequiz"  => cmd_schedulequiz(ctx, sender, body).await,
+        "!cancelquiz"    => cmd_cancelquiz(ctx, sender, body).await,
         "!prefetch"      => cmd_prefetch(ctx, sender).await,
         "!resetstats"    => cmd_resetstats(ctx, sender, body).await,
         "!scores"
@@ -239,6 +243,132 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     Ok(Some(lines.join("\n")))
 }
 
+// ── !schedulequiz ─────────────────────────────────────────────────────────────
+
+async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+    require_admin(ctx, sender)?;
+
+    // Collect all tokens after the command name, stripping any surrounding quotes.
+    let time_arg = body
+        .splitn(2, char::is_whitespace)
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
+
+    if time_arg.is_empty() {
+        // Show pending one-time quizzes.
+        let entries = ctx.state.lock().await.scheduled_once.clone();
+        if entries.is_empty() {
+            return Ok(Some(
+                "No one-time quizzes scheduled.\n\
+                 Usage: !schedulequiz HH:MM".to_owned()
+            ));
+        }
+        let mut lines = vec!["📅 Pending one-time quizzes:".to_owned()];
+        for e in &entries {
+            lines.push(format!("  • {} on {}", e.quiz_time, e.date));
+        }
+        return Ok(Some(lines.join("\n")));
+    }
+
+    let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
+        Some(t) => t,
+        None    => return Ok(Some(format!(
+            "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !schedulequiz 21:00"
+        ))),
+    };
+
+    let tz: Tz     = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+    let local_now  = chrono::Utc::now().with_timezone(&tz);
+    let offset     = ctx.config.schedule.reminder_before_secs as i64;
+
+    let quiz_secs  = (qh * 3600 + qm * 60) as i64;
+    let fire_secs  = (quiz_secs - offset).rem_euclid(86400);
+    let now_secs   = (local_now.hour() * 3600
+        + local_now.minute() * 60
+        + local_now.second()) as i64;
+
+    // If the fire moment has already passed today, schedule for tomorrow.
+    let date = if now_secs >= fire_secs {
+        local_now.date_naive() + chrono::Duration::days(1)
+    } else {
+        local_now.date_naive()
+    };
+
+    let quiz_time = format!("{qh:02}:{qm:02}");
+    let entry     = ScheduledOnce { quiz_time: quiz_time.clone(), date };
+
+    {
+        let mut state = ctx.state.lock().await;
+        if state.scheduled_once.iter().any(|e| e.quiz_time == quiz_time && e.date == date) {
+            return Ok(Some(format!(
+                "⚠️ A quiz at {quiz_time} on {date} is already scheduled."
+            )));
+        }
+        state.scheduled_once.push(entry);
+        state.save(&ctx.state_path).await?;
+    }
+
+    let day_str   = if date == local_now.date_naive() { "today".to_owned() } else { "tomorrow".to_owned() };
+    let fire_hour = (fire_secs / 3600) as u32;
+    let fire_min  = ((fire_secs % 3600) / 60) as u32;
+
+    if offset > 0 {
+        Ok(Some(format!(
+            "✅ Quiz scheduled for {day_str} at {quiz_time} \
+             (reminder fires at {fire_hour:02}:{fire_min:02}).\n\
+             Cancel with: !cancelquiz {quiz_time}"
+        )))
+    } else {
+        Ok(Some(format!(
+            "✅ Quiz scheduled for {day_str} at {quiz_time}.\n\
+             Cancel with: !cancelquiz {quiz_time}"
+        )))
+    }
+}
+
+// ── !cancelquiz ───────────────────────────────────────────────────────────────
+
+async fn cmd_cancelquiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+    require_admin(ctx, sender)?;
+
+    let time_arg = body
+        .splitn(2, char::is_whitespace)
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
+
+    if time_arg.is_empty() {
+        return Ok(Some(
+            "Usage: !cancelquiz HH:MM\n\
+             See pending quizzes with: !schedulequiz".to_owned()
+        ));
+    }
+
+    let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
+        Some(t) => t,
+        None    => return Ok(Some(format!(
+            "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !cancelquiz 21:00"
+        ))),
+    };
+
+    let quiz_time = format!("{qh:02}:{qm:02}");
+
+    let mut state   = ctx.state.lock().await;
+    let before      = state.scheduled_once.len();
+    state.scheduled_once.retain(|e| e.quiz_time != quiz_time);
+    let removed     = before - state.scheduled_once.len();
+    state.save(&ctx.state_path).await?;
+
+    if removed == 0 {
+        Ok(Some(format!("⚠️ No scheduled quiz found for {quiz_time}.")))
+    } else {
+        Ok(Some(format!("✅ Cancelled {removed} quiz(zes) at {quiz_time}.")))
+    }
+}
+
 // ── !help ─────────────────────────────────────────────────────────────────────
 
 fn help_text() -> String {
@@ -251,7 +381,10 @@ fn help_text() -> String {
   !help                    — show this help
 
 Admin commands:
-  !startquiz               — start a quiz right now
+  !startquiz               — start a quiz right now (no reminder)
+  !schedulequiz HH:MM      — schedule a one-time quiz (with reminder)
+  !schedulequiz            — list pending one-time quizzes
+  !cancelquiz HH:MM        — cancel a pending one-time quiz
   !prefetch                — manually pre-fetch a question batch from OpenTDB
   !resetstats confirm      — wipe all quiz history and reset the leaderboard
 

@@ -3,6 +3,15 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, VecDeque}, path::Path};
 
+/// A one-time quiz scheduled via `!schedulequiz`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ScheduledOnce {
+    /// Quiz *start* time as "HH:MM" in the configured timezone.
+    pub quiz_time: String,
+    /// The calendar date on which this quiz should fire.
+    pub date: NaiveDate,
+}
+
 // ── Persistent state (operational, not analytics) ─────────────────────────────
 //
 // Analytics data lives in SQLite (quiz.db).  This file holds only the ephemeral
@@ -22,6 +31,10 @@ pub struct State {
     /// Per-slot last-fired date.  Key = "HH:MM" time string from config.
     #[serde(default)]
     pub last_quiz_dates: HashMap<String, NaiveDate>,
+    /// One-time quizzes added via `!schedulequiz`.
+    /// Entries are removed by the scheduler the moment they fire.
+    #[serde(default)]
+    pub scheduled_once: Vec<ScheduledOnce>,
 }
 
 /// A question as returned by the OpenTDB API (decoded).
