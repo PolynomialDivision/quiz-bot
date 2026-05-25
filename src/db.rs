@@ -22,6 +22,32 @@ pub struct LeaderboardEntry {
     pub total_correct:   i64,
     pub total_questions: i64,
     pub rounds_played:   i64,
+    /// Wilson score lower bound (95 % CI) — the sort key used by the leaderboard.
+    /// Ranges 0..1; penalises small sample sizes so occasional lucky players
+    /// don't outrank consistent regulars.
+    pub wilson_score:    f64,
+}
+
+// ── Wilson score ──────────────────────────────────────────────────────────────
+
+/// Lower bound of the Wilson score confidence interval for a binomial proportion.
+///
+/// Uses z = 1.96 (95 % confidence).  Returns 0 when `total == 0`.
+///
+/// Properties that make it fair for a game leaderboard:
+/// * 5/5  correct (100 %) → ~0.57   (small sample, low confidence)
+/// * 47/50 correct (94 %) → ~0.83   (large sample, high confidence)
+/// * 0/0  answered        →  0.00   (no data)
+pub fn wilson_lower_bound(correct: i64, total: i64) -> f64 {
+    if total == 0 { return 0.0; }
+    let n  = total   as f64;
+    let p  = correct as f64 / n;
+    let z  = 1.96_f64;
+    let z2 = z * z;
+    let centre_adj   = z2 / (2.0 * n);
+    let margin       = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
+    let denominator  = 1.0 + z2 / n;
+    (p + centre_adj - margin) / denominator
 }
 
 pub struct UserStatsRow {
@@ -377,7 +403,7 @@ impl Db {
 
 impl Db {
     pub async fn leaderboard(&self) -> Result<Vec<LeaderboardEntry>> {
-        self.run(|conn| {
+        let mut entries = self.run(|conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT
                      user_id,
@@ -385,25 +411,43 @@ impl Db {
                      SUM(total_count)   AS total_questions,
                      COUNT(*)           AS rounds_played
                  FROM round_scores
-                 GROUP BY user_id
-                 ORDER BY
-                     CAST(SUM(correct_count) AS REAL) / MAX(SUM(total_count), 1) DESC,
-                     SUM(correct_count) DESC,
-                     SUM(total_count)   DESC,
-                     user_id            ASC",
+                 GROUP BY user_id",
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok(LeaderboardEntry {
-                    user_id:         r.get(0)?,
-                    total_correct:   r.get(1)?,
-                    total_questions: r.get(2)?,
-                    rounds_played:   r.get(3)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| anyhow::anyhow!(e))
         })
-        .await
+        .await?;
+
+        // Compute Wilson score and sort in Rust — SQLite lacks sqrt() by default.
+        let mut result: Vec<LeaderboardEntry> = entries
+            .drain(..)
+            .map(|(user_id, correct, total, rounds)| LeaderboardEntry {
+                wilson_score:    wilson_lower_bound(correct, total),
+                user_id,
+                total_correct:   correct,
+                total_questions: total,
+                rounds_played:   rounds,
+            })
+            .collect();
+
+        result.sort_by(|a, b| {
+            b.wilson_score
+                .partial_cmp(&a.wilson_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Tie-break: more questions answered first, then alphabetical.
+                .then(b.total_questions.cmp(&a.total_questions))
+                .then(a.user_id.cmp(&b.user_id))
+        });
+
+        Ok(result)
     }
 
     pub async fn user_stats(&self, user_id: &str) -> Result<Option<UserStatsRow>> {

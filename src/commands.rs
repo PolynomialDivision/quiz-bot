@@ -122,8 +122,10 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         } else { 0 };
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {:>2}. {} — {}/{} correct ({}%)",
-            i + 1, entry.user_id, entry.total_correct, entry.total_questions, pct,
+            "{medal} {:>2}. {} — {}/{} correct ({}%, {} round(s), score {:.2})",
+            i + 1, entry.user_id,
+            entry.total_correct, entry.total_questions, pct,
+            entry.rounds_played, entry.wilson_score,
         ));
     }
     Ok(Some(lines.join("\n")))
