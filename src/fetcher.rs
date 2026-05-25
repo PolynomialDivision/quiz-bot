@@ -164,8 +164,16 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 info!("Prefetched {n} questions from OpenTDB category {category} ({total} in cache)");
                 return Ok(n);
             }
+            // Code 3: token expired after 6 h inactivity — request a fresh one.
+            3 if attempt == 0 => {
+                warn!("OpenTDB session token expired, requesting a new one");
+                let mut state = ctx.state.lock().await;
+                state.opentdb_token = None;
+                state.save(&ctx.state_path).await?;
+            }
+            3 => anyhow::bail!("OpenTDB token still not found after refresh"),
+            // Code 4: every question for the current query has been seen — reset.
             4 if attempt == 0 => {
-                // Token pool exhausted — reset and retry.
                 warn!("OpenTDB token exhausted, resetting");
                 reset_token(ctx, &token).await?;
             }
@@ -232,8 +240,17 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                     }
                     anyhow::bail!("OpenTDB returned empty results for category {category}");
                 }
+                // Code 3: token expired after 6 h inactivity — clear it so
+                // ensure_token() will request a fresh one on the next try.
+                3 if token_try == 0 => {
+                    warn!("OpenTDB token not found (expired) for category {category}, refreshing");
+                    let mut state = ctx.state.lock().await;
+                    state.opentdb_token = None;
+                    state.save(&ctx.state_path).await?;
+                }
+                3 => anyhow::bail!("OpenTDB token not found even after refresh"),
                 4 if token_try == 0 => {
-                    warn!("OpenTDB token exhausted while fetching category {category}, resetting");
+                    warn!("OpenTDB token exhausted for category {category}, resetting");
                     reset_token(ctx, &token).await?;
                     let mut state = ctx.state.lock().await;
                     state.opentdb_token = None;
