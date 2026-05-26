@@ -27,6 +27,7 @@ use tracing::{error, info, warn};
 mod commands;
 mod config;
 mod db;
+mod explainer;
 mod fetcher;
 mod format;
 mod quiz;

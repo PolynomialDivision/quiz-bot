@@ -9,6 +9,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub trivia: TriviaConfig,
+    #[serde(default)]
+    pub explainer: ExplainerConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -82,3 +84,14 @@ pub struct TriviaConfig {
 }
 
 fn default_batch_size() -> u32 { 10 }
+
+#[derive(Deserialize, Default)]
+pub struct ExplainerConfig {
+    /// Groq API key — leave empty to disable post-question explanations.
+    pub api_key: Option<String>,
+    /// Groq model to use for explanations (default: llama-3.3-70b-versatile).
+    #[serde(default = "default_explainer_model")]
+    pub model: String,
+}
+
+fn default_explainer_model() -> String { "llama-3.3-70b-versatile".to_owned() }

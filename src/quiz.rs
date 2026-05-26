@@ -7,8 +7,8 @@ use matrix_sdk::{
         OwnedEventId,
         events::{
             reaction::ReactionEventContent,
-            relation::Annotation,
-            room::message::{ReplacementMetadata, RoomMessageEventContent},
+            relation::{Annotation, Thread},
+            room::message::{ReplacementMetadata, Relation, RoomMessageEventContent},
         },
     },
 };
@@ -482,9 +482,33 @@ pub async fn start_quiz(
             if let Err(e) = ctx.db.update_display_names(&names).await {
                 warn!("DB update_display_names failed: {e}");
             }
-            room.send(crate::format::mentionify_with_names(
+            let send_result = room.send(crate::format::mentionify_with_names(
                 &result_lines.join("\n"), &names,
-            )).await.ok();
+            )).await;
+
+            // If configured, post a quiz explanation as a thread reply.
+            if let (Ok(resp), Some(api_key)) = (
+                send_result,
+                ctx.config.explainer.api_key.clone(),
+            ) {
+                let result_event_id = resp.response.event_id;
+                let model    = ctx.config.explainer.model.clone();
+                let question = fetched.question.clone();
+                let answer   = fetched.correct_answer.clone();
+                let room2    = room.clone();
+                tokio::spawn(async move {
+                    if let Some(explanation) =
+                        crate::explainer::explain(&question, &answer, &api_key, &model).await
+                    {
+                        let mut content = RoomMessageEventContent::text_plain(&explanation);
+                        content.relates_to = Some(Relation::Thread(Thread::reply(
+                            result_event_id.clone(),
+                            result_event_id,
+                        )));
+                        room2.send(content).await.ok();
+                    }
+                });
+            }
         }
 
         if q_num < n_questions {
