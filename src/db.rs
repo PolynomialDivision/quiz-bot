@@ -69,6 +69,12 @@ pub struct SpeedEntry {
     pub sample_count: i64,
 }
 
+/// Users who have 1–2 correct answers (below the 3-sample speed threshold).
+pub struct SpeedNearEntry {
+    pub user_id:      String,
+    pub correct_count: i64,
+}
+
 pub struct UserCategoryStat {
     pub category: String,
     pub answered: i64,
@@ -565,6 +571,31 @@ impl Db {
                     user_id:      r.get(0)?,
                     avg_secs:     r.get(1)?,
                     sample_count: r.get(2)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+    }
+
+    /// Users with 1 or 2 correct answers — close to the 3-sample speed threshold.
+    pub async fn speed_near_threshold(&self) -> Result<Vec<SpeedNearEntry>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT a.user_id, COUNT(*) AS correct_count
+                 FROM answers a
+                 JOIN questions q ON a.question_id = q.id
+                 WHERE a.is_correct = 1
+                   AND a.submitted_at > q.asked_at
+                 GROUP BY a.user_id
+                 HAVING COUNT(*) < 3
+                 ORDER BY correct_count DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(SpeedNearEntry {
+                    user_id:       r.get(0)?,
+                    correct_count: r.get(1)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()

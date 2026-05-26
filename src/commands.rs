@@ -332,7 +332,10 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
             return Ok(Some("❌ Could not read speed stats from database.".to_owned()));
         }
     };
-    if board.is_empty() {
+
+    let near = ctx.db.speed_near_threshold().await.unwrap_or_default();
+
+    if board.is_empty() && near.is_empty() {
         return Ok(Some(
             "Not enough data yet · min. 3 correct answers per player.".to_owned()
         ));
@@ -342,12 +345,29 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
         "⚡ **Speed** · correct answers · min. 3 samples".to_owned(),
         String::new(),
     ];
-    for (i, e) in board.iter().enumerate() {
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        lines.push(format!(
-            "{medal} {} · {:.1}s avg · {} correct",
-            e.user_id, e.avg_secs, e.sample_count,
-        ));
+
+    if board.is_empty() {
+        lines.push("No one has 3 correct answers yet.".to_owned());
+    } else {
+        for (i, e) in board.iter().enumerate() {
+            let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+            lines.push(format!(
+                "{medal} {} · {:.1}s avg · {} correct",
+                e.user_id, e.avg_secs, e.sample_count,
+            ));
+        }
+    }
+
+    if !near.is_empty() {
+        lines.push(String::new());
+        lines.push("Almost there:".to_owned());
+        for e in &near {
+            let needed = 3 - e.correct_count;
+            lines.push(format!(
+                "  {} · {} more correct answer{} needed",
+                e.user_id, needed, if needed == 1 { "" } else { "s" },
+            ));
+        }
     }
 
     Ok(Some(lines.join("\n")))

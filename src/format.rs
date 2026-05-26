@@ -44,6 +44,8 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
     let mut found    = false;   // true when HTML output differs from plain
     let mut in_bold  = false;
 
+    let mut in_strike = false;
+
     while pos < text.len() {
         // ── **bold** markers ──────────────────────────────────────────────────
         if text.as_bytes().get(pos) == Some(&b'*')
@@ -57,6 +59,21 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
             in_bold = !in_bold;
             found   = true;
             pos    += 2;
+            continue;
+        }
+
+        // ── ~~strikethrough~~ markers ─────────────────────────────────────────
+        if text.as_bytes().get(pos) == Some(&b'~')
+            && text.as_bytes().get(pos + 1) == Some(&b'~')
+        {
+            if in_strike {
+                html.push_str("</del>");
+            } else {
+                html.push_str("<del>");
+            }
+            in_strike = !in_strike;
+            found     = true;
+            pos      += 2;
             continue;
         }
 
@@ -97,10 +114,9 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         pos += ch.len_utf8();
     }
 
-    // Close any unclosed bold tag (shouldn't happen with well-formed input).
-    if in_bold {
-        html.push_str("</strong>");
-    }
+    // Close any unclosed tags (shouldn't happen with well-formed input).
+    if in_bold   { html.push_str("</strong>"); }
+    if in_strike { html.push_str("</del>"); }
 
     if found {
         RoomMessageEventContent::text_html(plain, html)
@@ -176,6 +192,16 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains("<strong>"), "html={html}");
         assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+    }
+
+    #[test]
+    fn strikethrough_becomes_del() {
+        let c = mentionify("✗ ~~Sports~~");
+        let (plain, html) = bodies(&c);
+        let html = html.expect("should have HTML body");
+        assert!(html.contains("<del>Sports</del>"), "html={html}");
+        assert!(!plain.contains('~'), "plain should not contain tildes, got: {plain}");
+        assert!(plain.contains("Sports"), "plain={plain}");
     }
 
     #[test]
