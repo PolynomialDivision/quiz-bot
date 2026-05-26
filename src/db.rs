@@ -128,6 +128,8 @@ impl Db {
         self.run(|conn| {
             conn.execute_batch(include_str!("../migrations/001_initial.sql"))
                 .context("Applying DB schema")?;
+            conn.execute_batch(include_str!("../migrations/002_fix_round_totals.sql"))
+                .context("Backfilling round_scores.total_count")?;
             Ok(())
         })
         .await?;
