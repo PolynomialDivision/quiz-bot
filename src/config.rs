@@ -72,6 +72,13 @@ pub struct TriviaConfig {
     /// How many questions to pre-fetch per API call (1–50, default 10).
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
+    /// Category groups to skip entirely.
+    /// Available names: "General Knowledge", "Entertainment", "Science & Technology",
+    /// "Mythology", "Sports", "Geography", "History", "Politics", "Art",
+    /// "Celebrities", "Animals", "Vehicles".
+    /// Matching is case-insensitive and ignores "&" vs "and".
+    #[serde(default)]
+    pub excluded_categories: Vec<String>,
 }
 
 fn default_batch_size() -> u32 { 10 }

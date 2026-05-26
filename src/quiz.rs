@@ -491,6 +491,14 @@ pub async fn start_quiz(
     }
 
     // ── Finalise round ────────────────────────────────────────────────────────
+
+    // Fix leaderboard totals: a user who only answered some questions still
+    // "played" the full round.  Set total_count = questions_asked for everyone
+    // so the leaderboard reflects questions-in-round, not questions-answered.
+    for entry in round_scores.values_mut() {
+        entry.1 = questions_asked;
+    }
+
     if let Err(e) = ctx.db.finish_round(round_id, questions_asked as i32).await {
         error!("DB finish_round failed: {e}");
     }

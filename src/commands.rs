@@ -19,6 +19,8 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
         | "!leaderboard" => cmd_scores(ctx).await,
         "!mystats"       => cmd_mystats(ctx, sender).await,
         "!categories"    => cmd_categories(ctx).await,
+        "!catconfig"     => cmd_catconfig(ctx).await,
+        "!gameinfo"      => cmd_gameinfo(ctx).await,
         "!fastest"       => cmd_fastest(ctx).await,
         "!help"          => Ok(Some(help_text())),
         _                => Ok(None),
@@ -214,6 +216,127 @@ async fn cmd_categories(ctx: &BotContext) -> Result<Option<String>> {
     Ok(Some(lines.join("\n")))
 }
 
+// ── !catconfig ────────────────────────────────────────────────────────────────
+
+async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
+    let excluded = &ctx.config.trivia.excluded_categories;
+    let excluded_norm: Vec<String> = excluded.iter().map(|s| fetcher::normalise(s)).collect();
+
+    let all_groups = fetcher::CATEGORY_GROUPS;
+    let all_excluded = excluded_norm.len() == all_groups.len(); // fallback guard
+
+    let mut lines = vec!["📚 Category configuration:".to_owned(), String::new()];
+
+    for (name, _) in all_groups {
+        let is_excluded = !all_excluded && excluded_norm.contains(&fetcher::normalise(name));
+        if is_excluded {
+            lines.push(format!("  ✗  ~~{name}~~"));
+        } else {
+            lines.push(format!("  ✓  {name}"));
+        }
+    }
+
+    if !excluded.is_empty() {
+        if all_excluded {
+            lines.push(String::new());
+            lines.push(
+                "⚠️ All groups are excluded — falling back to using all categories.".to_owned()
+            );
+        } else {
+            let active_count = all_groups.len() - excluded_norm.iter()
+                .filter(|e| all_groups.iter().any(|(n, _)| &fetcher::normalise(n) == *e))
+                .count();
+            lines.push(String::new());
+            lines.push(format!(
+                "{active_count}/{} groups active.",
+                all_groups.len()
+            ));
+        }
+    } else {
+        lines.push(String::new());
+        lines.push(format!("All {}/{} groups active — no exclusions configured.", all_groups.len(), all_groups.len()));
+    }
+
+    Ok(Some(lines.join("\n")))
+}
+
+// ── !gameinfo ─────────────────────────────────────────────────────────────────
+
+async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
+    let s  = &ctx.config.schedule;
+    let tz = &s.timezone;
+
+    // Daily schedule.
+    let times_str = if s.quiz_times.is_empty() {
+        "not scheduled".to_owned()
+    } else {
+        s.quiz_times.join(", ")
+    };
+
+    // Reminder line — only show if non-zero.
+    let reminder_line = if s.reminder_before_secs > 0 {
+        format!(
+            "\n  ⏰ **Reminder** fires {} before the quiz.",
+            format_duration(s.reminder_before_secs),
+        )
+    } else {
+        String::new()
+    };
+
+    // Category info.
+    let cat_line = match ctx.config.trivia.category {
+        Some(id) => format!("\n  🗂️ **Category** fixed to OpenTDB id {id}."),
+        None => {
+            let excluded = &ctx.config.trivia.excluded_categories;
+            if excluded.is_empty() {
+                "\n  🗂️ **Categories** all groups, chosen randomly each round.".to_owned()
+            } else {
+                format!(
+                    "\n  🗂️ **Categories** random, excluding: {}.",
+                    excluded.join(", "),
+                )
+            }
+        }
+    };
+
+    // Difficulty.
+    let diff_line = match &ctx.config.trivia.difficulty {
+        Some(d) => format!("\n  🎯 **Difficulty** {d}."),
+        None    => String::new(),
+    };
+
+    let msg = format!(
+        "🧠 **Quiz Bot — game info**\n\
+         \n\
+           🕐 **Daily quiz** at {times_str} ({tz}).{reminder_line}\n\
+         \n\
+           ❓ **{questions}** questions per round, **{timeout}** to answer each one.\
+         {cat_line}{diff_line}\n\
+         \n\
+         **How to answer:** react with 🇦 🇧 🇨 🇩 or type **!a** / **!b** / **!c** / **!d**.\n\
+         You can change your answer any time before the timer runs out.",
+        questions = s.questions_per_round,
+        timeout   = format_duration(s.answer_timeout_secs),
+    );
+
+    Ok(Some(msg))
+}
+
+/// Human-readable duration (e.g. "1h 30m", "45m", "30s").
+fn format_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    match (h, m, s) {
+        (h, 0, 0) if h > 0 => format!("{h}h"),
+        (0, m, 0) if m > 0 => format!("{m}m"),
+        (0, 0, s)           => format!("{s}s"),
+        (h, m, 0)           => format!("{h}h {m}m"),
+        (0, m, s)           => format!("{m}m {s}s"),
+        (h, m, s)           => format!("{h}h {m}m {s}s"),
+    }
+}
+
 // ── !fastest ──────────────────────────────────────────────────────────────────
 
 async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
@@ -378,7 +501,9 @@ fn help_text() -> String {
 
   !scores / !leaderboard   — show the ranking of all players
   !mystats                 — your personal score, rank and best/worst category
+  !gameinfo                — show schedule, round format and category settings
   !categories              — bar chart of every category asked with accuracy
+  !catconfig               — show which category groups are active / excluded
   !fastest                 — speed leaderboard (avg seconds to correct answer)
   !help                    — show this help
 

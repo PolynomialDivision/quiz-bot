@@ -21,20 +21,45 @@ const API_URL:   &str = "https://opentdb.com/api.php";
 ///
 /// Each group has equal probability; sub-categories within a group have
 /// equal probability among themselves.
-const CATEGORY_GROUPS: &[&[u32]] = &[
-    &[9],                              // General Knowledge
-    &[10, 11, 12, 13, 14, 15, 16, 29, 31, 32], // Entertainment (all variants)
-    &[17, 18, 19, 30],                 // Science & Technology
-    &[20],                             // Mythology
-    &[21],                             // Sports
-    &[22],                             // Geography
-    &[23],                             // History
-    &[24],                             // Politics
-    &[25],                             // Art
-    &[26],                             // Celebrities
-    &[27],                             // Animals
-    &[28],                             // Vehicles
+///
+/// The name field matches the `excluded_categories` config option
+/// (case-insensitive; "&" and "and" are treated as equivalent).
+pub const CATEGORY_GROUPS: &[(&str, &[u32])] = &[
+    ("General Knowledge",    &[9]),
+    ("Entertainment",        &[10, 11, 12, 13, 14, 15, 16, 29, 31, 32]),
+    ("Science & Technology", &[17, 18, 19, 30]),
+    ("Mythology",            &[20]),
+    ("Sports",               &[21]),
+    ("Geography",            &[22]),
+    ("History",              &[23]),
+    ("Politics",             &[24]),
+    ("Art",                  &[25]),
+    ("Celebrities",          &[26]),
+    ("Animals",              &[27]),
+    ("Vehicles",             &[28]),
 ];
+
+/// Normalise a category name for exclusion matching:
+/// lower-case and replace " & " with " and ".
+pub fn normalise(s: &str) -> String {
+    s.to_lowercase().replace(" & ", " and ")
+}
+
+/// Return the subset of `CATEGORY_GROUPS` not excluded by config.
+/// Falls back to all groups if every group is excluded (avoids an empty pool).
+pub fn active_groups<'a>(excluded: &[String]) -> Vec<(&'a str, &'a [u32])> {
+    let excluded_norm: Vec<String> = excluded.iter().map(|s| normalise(s)).collect();
+    let filtered: Vec<_> = CATEGORY_GROUPS
+        .iter()
+        .filter(|(name, _)| !excluded_norm.contains(&normalise(name)))
+        .copied()
+        .collect();
+    if filtered.is_empty() {
+        CATEGORY_GROUPS.to_vec()
+    } else {
+        filtered
+    }
+}
 
 // ── Resilient HTTP helper ─────────────────────────────────────────────────────
 
@@ -174,8 +199,9 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
         // sub-categories it contains.
         let category: u32 = trivia.category.unwrap_or_else(|| {
             let mut rng = rand::thread_rng();
-            let group = CATEGORY_GROUPS.choose(&mut rng).expect("non-empty");
-            *group.choose(&mut rng).expect("non-empty")
+            let groups = active_groups(&trivia.excluded_categories);
+            let (_, ids) = groups.choose(&mut rng).expect("non-empty");
+            *ids.choose(&mut rng).expect("non-empty")
         });
 
         let mut url = format!(
@@ -240,17 +266,17 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     anyhow::bail!("OpenTDB prefetch failed after {MAX_ATTEMPTS} attempts")
 }
 
-/// Pick `n` category IDs from distinct groups.
+/// Pick `n` category IDs from distinct groups, respecting exclusions.
 /// Groups are shuffled; if n > num_groups we wrap around (some groups used twice).
-fn pick_round_categories(n: usize) -> Vec<u32> {
+fn pick_round_categories(n: usize, excluded: &[String]) -> Vec<u32> {
     let mut rng = rand::thread_rng();
-    let mut groups: Vec<&[u32]> = CATEGORY_GROUPS.to_vec();
+    let mut groups = active_groups(excluded);
     groups.shuffle(&mut rng);
     groups
         .iter()
         .cycle()
         .take(n)
-        .map(|g| *g.choose(&mut rng).unwrap())
+        .map(|(_, ids)| *ids.choose(&mut rng).unwrap())
         .collect()
 }
 
@@ -371,7 +397,7 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         return questions;
     }
 
-    let categories = pick_round_categories(n);
+    let categories = pick_round_categories(n, &ctx.config.trivia.excluded_categories);
     info!(
         "Pre-fetching {} round questions from categories: {:?}",
         n, categories
