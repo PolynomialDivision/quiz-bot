@@ -338,9 +338,9 @@ pub async fn start_quiz(
         let (choices, correct_index) = shuffle_choices(&fetched);
 
         // ── Post question ─────────────────────────────────────────────────────
-        let mut q_content = RoomMessageEventContent::text_plain(
-            question_text(q_num, n_questions, &fetched, &choices, timeout, timeout),
-        );
+        let qt = question_text(q_num, n_questions, &fetched, &choices, timeout, timeout);
+        let initial_text = if q_num == 1 { format!("@room\n{qt}") } else { qt };
+        let mut q_content = RoomMessageEventContent::text_plain(initial_text);
         if q_num == 1 {
             let mut m = Mentions::new();
             m.room = true;
