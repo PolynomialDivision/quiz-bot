@@ -338,10 +338,16 @@ pub async fn start_quiz(
         let (choices, correct_index) = shuffle_choices(&fetched);
 
         // ── Post question ─────────────────────────────────────────────────────
+        let mut q_content = RoomMessageEventContent::text_plain(
+            question_text(q_num, n_questions, &fetched, &choices, timeout, timeout),
+        );
+        if q_num == 1 {
+            let mut m = Mentions::new();
+            m.room = true;
+            q_content = q_content.add_mentions(m);
+        }
         let resp = room
-            .send(RoomMessageEventContent::text_plain(
-                question_text(q_num, n_questions, &fetched, &choices, timeout, timeout),
-            ))
+            .send(q_content)
             .await
             .map_err(|e| anyhow::anyhow!("send question failed: {e}"))?;
         let q_event_id: OwnedEventId = resp.response.event_id;
