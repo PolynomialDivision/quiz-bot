@@ -110,7 +110,7 @@ fn question_text(
     let bar  = time_bar(remaining_secs, total_secs);
     let mut lines = vec![
         format!(
-            "❓ Question {q_num}/{n_questions}  {icon} {} · {}  — ⏳ {remaining_secs}s  {bar}",
+            "❓ Q{q_num}/{n_questions} | {icon} {} · {} | ⏳ {remaining_secs}s {bar}",
             fetched.difficulty, fetched.category,
         ),
         String::new(),
@@ -120,11 +120,7 @@ fn question_text(
     for (i, choice) in choices.iter().enumerate() {
         lines.push(format!("{}  {}", CHOICE_EMOJIS[i], choice));
     }
-    lines.push(String::new());
-    lines.push(format!(
-        "React with {} to answer!",
-        CHOICE_EMOJIS[..choices.len()].join("  "),
-    ));
+    // No "React with …" footer — the bot adds reactions directly so users just tap.
     lines.join("\n")
 }
 
@@ -275,8 +271,8 @@ pub async fn start_quiz(
             format!("{} seconds", reminder_secs)
         };
         let qs = if n_questions == 1 { "question" } else { "questions" };
-        let plain = format!("🧠 Quiz starting in {time_str}! @room\nGet ready — {n_questions} {qs} incoming.");
-        let html  = format!("🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>Get ready — {n_questions} {qs} incoming.");
+        let plain = format!("🧠 Quiz starting in {time_str}! @room\n{n_questions} {qs} incoming.");
+        let html  = format!("🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>{n_questions} {qs} incoming.");
         let mut mentions = Mentions::new();
         mentions.room = true;
         room.send(RoomMessageEventContent::text_html(plain, html).add_mentions(mentions))
@@ -329,7 +325,7 @@ pub async fn start_quiz(
             None => {
                 error!("Pre-fetched questions exhausted at question {q_num}");
                 room.send(RoomMessageEventContent::text_plain(
-                    "⚠️ Could not fetch a question from OpenTDB — ending round early.",
+                    "⚠️ Could not fetch question · ending round early.",
                 )).await.ok();
                 break;
             }
@@ -456,14 +452,14 @@ pub async fn start_quiz(
 
         // ── Result message ────────────────────────────────────────────────────
         let mut result_lines = vec![
-            format!("⏱️ Time's up! Correct answer: {correct_emoji} **{correct_text}**"),
+            format!("✅ {correct_emoji} **{correct_text}**"),
         ];
         if answers.is_empty() {
-            result_lines.push("No answers received.".to_owned());
+            result_lines.push("No answers.".to_owned());
         } else if correct_users.is_empty() {
             result_lines.push("Nobody got it right 😅".to_owned());
         } else {
-            result_lines.push(format!("🎉 Correct: {}", correct_users.join(", ")));
+            result_lines.push(format!("🎉 {}", correct_users.join(", ")));
         }
         if !wrong_users.is_empty() {
             let wrong_str = wrong_users.iter()
@@ -473,10 +469,10 @@ pub async fn start_quiz(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            result_lines.push(format!("❌ Wrong: {wrong_str}"));
+            result_lines.push(format!("❌ {wrong_str}"));
         }
         if q_num < n_questions {
-            result_lines.push(format!("⏸️ Next question in {inter_pause}s…"));
+            result_lines.push(format!("⏭️ Next in {inter_pause}s"));
         }
 
         let all_user_ids: Vec<String> = answers.keys().cloned().collect();
@@ -514,11 +510,11 @@ pub async fn start_quiz(
 
     // ── Round summary ─────────────────────────────────────────────────────────
     if n_questions > 1 {
-        let mut summary_lines = vec![format!("🏁 Round complete! {questions_asked} question{}", if questions_asked == 1 { "" } else { "s" })];
+        let mut summary_lines = vec![format!("🏁 Round done · {questions_asked} Qs")];
 
         if round_scores.is_empty() {
             summary_lines.push(String::new());
-            summary_lines.push("No correct answers this round.".to_owned());
+            summary_lines.push("Nobody got it right.".to_owned());
         } else {
             let mut podium: Vec<(&String, u32, u32)> = round_scores
                 .iter()
@@ -529,7 +525,7 @@ pub async fn start_quiz(
             summary_lines.push("🎯 This round:".to_owned());
             for (i, (user, correct, _)) in podium.iter().take(5).enumerate() {
                 let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "▪️" };
-                summary_lines.push(format!("{medal} {}. {} — {correct}/{questions_asked}", i + 1, user));
+                summary_lines.push(format!("{medal} {} · {correct}/{questions_asked}", user));
             }
         }
 
@@ -537,15 +533,15 @@ pub async fn start_quiz(
             Ok(board) if !board.is_empty() => {
                 let q_count = ctx.db.question_count().await.unwrap_or(0);
                 summary_lines.push(String::new());
-                summary_lines.push(format!("🏆 All-time leaderboard ({q_count} questions played):"));
+                summary_lines.push(format!("🏆 All-time · {q_count} Qs:"));
                 for (i, entry) in board.iter().take(5).enumerate() {
                     let pct   = if entry.total_questions > 0 {
                         (entry.total_correct * 100 / entry.total_questions) as u32
                     } else { 0 };
                     let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "▪️" };
                     summary_lines.push(format!(
-                        "{medal} {}. {} — {}/{} ({}%)",
-                        i + 1, entry.user_id, entry.total_correct, entry.total_questions, pct,
+                        "{medal} {} · {}/{} · {}%",
+                        entry.user_id, entry.total_correct, entry.total_questions, pct,
                     ));
                 }
 

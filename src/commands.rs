@@ -56,8 +56,8 @@ async fn cmd_startquiz(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<
     });
 
     Ok(Some(format!(
-        "🎯 Quiz starting!  You have {} seconds to answer.",
-        ctx.config.schedule.answer_timeout_secs,
+        "🎯 Quiz starting · {} per question",
+        format_duration(ctx.config.schedule.answer_timeout_secs),
     )))
 }
 
@@ -86,14 +86,14 @@ async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
     let confirmed = body.split_whitespace().nth(1).unwrap_or("") == "confirm";
     if !confirmed {
         return Ok(Some(
-            "⚠️ This will delete ALL quiz history — rounds, questions, answers, scores and players.\n\
-             To confirm: !resetstats confirm".to_owned()
+            "⚠️ Deletes ALL history: rounds, questions, answers, scores.\n\
+             Confirm: !resetstats confirm".to_owned()
         ));
     }
 
     match ctx.db.reset_stats().await {
         Ok(()) => Ok(Some(
-            "✅ All stats have been reset. Leaderboard and history wiped.".to_owned()
+            "✅ Stats reset · leaderboard and history wiped.".to_owned()
         )),
         Err(e) => {
             error!("reset_stats failed: {e}");
@@ -113,10 +113,10 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if board.is_empty() {
-        return Ok(Some("No scores yet — no quizzes have been played.".to_owned()));
+        return Ok(Some("No scores yet.".to_owned()));
     }
     let round_count = ctx.db.round_count().await.unwrap_or(0);
-    let mut lines = vec![format!("🏆 Leaderboard  ({} round(s) played)", round_count)];
+    let mut lines = vec![format!("🏆 **Leaderboard** · {} rounds", round_count)];
     lines.push(String::new());
     for (i, entry) in board.iter().enumerate() {
         let pct   = if entry.total_questions > 0 {
@@ -124,10 +124,10 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         } else { 0 };
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {:>2}. {} — {}/{} correct ({}%, {} round(s), score {:.2})",
-            i + 1, entry.user_id,
+            "{medal} {} · {}/{} · {}% · {} rounds",
+            entry.user_id,
             entry.total_correct, entry.total_questions, pct,
-            entry.rounds_played, entry.wilson_score,
+            entry.rounds_played,
         ));
     }
     Ok(Some(lines.join("\n")))
@@ -156,11 +156,11 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     let board = ctx.db.leaderboard().await.unwrap_or_default();
     let rank  = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
     let rank_str = rank
-        .map(|r| format!("  |  rank #{r} of {}", board.len()))
+        .map(|r| format!(" · rank #{r} of {}", board.len()))
         .unwrap_or_default();
 
     let mut lines = vec![format!(
-        "📊 Your stats: {}/{} correct ({}%)  |  {} round(s) played{rank_str}",
+        "📊 **Stats** · {}/{} · {}% · {} rounds{rank_str}",
         stats.total_correct, stats.total_questions, pct, stats.rounds_played,
     )];
 
@@ -171,7 +171,7 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         let worst = cat_stats.last().unwrap();
         let best_pct  = best.correct  * 100 / best.answered;
         let worst_pct = worst.correct * 100 / worst.answered;
-        lines.push(format!("🏆 Best:  {} ({}%)", best.category,  best_pct));
+        lines.push(format!("🏆 Best: {} ({}%)", best.category,  best_pct));
         lines.push(format!("😬 Worst: {} ({}%)", worst.category, worst_pct));
     }
 
@@ -196,7 +196,7 @@ async fn cmd_categories(ctx: &BotContext) -> Result<Option<String>> {
     let max_asked    = stats.iter().map(|s| s.questions_asked).max().unwrap_or(1);
 
     let mut lines = vec![
-        format!("📊 Categories  ({} questions asked)", total_q),
+        format!("📊 **Categories** · {} Qs asked", total_q),
         String::new(),
     ];
 
@@ -225,14 +225,14 @@ async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
     let all_groups = fetcher::CATEGORY_GROUPS;
     let all_excluded = excluded_norm.len() == all_groups.len(); // fallback guard
 
-    let mut lines = vec!["📚 Category configuration:".to_owned(), String::new()];
+    let mut lines = vec!["📚 **Categories**".to_owned(), String::new()];
 
     for (name, _) in all_groups {
         let is_excluded = !all_excluded && excluded_norm.contains(&fetcher::normalise(name));
         if is_excluded {
-            lines.push(format!("  ✗  ~~{name}~~"));
+            lines.push(format!("✗ ~~{name}~~"));
         } else {
-            lines.push(format!("  ✓  {name}"));
+            lines.push(format!("✓ {name}"));
         }
     }
 
@@ -240,21 +240,18 @@ async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
         if all_excluded {
             lines.push(String::new());
             lines.push(
-                "⚠️ All groups are excluded — falling back to using all categories.".to_owned()
+                "⚠️ All groups excluded · using all categories.".to_owned()
             );
         } else {
             let active_count = all_groups.len() - excluded_norm.iter()
                 .filter(|e| all_groups.iter().any(|(n, _)| &fetcher::normalise(n) == *e))
                 .count();
             lines.push(String::new());
-            lines.push(format!(
-                "{active_count}/{} groups active.",
-                all_groups.len()
-            ));
+            lines.push(format!("{active_count}/{} active.", all_groups.len()));
         }
     } else {
         lines.push(String::new());
-        lines.push(format!("All {}/{} groups active — no exclusions configured.", all_groups.len(), all_groups.len()));
+        lines.push(format!("All {}/{} active.", all_groups.len(), all_groups.len()));
     }
 
     Ok(Some(lines.join("\n")))
@@ -263,63 +260,51 @@ async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
 // ── !gameinfo ─────────────────────────────────────────────────────────────────
 
 async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
-    let s  = &ctx.config.schedule;
-    let tz = &s.timezone;
+    let s = &ctx.config.schedule;
 
-    // Daily schedule.
     let times_str = if s.quiz_times.is_empty() {
         "not scheduled".to_owned()
     } else {
         s.quiz_times.join(", ")
     };
 
-    // Reminder line — only show if non-zero.
-    let reminder_line = if s.reminder_before_secs > 0 {
-        format!(
-            "\n  ⏰ **Reminder** fires {} before the quiz.",
-            format_duration(s.reminder_before_secs),
-        )
-    } else {
-        String::new()
-    };
+    let mut lines = vec![
+        "🧠 **Quiz Bot**".to_owned(),
+        String::new(),
+        format!("🕐 Daily at {} · {}", times_str, s.timezone),
+    ];
 
-    // Category info.
-    let cat_line = match ctx.config.trivia.category {
-        Some(id) => format!("\n  🗂️ **Category** fixed to OpenTDB id {id}."),
+    if s.reminder_before_secs > 0 {
+        lines.push(format!("⏰ Reminder {} before", format_duration(s.reminder_before_secs)));
+    }
+
+    lines.push(format!(
+        "❓ {} questions · {} each",
+        s.questions_per_round,
+        format_duration(s.answer_timeout_secs),
+    ));
+
+    match ctx.config.trivia.category {
+        Some(id) => lines.push(format!("🗂️ Fixed category (OpenTDB id {id})")),
         None => {
             let excluded = &ctx.config.trivia.excluded_categories;
             if excluded.is_empty() {
-                "\n  🗂️ **Categories** all groups, chosen randomly each round.".to_owned()
+                lines.push("🗂️ All categories · random".to_owned());
             } else {
-                format!(
-                    "\n  🗂️ **Categories** random, excluding: {}.",
-                    excluded.join(", "),
-                )
+                lines.push(format!("🗂️ Random · excluding: {}", excluded.join(", ")));
             }
         }
-    };
+    }
 
-    // Difficulty.
-    let diff_line = match &ctx.config.trivia.difficulty {
-        Some(d) => format!("\n  🎯 **Difficulty** {d}."),
-        None    => String::new(),
-    };
+    if let Some(d) = &ctx.config.trivia.difficulty {
+        lines.push(format!("🎯 Difficulty: {d}"));
+    }
 
-    let msg = format!(
-        "🧠 **Quiz Bot — game info**\n\
-         \n\
-           🕐 **Daily quiz** at {times_str} ({tz}).{reminder_line}\n\
-         \n\
-           ❓ **{questions}** questions per round, **{timeout}** to answer each one.\
-         {cat_line}{diff_line}\n\
-         \n\
-         **How to answer:** react with 🇦 🇧 🇨 🇩 or type **!a** / **!b** / **!c** / **!d**.\n\
-         You can change your answer any time before the timer runs out.",
-        questions = s.questions_per_round,
-        timeout   = format_duration(s.answer_timeout_secs),
-    );
+    lines.push(String::new());
+    lines.push("Answer: 🇦 🇧 🇨 🇩 · or type !a !b !c !d".to_owned());
+    lines.push("Change answer any time before the timer ends.".to_owned());
 
-    Ok(Some(msg))
+    Ok(Some(lines.join("\n")))
 }
 
 /// Human-readable duration (e.g. "1h 30m", "45m", "30s").
@@ -349,19 +334,19 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     };
     if board.is_empty() {
         return Ok(Some(
-            "Not enough data yet — need at least 3 correct answers per player.".to_owned()
+            "Not enough data yet · min. 3 correct answers per player.".to_owned()
         ));
     }
 
     let mut lines = vec![
-        "⚡ Speed Leaderboard  (correct answers only, min. 3 samples)".to_owned(),
+        "⚡ **Speed** · correct answers · min. 3 samples".to_owned(),
         String::new(),
     ];
     for (i, e) in board.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {:>2}. {} — avg {:.1}s  ({} correct answers)",
-            i + 1, e.user_id, e.avg_secs, e.sample_count,
+            "{medal} {} · {:.1}s avg · {} correct",
+            e.user_id, e.avg_secs, e.sample_count,
         ));
     }
 
@@ -386,13 +371,13 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
         let entries = ctx.state.lock().await.scheduled_once.clone();
         if entries.is_empty() {
             return Ok(Some(
-                "No one-time quizzes scheduled.\n\
+                "No quizzes scheduled.\n\
                  Usage: !schedulequiz HH:MM".to_owned()
             ));
         }
-        let mut lines = vec!["📅 Pending one-time quizzes:".to_owned()];
+        let mut lines = vec!["📅 Pending quizzes:".to_owned()];
         for e in &entries {
-            lines.push(format!("  • {} on {}", e.quiz_time, e.date));
+            lines.push(format!("• {} on {}", e.quiz_time, e.date));
         }
         return Ok(Some(lines.join("\n")));
     }
@@ -400,7 +385,7 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
     let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
         Some(t) => t,
         None    => return Ok(Some(format!(
-            "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !schedulequiz 21:00"
+            "❌ Invalid: \"{time_arg}\" · use HH:MM"
         ))),
     };
 
@@ -441,14 +426,13 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
 
     if offset > 0 {
         Ok(Some(format!(
-            "✅ Quiz scheduled for {day_str} at {quiz_time} \
-             (reminder fires at {fire_hour:02}:{fire_min:02}).\n\
-             Cancel with: !cancelquiz {quiz_time}"
+            "✅ Quiz {day_str} at {quiz_time} · reminder {fire_hour:02}:{fire_min:02}\n\
+             Cancel: !cancelquiz {quiz_time}"
         )))
     } else {
         Ok(Some(format!(
-            "✅ Quiz scheduled for {day_str} at {quiz_time}.\n\
-             Cancel with: !cancelquiz {quiz_time}"
+            "✅ Quiz {day_str} at {quiz_time}\n\
+             Cancel: !cancelquiz {quiz_time}"
         )))
     }
 }
@@ -468,14 +452,14 @@ async fn cmd_cancelquiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
     if time_arg.is_empty() {
         return Ok(Some(
             "Usage: !cancelquiz HH:MM\n\
-             See pending quizzes with: !schedulequiz".to_owned()
+             Pending: !schedulequiz".to_owned()
         ));
     }
 
     let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
         Some(t) => t,
         None    => return Ok(Some(format!(
-            "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !cancelquiz 21:00"
+            "❌ Invalid: \"{time_arg}\" · use HH:MM"
         ))),
     };
 
@@ -488,38 +472,34 @@ async fn cmd_cancelquiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
     state.save(&ctx.state_path).await?;
 
     if removed == 0 {
-        Ok(Some(format!("⚠️ No scheduled quiz found for {quiz_time}.")))
+        Ok(Some(format!("⚠️ No quiz scheduled for {quiz_time}.")))
     } else {
-        Ok(Some(format!("✅ Cancelled {removed} quiz(zes) at {quiz_time}.")))
+        Ok(Some(format!("✅ Cancelled quiz at {quiz_time}.")))
     }
 }
 
 // ── !help ─────────────────────────────────────────────────────────────────────
 
 fn help_text() -> String {
-    "🧠 Quiz Bot commands:
+    "🧠 **Quiz Bot**
 
-  !scores / !leaderboard   — show the ranking of all players
-  !mystats                 — your personal score, rank and best/worst category
-  !gameinfo                — show schedule, round format and category settings
-  !categories              — bar chart of every category asked with accuracy
-  !catconfig               — show which category groups are active / excluded
-  !fastest                 — speed leaderboard (avg seconds to correct answer)
-  !help                    — show this help
+!scores / !leaderboard · ranking
+!mystats · your stats + rank
+!gameinfo · schedule and format
+!categories · category breakdown
+!catconfig · active/excluded groups
+!fastest · speed leaderboard
+!help · this message
 
-Admin commands:
-  !startquiz               — start a quiz right now (no reminder)
-  !schedulequiz HH:MM      — schedule a one-time quiz (with reminder)
-  !schedulequiz            — list pending one-time quizzes
-  !cancelquiz HH:MM        — cancel a pending one-time quiz
-  !prefetch                — manually pre-fetch a question batch from OpenTDB
-  !resetstats confirm      — wipe all quiz history and reset the leaderboard
+**Admin:**
+!startquiz · start now
+!schedulequiz HH:MM · schedule once
+!schedulequiz · list pending
+!cancelquiz HH:MM · cancel
+!prefetch · pre-fetch questions
+!resetstats confirm · wipe all history
 
-During a quiz, submit your answer in either way:
-  • React with 🇦 🇧 🇨 🇩  (reaction is hidden immediately after)
-  • Type  !a  !b  !c  !d  (message is hidden immediately after)
-You can change your answer at any time before the timer runs out.
-
-Questions are sourced automatically from https://opentdb.com/."
+Answer: 🇦 🇧 🇨 🇩 · or type !a !b !c !d
+Change answer any time before the timer ends."
         .to_owned()
 }
