@@ -124,10 +124,10 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         } else { 0 };
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {} · {}/{} · {}% · {} rounds",
+            "{medal} {} · {}/{} ({}%) · ⭐{:.0}%",
             entry.user_id,
             entry.total_correct, entry.total_questions, pct,
-            entry.rounds_played,
+            entry.wilson_score * 100.0,
         ));
     }
     Ok(Some(lines.join("\n")))
@@ -153,26 +153,47 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         stats.total_correct * 100 / stats.total_questions
     } else { 0 };
 
-    let board = ctx.db.leaderboard().await.unwrap_or_default();
-    let rank  = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
+    // Leaderboard rank + Wilson score.
+    let board  = ctx.db.leaderboard().await.unwrap_or_default();
+    let me     = board.iter().find(|e| e.user_id == user);
+    let wilson = me.map(|e| e.wilson_score).unwrap_or(0.0);
+    let rank   = me.and_then(|e| board.iter().position(|x| x.user_id == e.user_id))
+                   .map(|i| i + 1);
     let rank_str = rank
         .map(|r| format!(" · rank #{r} of {}", board.len()))
         .unwrap_or_default();
 
+    // Header line.
     let mut lines = vec![format!(
-        "📊 **Stats** · {}/{} · {}% · {} rounds{rank_str}",
-        stats.total_correct, stats.total_questions, pct, stats.rounds_played,
+        "📊 **Your Stats**{rank_str}",
     )];
+    lines.push(format!(
+        "{}/{} ({}%) · ⭐{:.0}% · {} rounds",
+        stats.total_correct, stats.total_questions, pct,
+        wilson * 100.0,
+        stats.rounds_played,
+    ));
 
-    // Best / worst category (requires ≥ 2 answers per category).
+    // Speed.
+    let speed_board = ctx.db.speed_leaderboard().await.unwrap_or_default();
+    if let Ok(Some((avg_secs, _))) = ctx.db.user_speed(user).await {
+        let speed_rank = speed_board.iter().position(|e| e.user_id == user).map(|i| i + 1);
+        let rank_part  = speed_rank
+            .map(|r| format!(" · rank #{r} of {}", speed_board.len()))
+            .unwrap_or_default();
+        lines.push(format!("⚡ avg speed: {avg_secs:.1}s{rank_part}"));
+    }
+
+    // Per-category breakdown with colour dots (≥ 2 answers per category).
     let cat_stats = ctx.db.user_category_stats(user).await.unwrap_or_default();
-    if cat_stats.len() >= 2 {
-        let best  = cat_stats.first().unwrap();
-        let worst = cat_stats.last().unwrap();
-        let best_pct  = best.correct  * 100 / best.answered;
-        let worst_pct = worst.correct * 100 / worst.answered;
-        lines.push(format!("🏆 Best: {} ({}%)", best.category,  best_pct));
-        lines.push(format!("😬 Worst: {} ({}%)", worst.category, worst_pct));
+    if !cat_stats.is_empty() {
+        lines.push(String::new());
+        lines.push("📚 Categories:".to_owned());
+        for c in &cat_stats {
+            let cat_pct = c.correct * 100 / c.answered;
+            let dot = if cat_pct >= 70 { "🟢" } else if cat_pct >= 50 { "🟡" } else { "🔴" };
+            lines.push(format!("{dot} {} · {}/{} ({}%)", c.category, c.correct, c.answered, cat_pct));
+        }
     }
 
     Ok(Some(lines.join("\n")))

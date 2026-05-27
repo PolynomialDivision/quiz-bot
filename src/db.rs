@@ -632,6 +632,31 @@ impl Db {
         })
         .await
     }
+
+    /// Average seconds from question post to correct answer for a single user.
+    /// Returns `None` if the user has fewer than 3 correct answers with timing data.
+    pub async fn user_speed(&self, user_id: &str) -> Result<Option<(f64, i64)>> {
+        let user_id = user_id.to_owned();
+        self.run(move |conn| {
+            let result = conn.query_row(
+                "SELECT
+                     AVG((julianday(a.submitted_at) - julianday(q.asked_at)) * 86400.0),
+                     COUNT(*)
+                 FROM answers a
+                 JOIN questions q ON a.question_id = q.id
+                 WHERE a.user_id = ?1
+                   AND a.is_correct = 1
+                   AND a.submitted_at > q.asked_at",
+                params![user_id],
+                |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, i64>(1)?)),
+            )?;
+            match result {
+                (Some(avg), n) if n >= 3 => Ok(Some((avg, n))),
+                _ => Ok(None),
+            }
+        })
+        .await
+    }
 }
 
 // ── Reset ─────────────────────────────────────────────────────────────────────

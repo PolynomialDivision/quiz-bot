@@ -398,6 +398,10 @@ pub async fn start_quiz(
             )).await.ok();
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
+        room.send(make_edit(
+            q_event_id.clone(),
+            &question_text(q_num, n_questions, &fetched, &choices, timeout, 0),
+        )).await.ok();
 
         // Drain active quiz.
         let mut answers: HashMap<String, AnswerRecord> = {
@@ -607,8 +611,9 @@ pub async fn start_quiz(
                     } else { 0 };
                     let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "▪️" };
                     summary_lines.push(format!(
-                        "{medal} {} · {}/{} · {}%",
+                        "{medal} {} · {}/{} ({}%) · ⭐{:.0}%",
                         entry.user_id, entry.total_correct, entry.total_questions, pct,
+                        entry.wilson_score * 100.0,
                     ));
                 }
 
