@@ -16,9 +16,13 @@ IMAGE: <url>
 
 Rules for the IMAGE line:
 - The most important thing: the image must be the best possible illustration of the answer.
-- Only include a URL you are confident actually exists and is publicly accessible. \
-If you are not certain the URL is real, omit the IMAGE line — a missing image is better than a broken one.
-- Any source is fine: Wikimedia Commons, Wikipedia, news archives, museums, etc.
+- Only include a URL you are CERTAIN actually exists and is a real, accessible file. \
+A missing image is better than a broken link.
+- STRONGLY PREFER Wikimedia Commons page URLs in this exact format:
+    https://commons.wikimedia.org/wiki/File:Filename.jpg
+  These are resolved automatically and are the most reliable source.
+- Do NOT use thumbnail URLs (URLs containing /thumb/ in the path).
+- Do NOT use Wikipedia article page URLs (en.wikipedia.org/wiki/...) — those are not images.
 - Nothing may appear after the IMAGE line.";
 
 /// Fallback prompt used when image retrieval failed — text only, no IMAGE line.
@@ -35,6 +39,9 @@ const MAX_ATTEMPTS:    u32 = 3;
 const REQUEST_TIMEOUT: u64 = 30; // seconds for Groq API call
 const IMAGE_TIMEOUT:   u64 = 8;  // seconds for image validation / Commons API
 const FETCH_TIMEOUT:   u64 = 15; // seconds for image download
+
+// Wikimedia requires a descriptive User-Agent to avoid rate-limiting.
+const USER_AGENT: &str = "quiz-bot/1.0 (Matrix trivia quiz; https://matrix.org)";
 
 // ── Result type ───────────────────────────────────────────────────────────────
 
@@ -102,6 +109,24 @@ fn parse_response(raw: String) -> (String, Option<String>) {
 
 // ── Image URL resolution + validation ────────────────────────────────────────
 
+/// Convert a Wikimedia thumbnail URL to the original file URL.
+///
+/// `.../thumb/{a}/{ab}/{File.jpg}/{N}px-{File.jpg}` → `.../{ a}/{ab}/{File.jpg}`
+///
+/// The model frequently produces thumbnail paths that the upload server rejects
+/// (400). Stripping the thumbnail wrapper gives the direct original file URL.
+fn strip_wikimedia_thumbnail(url: &str) -> std::borrow::Cow<'_, str> {
+    if url.contains("upload.wikimedia.org") && url.contains("/thumb/") {
+        // Remove the "/thumb" component from the path.
+        let without_thumb = url.replace("/thumb/", "/");
+        // Drop the last path segment (the "{N}px-{filename}" thumbnail name).
+        if let Some(idx) = without_thumb.rfind('/') {
+            return without_thumb[..idx].to_owned().into();
+        }
+    }
+    url.into()
+}
+
 /// Resolve a Wikimedia Commons file page URL to a direct upload URL via the API.
 /// "https://commons.wikimedia.org/wiki/File:Foo.jpg"
 ///   → "https://upload.wikimedia.org/wikipedia/commons/…/Foo.jpg"
@@ -114,7 +139,7 @@ async fn resolve_commons_url(client: &reqwest::Client, url: &str) -> Option<Stri
 
     let resp: serde_json::Value = client
         .get(&api_url)
-        .header("User-Agent", "quiz-bot/1.0")
+        .header("User-Agent", USER_AGENT)
         .send()
         .await
         .map_err(|e| warn!("Explainer: Commons API request failed: {e}"))
@@ -142,6 +167,7 @@ async fn resolve_commons_url(client: &reqwest::Client, url: &str) -> Option<Stri
 
 /// Validate a raw image URL from the LLM and return a resolved direct URL, or None.
 ///
+/// - Wikimedia thumbnail URLs     → stripped to original file URL, then validated
 /// - Wikimedia Commons page URLs  → resolved via the Commons API
 /// - Everything else              → verified with a HEAD request (must be image/*)
 ///
@@ -149,26 +175,49 @@ async fn resolve_commons_url(client: &reqwest::Client, url: &str) -> Option<Stri
 async fn resolve_image_url(raw_url: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(IMAGE_TIMEOUT))
-        .user_agent("quiz-bot/1.0")
+        .user_agent(USER_AGENT)
         .build()
         .map_err(|e| warn!("Explainer: failed to build image client: {e}"))
         .ok()?;
 
-    if raw_url.contains("commons.wikimedia.org/wiki/") {
-        return resolve_commons_url(&client, raw_url).await;
+    // Strip thumbnail wrappers before any other processing.
+    let cow      = strip_wikimedia_thumbnail(raw_url);
+    let work_url = cow.as_ref();
+
+    if raw_url != work_url {
+        info!("Explainer: thumbnail URL normalised → {work_url}");
+    }
+
+    if work_url.contains("commons.wikimedia.org/wiki/") {
+        return resolve_commons_url(&client, work_url).await;
     }
 
     // HEAD request — fast check without downloading the full image.
-    let resp = match client.head(raw_url).send().await {
-        Ok(r)  => r,
-        Err(e) => {
-            warn!("Explainer: image HEAD request failed for {raw_url}: {e}");
-            return None;
+    // On 429 (rate-limit) wait briefly and retry once.
+    let resp = {
+        let r = client.head(work_url).send().await;
+        match r {
+            Ok(r) if r.status().as_u16() == 429 => {
+                warn!("Explainer: 429 rate-limit for {work_url} — retrying in 3s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                match client.head(work_url).send().await {
+                    Ok(r2) => r2,
+                    Err(e) => {
+                        warn!("Explainer: image HEAD retry failed for {work_url}: {e}");
+                        return None;
+                    }
+                }
+            }
+            Ok(r)  => r,
+            Err(e) => {
+                warn!("Explainer: image HEAD request failed for {work_url}: {e}");
+                return None;
+            }
         }
     };
 
     if !resp.status().is_success() {
-        warn!("Explainer: image URL returned {} for {raw_url}", resp.status());
+        warn!("Explainer: image URL returned {} for {work_url}", resp.status());
         return None;
     }
 
@@ -179,9 +228,9 @@ async fn resolve_image_url(raw_url: &str) -> Option<String> {
         .unwrap_or("");
 
     if ct.starts_with("image/") {
-        Some(raw_url.to_owned())
+        Some(work_url.to_owned())
     } else {
-        warn!("Explainer: image URL has non-image content-type {ct:?}: {raw_url}");
+        warn!("Explainer: image URL has non-image content-type {ct:?}: {work_url}");
         None
     }
 }
@@ -192,7 +241,7 @@ async fn resolve_image_url(raw_url: &str) -> Option<String> {
 pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT))
-        .user_agent("quiz-bot/1.0")
+        .user_agent(USER_AGENT)
         .build()
         .map_err(|e| warn!("Explainer: failed to build fetch client: {e}"))
         .ok()?;
