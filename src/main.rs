@@ -37,9 +37,18 @@ mod state;
 use config::Config;
 use state::State;
 
-fn thread_reply(text: &str, root: OwnedEventId) -> RoomMessageEventContent {
+/// Build a thread reply.
+/// `root`     — the thread root event (m.thread event_id).
+/// `reply_to` — the specific event being quoted (m.in_reply_to).
+///              Pass `ev.event_id` so the reply quotes the command message,
+///              not the thread root.
+fn thread_reply(
+    text:     &str,
+    root:     OwnedEventId,
+    reply_to: OwnedEventId,
+) -> RoomMessageEventContent {
     let mut content = format::mentionify(text);
-    content.relates_to = Some(Relation::Thread(Thread::reply(root.clone(), root)));
+    content.relates_to = Some(Relation::Thread(Thread::reply(root, reply_to)));
     content
 }
 
@@ -198,7 +207,7 @@ async fn main() -> Result<()> {
                 match commands::handle(&ctx, &ev.sender, body).await {
                     Ok(Some(reply)) => {
                         if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(&reply, thread_root)).await.ok();
+                            r.send(thread_reply(&reply, thread_root, ev.event_id.clone())).await.ok();
                         }
                     }
                     Err(e) if e.to_string() == "__not_admin__" => {
@@ -206,6 +215,7 @@ async fn main() -> Result<()> {
                             r.send(thread_reply(
                                 "❌ This command requires admin privileges.",
                                 thread_root,
+                                ev.event_id.clone(),
                             )).await.ok();
                         }
                     }

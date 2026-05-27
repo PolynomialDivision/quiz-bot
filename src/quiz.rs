@@ -4,11 +4,15 @@ use chrono_tz::Tz;
 use matrix_sdk::{
     Client, Room,
     ruma::{
+        UInt,
         OwnedEventId,
         events::{
             reaction::ReactionEventContent,
             relation::{Annotation, Thread},
-            room::message::{ReplacementMetadata, Relation, RoomMessageEventContent},
+            room::{
+                ImageInfo,
+                message::{ReplacementMetadata, Relation, RoomMessageEventContent},
+            },
         },
     },
 };
@@ -502,7 +506,8 @@ pub async fn start_quiz(
                         crate::explainer::explain(&question, &answer, &api_key, &model).await
                     else { return };
 
-                    // Upload and post the image first so it appears above the text.
+                    // Upload and post the image first (no quote box) so it
+                    // appears above the explanation text.
                     if let Some(img_url) = result.image_url {
                         if let Some((bytes, ct)) =
                             crate::explainer::fetch_image_bytes(&img_url).await
@@ -511,25 +516,34 @@ pub async fn start_quiz(
                                 ImageMessageEventContent, MessageType,
                             };
                             let mime: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
+                            let dims = crate::explainer::image_dimensions(&bytes);
                             if let Ok(upload) =
                                 client2.media().upload(&mime, bytes, None).await
                             {
-                                let mut img_msg = RoomMessageEventContent::new(
-                                    MessageType::Image(ImageMessageEventContent::plain(
-                                        String::new(),
-                                        upload.content_uri,
-                                    )),
+                                let mut img_content = ImageMessageEventContent::plain(
+                                    String::new(),
+                                    upload.content_uri,
                                 );
-                                img_msg.relates_to = Some(Relation::Thread(Thread::reply(
-                                    result_event_id.clone(),
-                                    result_event_id.clone(),
-                                )));
+                                if let Some((w, h)) = dims {
+                                    let mut info = ImageInfo::new();
+                                    info.width    = UInt::new(w as u64);
+                                    info.height   = UInt::new(h as u64);
+                                    info.mimetype = Some(ct);
+                                    img_content.info = Some(Box::new(info));
+                                }
+                                let mut img_msg = RoomMessageEventContent::new(
+                                    MessageType::Image(img_content),
+                                );
+                                // without_fallback → no quote box on the image
+                                img_msg.relates_to = Some(Relation::Thread(
+                                    Thread::without_fallback(result_event_id.clone()),
+                                ));
                                 room2.send(img_msg).await.ok();
                             }
                         }
                     }
 
-                    // Post the explanation text.
+                    // Post the explanation text as a reply (shows quote box).
                     let mut content = RoomMessageEventContent::text_plain(&result.text);
                     content.relates_to = Some(Relation::Thread(Thread::reply(
                         result_event_id.clone(),
