@@ -486,7 +486,7 @@ pub async fn start_quiz(
                 &result_lines.join("\n"), &names,
             )).await;
 
-            // If configured, post a quiz explanation as a thread reply.
+            // If configured, post a quiz explanation (+ image) as a thread reply.
             if let (Ok(resp), Some(api_key)) = (
                 send_result,
                 ctx.config.explainer.api_key.clone(),
@@ -496,17 +496,46 @@ pub async fn start_quiz(
                 let question = fetched.question.clone();
                 let answer   = fetched.correct_answer.clone();
                 let room2    = room.clone();
+                let client2  = client.clone();
                 tokio::spawn(async move {
-                    if let Some(explanation) =
+                    let Some(result) =
                         crate::explainer::explain(&question, &answer, &api_key, &model).await
-                    {
-                        let mut content = RoomMessageEventContent::text_plain(&explanation);
-                        content.relates_to = Some(Relation::Thread(Thread::reply(
-                            result_event_id.clone(),
-                            result_event_id,
-                        )));
-                        room2.send(content).await.ok();
+                    else { return };
+
+                    // Upload and post the image first so it appears above the text.
+                    if let Some(img_url) = result.image_url {
+                        if let Some((bytes, ct)) =
+                            crate::explainer::fetch_image_bytes(&img_url).await
+                        {
+                            use matrix_sdk::ruma::events::room::message::{
+                                ImageMessageEventContent, MessageType,
+                            };
+                            let mime: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
+                            if let Ok(upload) =
+                                client2.media().upload(&mime, bytes, None).await
+                            {
+                                let mut img_msg = RoomMessageEventContent::new(
+                                    MessageType::Image(ImageMessageEventContent::plain(
+                                        String::new(),
+                                        upload.content_uri,
+                                    )),
+                                );
+                                img_msg.relates_to = Some(Relation::Thread(Thread::reply(
+                                    result_event_id.clone(),
+                                    result_event_id.clone(),
+                                )));
+                                room2.send(img_msg).await.ok();
+                            }
+                        }
                     }
+
+                    // Post the explanation text.
+                    let mut content = RoomMessageEventContent::text_plain(&result.text);
+                    content.relates_to = Some(Relation::Thread(Thread::reply(
+                        result_event_id.clone(),
+                        result_event_id,
+                    )));
+                    room2.send(content).await.ok();
                 });
             }
         }

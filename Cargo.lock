@@ -2528,6 +2528,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "matrix-sdk",
+ "mime",
  "mxbot-common",
  "rand 0.8.6",
  "reqwest",
