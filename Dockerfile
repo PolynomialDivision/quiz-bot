@@ -27,7 +27,7 @@ COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=quiz-bot-target,target=/build/target \
-    cargo build --release --locked && \
+    cargo build --release && \
     cp target/release/quiz-bot /quiz-bot
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
