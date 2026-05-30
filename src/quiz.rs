@@ -558,12 +558,9 @@ pub async fn start_quiz(
                                 let mut img_msg = RoomMessageEventContent::new(
                                     MessageType::Image(img_content),
                                 );
-                                // Thread::reply adds m.in_reply_to which Element Web
-                                // requires to display the message in the thread panel.
-                                img_msg.relates_to = Some(Relation::Thread(Thread::reply(
-                                    result_event_id.clone(),
-                                    result_event_id.clone(),
-                                )));
+                                img_msg.relates_to = Some(Relation::Thread(
+                                    Thread::without_fallback(result_event_id.clone()),
+                                ));
                                 room2.send(img_msg).await.ok();
                             }
                         }
