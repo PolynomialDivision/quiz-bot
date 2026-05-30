@@ -96,6 +96,15 @@ fn difficulty_icon(d: &str) -> &'static str {
     match d { "easy" => "🟢", "medium" => "🟡", "hard" => "🔴", _ => "⚪" }
 }
 
+fn format_countdown(secs: u64) -> String {
+    let mins = secs / 60;
+    if mins >= 1 {
+        format!("{} minute{}", mins, if mins == 1 { "" } else { "s" })
+    } else {
+        format!("{} seconds", secs)
+    }
+}
+
 fn time_bar(remaining: u64, total: u64) -> String {
     const W: usize = 10;
     let filled = if total > 0 { (remaining * W as u64 / total) as usize } else { 0 };
@@ -244,7 +253,10 @@ pub async fn start_quiz(
     let n_questions   = ctx.config.schedule.questions_per_round.max(1);
     let timeout       = ctx.config.schedule.answer_timeout_secs;
     let inter_pause   = ctx.config.schedule.inter_question_secs;
-    let reminder_secs = ctx.config.schedule.reminder_before_secs;
+    // Reminders sorted descending so we fire the earliest one first.
+    let mut reminders = ctx.config.schedule.reminder_before_secs.clone();
+    reminders.sort_unstable_by(|a, b| b.cmp(a));
+    reminders.dedup();
 
     let room = match client.get_room(&ctx.room_id) {
         Some(r) => r,
@@ -266,23 +278,29 @@ pub async fn start_quiz(
         tokio::spawn(async move { fetcher::fetch_round_questions(&ctx2, n).await })
     };
 
-    // ── Reminder ──────────────────────────────────────────────────────────────
-    if !skip_reminder && reminder_secs > 0 {
-        let mins = reminder_secs / 60;
-        let time_str = if mins >= 1 {
-            format!("{} minute{}", mins, if mins == 1 { "" } else { "s" })
-        } else {
-            format!("{} seconds", reminder_secs)
-        };
+    // ── Reminders ─────────────────────────────────────────────────────────────
+    // reminders is sorted descending, e.g. [300, 60].
+    // We fire each one in order, sleeping the gap to the next, then sleeping
+    // the final interval to bring us exactly to quiz-start time.
+    if !skip_reminder && !reminders.is_empty() {
         let qs = if n_questions == 1 { "question" } else { "questions" };
-        let plain = format!("🧠 Quiz starting in {time_str}! @room\n{n_questions} {qs} incoming.");
-        let html  = format!("🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>{n_questions} {qs} incoming.");
-        let mut mentions = Mentions::new();
-        mentions.room = true;
-        room.send(RoomMessageEventContent::text_html(plain, html).add_mentions(mentions))
-            .await
-            .ok();
-        tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
+        for i in 0..reminders.len() {
+            let secs_before = reminders[i];
+            let time_str = format_countdown(secs_before);
+            let plain = format!("🧠 Quiz starting in {time_str}! @room\n{n_questions} {qs} incoming.");
+            let html  = format!("🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>{n_questions} {qs} incoming.");
+            let mut mentions = Mentions::new();
+            mentions.room = true;
+            room.send(RoomMessageEventContent::text_html(plain, html).add_mentions(mentions))
+                .await
+                .ok();
+            let sleep_secs = if i + 1 < reminders.len() {
+                reminders[i] - reminders[i + 1]  // gap to next reminder
+            } else {
+                reminders[i]                      // final wait until quiz starts
+            };
+            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+        }
     }
 
     // ── Mark today for this scheduler slot ────────────────────────────────────

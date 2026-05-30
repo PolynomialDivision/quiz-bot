@@ -30,10 +30,12 @@ answer_timeout_secs = 60
 # Pause in seconds between questions (default 10).
 inter_question_secs = 10
 
-# Seconds before quiz_hour:quiz_minute to post a "starting soon" reminder.
-# The scheduler fires this early and sleeps before posting the first question.
-# Set to 0 to disable.  Default: 300 (5 minutes).
-reminder_before_secs = 300
+# Reminders before the quiz: a list of seconds, each triggering a "starting
+# soon" message.  The scheduler wakes at the largest value; each reminder fires
+# in order with the appropriate gap between them.
+# Use a single value [300] for one reminder, or [300, 60] for two.
+# Set to [] or omit to disable.  Default: [300] (5 minutes).
+reminder_before_secs = [300, 60]
 
 # IANA timezone for quiz scheduling.
 timezone = "Europe/Berlin"

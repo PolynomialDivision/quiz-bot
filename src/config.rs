@@ -38,10 +38,13 @@ pub struct ScheduleConfig {
     /// Pause in seconds between questions.
     #[serde(default = "default_inter_question_secs")]
     pub inter_question_secs: u64,
-    /// Seconds before the quiz to post a "starting soon" reminder.
-    /// Set to 0 to disable. The scheduler fires this many seconds early.
-    #[serde(default = "default_reminder_before_secs")]
-    pub reminder_before_secs: u64,
+    /// Seconds before the quiz to post "starting soon" reminders.
+    /// Accepts a single integer (`300`) or a list (`[300, 60]`).
+    /// The list is sorted and each entry fires at that many seconds before
+    /// the quiz, with the largest value determining when the scheduler wakes.
+    /// Set to `0` or `[]` to disable.  Default: `[300]` (one reminder, 5 min).
+    #[serde(default = "default_reminder_before_secs", deserialize_with = "deserialize_reminders")]
+    pub reminder_before_secs: Vec<u64>,
     /// IANA timezone used for quiz scheduling (e.g. "Europe/Berlin").
     #[serde(default = "default_timezone")]
     pub timezone: String,
@@ -60,7 +63,35 @@ impl ScheduleConfig {
 fn default_answer_timeout() -> u64 { 60 }
 fn default_questions_per_round() -> u32 { 5 }
 fn default_inter_question_secs() -> u64 { 10 }
-fn default_reminder_before_secs() -> u64 { 300 }   // 5 minutes
+fn default_reminder_before_secs() -> Vec<u64> { vec![300] }
+
+/// Accepts either a bare integer (`300`) or an array (`[300, 60]`).
+fn deserialize_reminders<'de, D>(d: D) -> Result<Vec<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number or array of numbers")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Vec<u64>, E> {
+            Ok(if v == 0 { vec![] } else { vec![v] })
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Vec<u64>, E> {
+            Ok(if v <= 0 { vec![] } else { vec![v as u64] })
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u64>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(v) = seq.next_element::<u64>()? {
+                if v > 0 { out.push(v); }
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_any(V)
+}
 fn default_timezone() -> String { "UTC".to_owned() }
 
 #[derive(Deserialize, Default)]

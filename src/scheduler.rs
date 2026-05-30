@@ -23,7 +23,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let local_date = local_now.date_naive();
     let now_hour   = local_now.hour();
     let now_minute = local_now.minute();
-    let offset     = ctx.config.schedule.reminder_before_secs as i64;
+    let offset = ctx.config.schedule.reminder_before_secs.iter().copied().max().unwrap_or(0) as i64;
 
     for time_str in &ctx.config.schedule.quiz_times {
         let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_str) {

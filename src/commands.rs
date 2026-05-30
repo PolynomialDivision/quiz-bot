@@ -295,8 +295,11 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
         format!("🕐 Daily at {} · {}", times_str, s.timezone),
     ];
 
-    if s.reminder_before_secs > 0 {
-        lines.push(format!("⏰ Reminder {} before", format_duration(s.reminder_before_secs)));
+    if !s.reminder_before_secs.is_empty() {
+        let parts: Vec<String> = s.reminder_before_secs.iter()
+            .map(|&secs| format_duration(secs))
+            .collect();
+        lines.push(format!("⏰ Reminders: {} before", parts.join(", ")));
     }
 
     lines.push(format!(
@@ -432,7 +435,7 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
 
     let tz: Tz     = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
     let local_now  = chrono::Utc::now().with_timezone(&tz);
-    let offset     = ctx.config.schedule.reminder_before_secs as i64;
+    let offset     = ctx.config.schedule.reminder_before_secs.iter().copied().max().unwrap_or(0) as i64;
 
     let quiz_secs  = (qh * 3600 + qm * 60) as i64;
     let fire_secs  = (quiz_secs - offset).rem_euclid(86400);
