@@ -521,20 +521,22 @@ pub async fn start_quiz(
                             };
                             let mime: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
                             let dims = crate::explainer::image_dimensions(&bytes);
+                            let size = bytes.len();
                             if let Ok(upload) =
                                 client2.media().upload(&mime, bytes, None).await
                             {
                                 let mut img_content = ImageMessageEventContent::plain(
-                                    String::new(),
+                                    answer.clone(),
                                     upload.content_uri,
                                 );
+                                let mut info = ImageInfo::new();
+                                info.mimetype = Some(ct);
+                                info.size     = UInt::new(size as u64);
                                 if let Some((w, h)) = dims {
-                                    let mut info = ImageInfo::new();
-                                    info.width    = UInt::new(w as u64);
-                                    info.height   = UInt::new(h as u64);
-                                    info.mimetype = Some(ct);
-                                    img_content.info = Some(Box::new(info));
+                                    info.width  = UInt::new(w as u64);
+                                    info.height = UInt::new(h as u64);
                                 }
+                                img_content.info = Some(Box::new(info));
                                 let mut img_msg = RoomMessageEventContent::new(
                                     MessageType::Image(img_content),
                                 );
