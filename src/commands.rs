@@ -4,26 +4,25 @@ use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
 use tracing::error;
 
-use crate::{BotContext, config::ScheduleConfig, fetcher, state::ScheduledOnce};
+use crate::{config::ScheduleConfig, fetcher, state::ScheduledOnce, BotContext};
 
 pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     let cmd = body.split_whitespace().next().unwrap_or("").to_lowercase();
 
     match cmd.as_str() {
-        "!startquiz"     => cmd_startquiz(ctx, sender).await,
-        "!schedulequiz"  => cmd_schedulequiz(ctx, sender, body).await,
-        "!cancelquiz"    => cmd_cancelquiz(ctx, sender, body).await,
-        "!prefetch"      => cmd_prefetch(ctx, sender).await,
-        "!resetstats"    => cmd_resetstats(ctx, sender, body).await,
-        "!scores"
-        | "!leaderboard" => cmd_scores(ctx).await,
-        "!mystats"       => cmd_mystats(ctx, sender).await,
-        "!categories"    => cmd_categories(ctx).await,
-        "!catconfig"     => cmd_catconfig(ctx).await,
-        "!gameinfo"      => cmd_gameinfo(ctx).await,
-        "!fastest"       => cmd_fastest(ctx).await,
-        "!help"          => Ok(Some(help_text())),
-        _                => Ok(None),
+        "!startquiz" => cmd_startquiz(ctx, sender).await,
+        "!schedulequiz" => cmd_schedulequiz(ctx, sender, body).await,
+        "!cancelquiz" => cmd_cancelquiz(ctx, sender, body).await,
+        "!prefetch" => cmd_prefetch(ctx, sender).await,
+        "!resetstats" => cmd_resetstats(ctx, sender, body).await,
+        "!scores" | "!leaderboard" => cmd_scores(ctx).await,
+        "!mystats" => cmd_mystats(ctx, sender).await,
+        "!categories" => cmd_categories(ctx).await,
+        "!catconfig" => cmd_catconfig(ctx).await,
+        "!gameinfo" => cmd_gameinfo(ctx).await,
+        "!fastest" => cmd_fastest(ctx).await,
+        "!help" => Ok(Some(help_text())),
+        _ => Ok(None),
     }
 }
 
@@ -47,7 +46,7 @@ async fn cmd_startquiz(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<
         }
     }
 
-    let ctx2   = ctx.clone();
+    let ctx2 = ctx.clone();
     let client = ctx.client.clone();
     tokio::spawn(async move {
         if let Err(e) = crate::quiz::start_quiz(ctx2, client, true, None).await {
@@ -68,7 +67,7 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
 
     let cached_before = ctx.state.lock().await.cached_questions.len();
     match fetcher::prefetch(ctx).await {
-        Ok(n)  => {
+        Ok(n) => {
             let total = ctx.state.lock().await.cached_questions.len();
             Ok(Some(format!(
                 "✅ Fetched {n} questions from OpenTDB.  Cache: {cached_before} → {total}."
@@ -80,20 +79,25 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
 
 // ── !resetstats ───────────────────────────────────────────────────────────────
 
-async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_resetstats(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let confirmed = body.split_whitespace().nth(1).unwrap_or("") == "confirm";
     if !confirmed {
         return Ok(Some(
             "⚠️ Deletes ALL history: rounds, questions, answers, scores.\n\
-             Confirm: !resetstats confirm".to_owned()
+             Confirm: !resetstats confirm"
+                .to_owned(),
         ));
     }
 
     match ctx.db.reset_stats().await {
         Ok(()) => Ok(Some(
-            "✅ Stats reset · leaderboard and history wiped.".to_owned()
+            "✅ Stats reset · leaderboard and history wiped.".to_owned(),
         )),
         Err(e) => {
             error!("reset_stats failed: {e}");
@@ -106,10 +110,12 @@ async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
 
 async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
     let board = match ctx.db.leaderboard().await {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(e) => {
             error!("DB leaderboard error: {e}");
-            return Ok(Some("❌ Could not read leaderboard from database.".to_owned()));
+            return Ok(Some(
+                "❌ Could not read leaderboard from database.".to_owned(),
+            ));
         }
     };
     if board.is_empty() {
@@ -119,14 +125,23 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
     let mut lines = vec![format!("🏆 **Leaderboard** · {} rounds", round_count)];
     lines.push(String::new());
     for (i, entry) in board.iter().enumerate() {
-        let pct   = if entry.total_questions > 0 {
+        let pct = if entry.total_questions > 0 {
             entry.total_correct * 100 / entry.total_questions
-        } else { 0 };
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+        } else {
+            0
+        };
+        let medal = match i {
+            0 => "🥇",
+            1 => "🥈",
+            2 => "🥉",
+            _ => "  ",
+        };
         lines.push(format!(
             "{medal} {} · {}/{} ({}%) · ⭐{:.0}%",
             entry.user_id,
-            entry.total_correct, entry.total_questions, pct,
+            entry.total_correct,
+            entry.total_questions,
+            pct,
             entry.wilson_score * 100.0,
         ));
     }
@@ -143,33 +158,38 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
             error!("DB user_stats error: {e}");
             return Ok(Some("❌ Could not read stats from database.".to_owned()));
         }
-        Ok(None) => return Ok(Some(
-            "You haven't answered any quiz questions yet.".to_owned()
-        )),
+        Ok(None) => {
+            return Ok(Some(
+                "You haven't answered any quiz questions yet.".to_owned(),
+            ))
+        }
         Ok(Some(s)) => s,
     };
 
     let pct = if stats.total_questions > 0 {
         stats.total_correct * 100 / stats.total_questions
-    } else { 0 };
+    } else {
+        0
+    };
 
     // Leaderboard rank + Wilson score.
-    let board  = ctx.db.leaderboard().await.unwrap_or_default();
-    let me     = board.iter().find(|e| e.user_id == user);
+    let board = ctx.db.leaderboard().await.unwrap_or_default();
+    let me = board.iter().find(|e| e.user_id == user);
     let wilson = me.map(|e| e.wilson_score).unwrap_or(0.0);
-    let rank   = me.and_then(|e| board.iter().position(|x| x.user_id == e.user_id))
-                   .map(|i| i + 1);
+    let rank = me
+        .and_then(|e| board.iter().position(|x| x.user_id == e.user_id))
+        .map(|i| i + 1);
     let rank_str = rank
         .map(|r| format!(" · rank #{r} of {}", board.len()))
         .unwrap_or_default();
 
     // Header line.
-    let mut lines = vec![format!(
-        "📊 **Your Stats**{rank_str}",
-    )];
+    let mut lines = vec![format!("📊 **Your Stats**{rank_str}",)];
     lines.push(format!(
         "{}/{} ({}%) · ⭐{:.0}% · {} rounds",
-        stats.total_correct, stats.total_questions, pct,
+        stats.total_correct,
+        stats.total_questions,
+        pct,
         wilson * 100.0,
         stats.rounds_played,
     ));
@@ -177,8 +197,11 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     // Speed.
     let speed_board = ctx.db.speed_leaderboard().await.unwrap_or_default();
     if let Ok(Some((avg_secs, _))) = ctx.db.user_speed(user).await {
-        let speed_rank = speed_board.iter().position(|e| e.user_id == user).map(|i| i + 1);
-        let rank_part  = speed_rank
+        let speed_rank = speed_board
+            .iter()
+            .position(|e| e.user_id == user)
+            .map(|i| i + 1);
+        let rank_part = speed_rank
             .map(|r| format!(" · rank #{r} of {}", speed_board.len()))
             .unwrap_or_default();
         lines.push(format!("⚡ avg speed: {avg_secs:.1}s{rank_part}"));
@@ -191,8 +214,17 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         lines.push("📚 Categories:".to_owned());
         for c in &cat_stats {
             let cat_pct = c.correct * 100 / c.answered;
-            let dot = if cat_pct >= 70 { "🟢" } else if cat_pct >= 50 { "🟡" } else { "🔴" };
-            lines.push(format!("{dot} {} · {}/{} ({}%)", c.category, c.correct, c.answered, cat_pct));
+            let dot = if cat_pct >= 70 {
+                "🟢"
+            } else if cat_pct >= 50 {
+                "🟡"
+            } else {
+                "🔴"
+            };
+            lines.push(format!(
+                "{dot} {} · {}/{} ({}%)",
+                c.category, c.correct, c.answered, cat_pct
+            ));
         }
     }
 
@@ -203,10 +235,12 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
 
 async fn cmd_categories(ctx: &BotContext) -> Result<Option<String>> {
     let stats = match ctx.db.category_stats().await {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => {
             error!("category_stats: {e}");
-            return Ok(Some("❌ Could not read category stats from database.".to_owned()));
+            return Ok(Some(
+                "❌ Could not read category stats from database.".to_owned(),
+            ));
         }
     };
     if stats.is_empty() {
@@ -214,20 +248,22 @@ async fn cmd_categories(ctx: &BotContext) -> Result<Option<String>> {
     }
 
     let total_q: i64 = stats.iter().map(|s| s.questions_asked).sum();
-    let max_asked    = stats.iter().map(|s| s.questions_asked).max().unwrap_or(1);
+    let max_asked = stats.iter().map(|s| s.questions_asked).max().unwrap_or(1);
 
     let mut lines = vec![
-        format!("📊 **Categories** · {} Qs asked", total_q),
+        format!("📊 **Category Groups** · {} Qs asked", total_q),
         String::new(),
     ];
 
     const BAR_W: usize = 10;
     for s in &stats {
-        let filled  = (s.questions_asked * BAR_W as i64 / max_asked) as usize;
-        let bar     = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
-        let pct     = if s.total_answers > 0 {
+        let filled = (s.questions_asked * BAR_W as i64 / max_asked) as usize;
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
+        let pct = if s.total_answers > 0 {
             s.correct_answers * 100 / s.total_answers
-        } else { 0 };
+        } else {
+            0
+        };
         lines.push(format!(
             "{bar}  {:>2}q  {:>3}% ✓  {}",
             s.questions_asked, pct, s.category,
@@ -260,19 +296,23 @@ async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
     if !excluded.is_empty() {
         if all_excluded {
             lines.push(String::new());
-            lines.push(
-                "⚠️ All groups excluded · using all categories.".to_owned()
-            );
+            lines.push("⚠️ All groups excluded · using all categories.".to_owned());
         } else {
-            let active_count = all_groups.len() - excluded_norm.iter()
-                .filter(|e| all_groups.iter().any(|(n, _)| &fetcher::normalise(n) == *e))
-                .count();
+            let active_count = all_groups.len()
+                - excluded_norm
+                    .iter()
+                    .filter(|e| all_groups.iter().any(|(n, _)| &fetcher::normalise(n) == *e))
+                    .count();
             lines.push(String::new());
             lines.push(format!("{active_count}/{} active.", all_groups.len()));
         }
     } else {
         lines.push(String::new());
-        lines.push(format!("All {}/{} active.", all_groups.len(), all_groups.len()));
+        lines.push(format!(
+            "All {}/{} active.",
+            all_groups.len(),
+            all_groups.len()
+        ));
     }
 
     Ok(Some(lines.join("\n")))
@@ -296,7 +336,9 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     ];
 
     if !s.reminder_before_secs.is_empty() {
-        let parts: Vec<String> = s.reminder_before_secs.iter()
+        let parts: Vec<String> = s
+            .reminder_before_secs
+            .iter()
             .map(|&secs| format_duration(secs))
             .collect();
         lines.push(format!("⏰ Reminders: {} before", parts.join(", ")));
@@ -339,10 +381,10 @@ fn format_duration(secs: u64) -> String {
     match (h, m, s) {
         (h, 0, 0) if h > 0 => format!("{h}h"),
         (0, m, 0) if m > 0 => format!("{m}m"),
-        (0, 0, s)           => format!("{s}s"),
-        (h, m, 0)           => format!("{h}h {m}m"),
-        (0, m, s)           => format!("{m}m {s}s"),
-        (h, m, s)           => format!("{h}h {m}m {s}s"),
+        (0, 0, s) => format!("{s}s"),
+        (h, m, 0) => format!("{h}h {m}m"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, s) => format!("{h}h {m}m {s}s"),
     }
 }
 
@@ -350,10 +392,12 @@ fn format_duration(secs: u64) -> String {
 
 async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     let board = match ctx.db.speed_leaderboard().await {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(e) => {
             error!("speed_leaderboard: {e}");
-            return Ok(Some("❌ Could not read speed stats from database.".to_owned()));
+            return Ok(Some(
+                "❌ Could not read speed stats from database.".to_owned(),
+            ));
         }
     };
 
@@ -361,7 +405,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
 
     if board.is_empty() && near.is_empty() {
         return Ok(Some(
-            "Not enough data yet · min. 3 correct answers per player.".to_owned()
+            "Not enough data yet · min. 3 correct answers per player.".to_owned(),
         ));
     }
 
@@ -374,7 +418,12 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
         lines.push("No one has 3 correct answers yet.".to_owned());
     } else {
         for (i, e) in board.iter().enumerate() {
-            let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+            let medal = match i {
+                0 => "🥇",
+                1 => "🥈",
+                2 => "🥉",
+                _ => "  ",
+            };
             lines.push(format!(
                 "{medal} {} · {:.1}s avg · {} correct",
                 e.user_id, e.avg_secs, e.sample_count,
@@ -389,7 +438,9 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
             let needed = 3 - e.correct_count;
             lines.push(format!(
                 "  {} · {} more correct answer{} needed",
-                e.user_id, needed, if needed == 1 { "" } else { "s" },
+                e.user_id,
+                needed,
+                if needed == 1 { "" } else { "s" },
             ));
         }
     }
@@ -399,7 +450,11 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
 
 // ── !schedulequiz ─────────────────────────────────────────────────────────────
 
-async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_schedulequiz(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     // Collect all tokens after the command name, stripping any surrounding quotes.
@@ -416,7 +471,8 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
         if entries.is_empty() {
             return Ok(Some(
                 "No quizzes scheduled.\n\
-                 Usage: !schedulequiz HH:MM".to_owned()
+                 Usage: !schedulequiz HH:MM"
+                    .to_owned(),
             ));
         }
         let mut lines = vec!["📅 Pending quizzes:".to_owned()];
@@ -428,20 +484,28 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
 
     let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
         Some(t) => t,
-        None    => return Ok(Some(format!(
-            "❌ Invalid: \"{time_arg}\" · use HH:MM"
-        ))),
+        None => return Ok(Some(format!("❌ Invalid: \"{time_arg}\" · use HH:MM"))),
     };
 
-    let tz: Tz     = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-    let local_now  = chrono::Utc::now().with_timezone(&tz);
-    let offset     = ctx.config.schedule.reminder_before_secs.iter().copied().max().unwrap_or(0) as i64;
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let local_now = chrono::Utc::now().with_timezone(&tz);
+    let offset = ctx
+        .config
+        .schedule
+        .reminder_before_secs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0) as i64;
 
-    let quiz_secs  = (qh * 3600 + qm * 60) as i64;
-    let fire_secs  = (quiz_secs - offset).rem_euclid(86400);
-    let now_secs   = (local_now.hour() * 3600
-        + local_now.minute() * 60
-        + local_now.second()) as i64;
+    let quiz_secs = (qh * 3600 + qm * 60) as i64;
+    let fire_secs = (quiz_secs - offset).rem_euclid(86400);
+    let now_secs = (local_now.hour() * 3600 + local_now.minute() * 60 + local_now.second()) as i64;
 
     // If the fire moment has already passed today, schedule for tomorrow.
     let date = if now_secs >= fire_secs {
@@ -451,11 +515,18 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
     };
 
     let quiz_time = format!("{qh:02}:{qm:02}");
-    let entry     = ScheduledOnce { quiz_time: quiz_time.clone(), date };
+    let entry = ScheduledOnce {
+        quiz_time: quiz_time.clone(),
+        date,
+    };
 
     {
         let mut state = ctx.state.lock().await;
-        if state.scheduled_once.iter().any(|e| e.quiz_time == quiz_time && e.date == date) {
+        if state
+            .scheduled_once
+            .iter()
+            .any(|e| e.quiz_time == quiz_time && e.date == date)
+        {
             return Ok(Some(format!(
                 "⚠️ A quiz at {quiz_time} on {date} is already scheduled."
             )));
@@ -464,9 +535,13 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
         state.save(&ctx.state_path).await?;
     }
 
-    let day_str   = if date == local_now.date_naive() { "today".to_owned() } else { "tomorrow".to_owned() };
+    let day_str = if date == local_now.date_naive() {
+        "today".to_owned()
+    } else {
+        "tomorrow".to_owned()
+    };
     let fire_hour = (fire_secs / 3600) as u32;
-    let fire_min  = ((fire_secs % 3600) / 60) as u32;
+    let fire_min = ((fire_secs % 3600) / 60) as u32;
 
     if offset > 0 {
         Ok(Some(format!(
@@ -483,7 +558,11 @@ async fn cmd_schedulequiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) ->
 
 // ── !cancelquiz ───────────────────────────────────────────────────────────────
 
-async fn cmd_cancelquiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_cancelquiz(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let time_arg = body
@@ -496,23 +575,22 @@ async fn cmd_cancelquiz(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
     if time_arg.is_empty() {
         return Ok(Some(
             "Usage: !cancelquiz HH:MM\n\
-             Pending: !schedulequiz".to_owned()
+             Pending: !schedulequiz"
+                .to_owned(),
         ));
     }
 
     let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_arg) {
         Some(t) => t,
-        None    => return Ok(Some(format!(
-            "❌ Invalid: \"{time_arg}\" · use HH:MM"
-        ))),
+        None => return Ok(Some(format!("❌ Invalid: \"{time_arg}\" · use HH:MM"))),
     };
 
     let quiz_time = format!("{qh:02}:{qm:02}");
 
-    let mut state   = ctx.state.lock().await;
-    let before      = state.scheduled_once.len();
+    let mut state = ctx.state.lock().await;
+    let before = state.scheduled_once.len();
     state.scheduled_once.retain(|e| e.quiz_time != quiz_time);
-    let removed     = before - state.scheduled_once.len();
+    let removed = before - state.scheduled_once.len();
     state.save(&ctx.state_path).await?;
 
     if removed == 0 {
@@ -530,7 +608,7 @@ fn help_text() -> String {
 !scores / !leaderboard · ranking
 !mystats · your stats + rank
 !gameinfo · schedule and format
-!categories · category breakdown
+!categories · category group breakdown
 !catconfig · active/excluded groups
 !fastest · speed leaderboard
 !help · this message

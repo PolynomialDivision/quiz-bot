@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS questions (
     question_num        INTEGER NOT NULL,
     matrix_event_id     TEXT,
     category            TEXT    NOT NULL,
+    category_group      TEXT,
     difficulty          TEXT    NOT NULL,
     question_text       TEXT    NOT NULL,
     choices             TEXT    NOT NULL,   -- JSON array ["a","b","c","d"]

@@ -5,9 +5,15 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
-use std::{collections::HashMap, path::Path, sync::{Arc, Mutex}};
+use rusqlite::{params, Connection};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use tracing::info;
+
+use crate::fetcher;
 
 // ── Pool wrapper ──────────────────────────────────────────────────────────────
 
@@ -18,14 +24,14 @@ pub struct Db {
 // ── Result types ──────────────────────────────────────────────────────────────
 
 pub struct LeaderboardEntry {
-    pub user_id:         String,
-    pub total_correct:   i64,
+    pub user_id: String,
+    pub total_correct: i64,
     pub total_questions: i64,
-    pub rounds_played:   i64,
+    pub rounds_played: i64,
     /// Wilson score lower bound (95 % CI) — the sort key used by the leaderboard.
     /// Ranges 0..1; penalises small sample sizes so occasional lucky players
     /// don't outrank consistent regulars.
-    pub wilson_score:    f64,
+    pub wilson_score: f64,
 }
 
 // ── Wilson score ──────────────────────────────────────────────────────────────
@@ -39,54 +45,56 @@ pub struct LeaderboardEntry {
 /// * 47/50 correct (94 %) → ~0.83   (large sample, high confidence)
 /// * 0/0  answered        →  0.00   (no data)
 pub fn wilson_lower_bound(correct: i64, total: i64) -> f64 {
-    if total == 0 { return 0.0; }
-    let n  = total   as f64;
-    let p  = correct as f64 / n;
-    let z  = 1.96_f64;
+    if total == 0 {
+        return 0.0;
+    }
+    let n = total as f64;
+    let p = correct as f64 / n;
+    let z = 1.96_f64;
     let z2 = z * z;
-    let centre_adj   = z2 / (2.0 * n);
-    let margin       = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
-    let denominator  = 1.0 + z2 / n;
+    let centre_adj = z2 / (2.0 * n);
+    let margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt());
+    let denominator = 1.0 + z2 / n;
     (p + centre_adj - margin) / denominator
 }
 
 pub struct UserStatsRow {
-    pub total_correct:   i64,
+    pub total_correct: i64,
     pub total_questions: i64,
-    pub rounds_played:   i64,
+    pub rounds_played: i64,
 }
 
 pub struct CategoryStat {
-    pub category:        String,
+    pub category: String,
     pub questions_asked: i64,
-    pub total_answers:   i64,
+    pub total_answers: i64,
     pub correct_answers: i64,
 }
 
 pub struct SpeedEntry {
-    pub user_id:      String,
-    pub avg_secs:     f64,
+    pub user_id: String,
+    pub avg_secs: f64,
     pub sample_count: i64,
 }
 
 /// Users who have 1–2 correct answers (below the 3-sample speed threshold).
 pub struct SpeedNearEntry {
-    pub user_id:      String,
+    pub user_id: String,
     pub correct_count: i64,
 }
 
 pub struct UserCategoryStat {
     pub category: String,
     pub answered: i64,
-    pub correct:  i64,
+    pub correct: i64,
 }
 
 /// A single user's final answer including timing metadata.
 #[derive(Clone, Debug)]
 pub struct AnswerRecord {
-    pub choice:         u8,
-    pub source:         &'static str,   // 'reaction' | 'text' | 'reconciled'
-    pub submitted_at:   DateTime<Utc>,
+    pub choice: u8,
+    pub source: &'static str, // 'reaction' | 'text' | 'reconciled'
+    pub submitted_at: DateTime<Utc>,
     pub changed_answer: bool,
 }
 
@@ -127,7 +135,9 @@ impl Db {
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -136,10 +146,47 @@ impl Db {
                 .context("Applying DB schema")?;
             conn.execute_batch(include_str!("../migrations/002_fix_round_totals.sql"))
                 .context("Backfilling round_scores.total_count")?;
+            Self::migrate_category_group_column(conn)
+                .context("Migrating questions.category_group")?;
             Ok(())
         })
         .await?;
         info!("DB schema applied");
+        Ok(())
+    }
+
+    fn migrate_category_group_column(conn: &mut Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(questions)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            let names = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|name| name == "category_group")
+        };
+
+        if !has_column {
+            conn.execute("ALTER TABLE questions ADD COLUMN category_group TEXT", [])?;
+        }
+
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT id, category
+                 FROM questions
+                 WHERE category_group IS NULL OR category_group = ''",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let tx = conn.transaction()?;
+        for (id, category) in rows {
+            let group = fetcher::category_group_label(&category);
+            tx.execute(
+                "UPDATE questions SET category_group = ?1 WHERE id = ?2",
+                params![group, id],
+            )?;
+        }
+        tx.commit()?;
+
         Ok(())
     }
 }
@@ -150,9 +197,7 @@ impl Db {
     pub async fn kv_get(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_owned();
         self.run(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT value FROM bot_kv WHERE key = ?1",
-            )?;
+            let mut stmt = conn.prepare_cached("SELECT value FROM bot_kv WHERE key = ?1")?;
             let mut rows = stmt.query(params![key])?;
             Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
         })
@@ -180,7 +225,7 @@ impl Db {
 
 impl Db {
     pub async fn upsert_player(&self, user_id: &str, display_name: Option<&str>) -> Result<()> {
-        let user_id      = user_id.to_owned();
+        let user_id = user_id.to_owned();
         let display_name = display_name.map(str::to_owned);
         self.run(move |conn| {
             match &display_name {
@@ -216,26 +261,26 @@ impl Db {
 // ── Rounds ────────────────────────────────────────────────────────────────────
 
 pub struct RoundParams<'a> {
-    pub room_id:                    &'a str,
-    pub n_questions_planned:        i32,
-    pub triggered_by:               &'a str,
-    pub config_answer_timeout:      i32,
+    pub room_id: &'a str,
+    pub n_questions_planned: i32,
+    pub triggered_by: &'a str,
+    pub config_answer_timeout: i32,
     pub config_questions_per_round: i32,
-    pub config_timezone:            &'a str,
-    pub config_category_id:         Option<i32>,
-    pub config_difficulty:          Option<&'a str>,
+    pub config_timezone: &'a str,
+    pub config_category_id: Option<i32>,
+    pub config_difficulty: Option<&'a str>,
 }
 
 impl Db {
     pub async fn create_round(&self, p: &RoundParams<'_>) -> Result<i64> {
-        let room_id         = p.room_id.to_owned();
-        let n_planned       = p.n_questions_planned;
-        let triggered_by    = p.triggered_by.to_owned();
-        let timeout         = p.config_answer_timeout;
-        let n_per_round     = p.config_questions_per_round;
-        let timezone        = p.config_timezone.to_owned();
-        let category_id     = p.config_category_id;
-        let difficulty      = p.config_difficulty.map(str::to_owned);
+        let room_id = p.room_id.to_owned();
+        let n_planned = p.n_questions_planned;
+        let triggered_by = p.triggered_by.to_owned();
+        let timeout = p.config_answer_timeout;
+        let n_per_round = p.config_questions_per_round;
+        let timezone = p.config_timezone.to_owned();
+        let category_id = p.config_category_id;
+        let difficulty = p.config_difficulty.map(str::to_owned);
 
         self.run(move |conn| {
             conn.execute(
@@ -244,8 +289,16 @@ impl Db {
                     config_answer_timeout, config_questions_per_round,
                     config_timezone, config_category_id, config_difficulty)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![room_id, n_planned, triggered_by,
-                         timeout, n_per_round, timezone, category_id, difficulty],
+                params![
+                    room_id,
+                    n_planned,
+                    triggered_by,
+                    timeout,
+                    n_per_round,
+                    timezone,
+                    category_id,
+                    difficulty
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -270,42 +323,54 @@ impl Db {
 // ── Questions ─────────────────────────────────────────────────────────────────
 
 pub struct QuestionParams<'a> {
-    pub round_id:            i64,
-    pub question_num:        i32,
-    pub matrix_event_id:     Option<&'a str>,
-    pub category:            &'a str,
-    pub difficulty:          &'a str,
-    pub question_text:       &'a str,
-    pub choices:             &'a [String],
-    pub correct_index:       i16,
+    pub round_id: i64,
+    pub question_num: i32,
+    pub matrix_event_id: Option<&'a str>,
+    pub category: &'a str,
+    pub category_group: &'a str,
+    pub difficulty: &'a str,
+    pub question_text: &'a str,
+    pub choices: &'a [String],
+    pub correct_index: i16,
     pub correct_answer_text: &'a str,
     pub answer_timeout_secs: i32,
 }
 
 impl Db {
     pub async fn insert_question(&self, p: &QuestionParams<'_>) -> Result<i64> {
-        let round_id        = p.round_id;
-        let question_num    = p.question_num;
+        let round_id = p.round_id;
+        let question_num = p.question_num;
         let matrix_event_id = p.matrix_event_id.map(str::to_owned);
-        let category        = p.category.to_owned();
-        let difficulty      = p.difficulty.to_owned();
-        let question_text   = p.question_text.to_owned();
-        let choices_json    = serde_json::to_string(p.choices)?;
-        let correct_index   = p.correct_index as i32;
-        let correct_answer  = p.correct_answer_text.to_owned();
-        let timeout         = p.answer_timeout_secs;
+        let category = p.category.to_owned();
+        let category_group = p.category_group.to_owned();
+        let difficulty = p.difficulty.to_owned();
+        let question_text = p.question_text.to_owned();
+        let choices_json = serde_json::to_string(p.choices)?;
+        let correct_index = p.correct_index as i32;
+        let correct_answer = p.correct_answer_text.to_owned();
+        let timeout = p.answer_timeout_secs;
 
         self.run(move |conn| {
             conn.execute(
                 "INSERT INTO questions
                    (round_id, question_num, matrix_event_id,
-                    category, difficulty, question_text,
+                    category, category_group, difficulty, question_text,
                     choices, correct_index, correct_answer_text,
                     answer_timeout_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![round_id, question_num, matrix_event_id,
-                         category, difficulty, question_text,
-                         choices_json, correct_index, correct_answer, timeout],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    round_id,
+                    question_num,
+                    matrix_event_id,
+                    category,
+                    category_group,
+                    difficulty,
+                    question_text,
+                    choices_json,
+                    correct_index,
+                    correct_answer,
+                    timeout
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -315,9 +380,9 @@ impl Db {
     pub async fn update_question_stats(
         &self,
         question_id: i64,
-        n_answers:   i32,
-        n_correct:   i32,
-        n_wrong:     i32,
+        n_answers: i32,
+        n_correct: i32,
+        n_wrong: i32,
     ) -> Result<()> {
         self.run(move |conn| {
             conn.execute(
@@ -337,9 +402,9 @@ impl Db {
 impl Db {
     pub async fn insert_answers(
         &self,
-        question_id:   i64,
-        round_id:      i64,
-        answers:       &HashMap<String, AnswerRecord>,
+        question_id: i64,
+        round_id: i64,
+        answers: &HashMap<String, AnswerRecord>,
         correct_index: u8,
     ) -> Result<()> {
         // Upsert players first (best-effort).
@@ -351,10 +416,10 @@ impl Db {
         self.run(move |conn| {
             let tx = conn.transaction()?;
             for (user_id, rec) in &answers {
-                let is_correct     = (rec.choice == correct_index) as i32;
-                let choice_i       = rec.choice as i32;
+                let is_correct = (rec.choice == correct_index) as i32;
+                let choice_i = rec.choice as i32;
                 let changed_answer = rec.changed_answer as i32;
-                let submitted_at   = rec.submitted_at.to_rfc3339();
+                let submitted_at = rec.submitted_at.to_rfc3339();
                 tx.execute(
                     "INSERT INTO answers
                        (question_id, round_id, user_id,
@@ -367,9 +432,16 @@ impl Db {
                            source         = excluded.source,
                            submitted_at   = excluded.submitted_at,
                            changed_answer = excluded.changed_answer",
-                    params![question_id, round_id, user_id,
-                             choice_i, is_correct, rec.source,
-                             submitted_at, changed_answer],
+                    params![
+                        question_id,
+                        round_id,
+                        user_id,
+                        choice_i,
+                        is_correct,
+                        rec.source,
+                        submitted_at,
+                        changed_answer
+                    ],
                 )?;
             }
             tx.commit()?;
@@ -385,7 +457,7 @@ impl Db {
     pub async fn write_round_scores(
         &self,
         round_id: i64,
-        scores:   &HashMap<String, (u32, u32)>,
+        scores: &HashMap<String, (u32, u32)>,
     ) -> Result<()> {
         let scores = scores.clone();
         self.run(move |conn| {
@@ -411,38 +483,39 @@ impl Db {
 
 impl Db {
     pub async fn leaderboard(&self) -> Result<Vec<LeaderboardEntry>> {
-        let mut entries = self.run(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT
+        let mut entries = self
+            .run(|conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT
                      user_id,
                      SUM(correct_count) AS total_correct,
                      SUM(total_count)   AS total_questions,
                      COUNT(*)           AS rounds_played
                  FROM round_scores
                  GROUP BY user_id",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| anyhow::anyhow!(e))
-        })
-        .await?;
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .await?;
 
         // Compute Wilson score and sort in Rust — SQLite lacks sqrt() by default.
         let mut result: Vec<LeaderboardEntry> = entries
             .drain(..)
             .map(|(user_id, correct, total, rounds)| LeaderboardEntry {
-                wilson_score:    wilson_lower_bound(correct, total),
+                wilson_score: wilson_lower_bound(correct, total),
                 user_id,
-                total_correct:   correct,
+                total_correct: correct,
                 total_questions: total,
-                rounds_played:   rounds,
+                rounds_played: rounds,
             })
             .collect();
 
@@ -480,9 +553,9 @@ impl Db {
                 return Ok(None);
             }
             Ok(Some(UserStatsRow {
-                total_correct:   row.0,
+                total_correct: row.0,
                 total_questions: row.1,
-                rounds_played:   row.2,
+                rounds_played: row.2,
             }))
         })
         .await
@@ -500,10 +573,8 @@ impl Db {
     }
 
     pub async fn question_count(&self) -> Result<i64> {
-        self.run(|conn| {
-            Ok(conn.query_row("SELECT COUNT(*) FROM questions", [], |r| r.get(0))?)
-        })
-        .await
+        self.run(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM questions", [], |r| r.get(0))?))
+            .await
     }
 
     pub async fn question_exists(&self, question_text: &str) -> Result<bool> {
@@ -517,29 +588,44 @@ impl Db {
         })
         .await
     }
+
+    pub async fn category_group_counts(&self) -> Result<Vec<(String, i64)>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COALESCE(category_group, category) AS group_name,
+                        COUNT(*) AS questions_asked
+                 FROM questions
+                 GROUP BY group_name",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+    }
 }
 
 // ── Extended stats queries ────────────────────────────────────────────────────
 
 impl Db {
-    /// Per-category question counts and answer accuracy.
+    /// Per-balanced-group question counts and answer accuracy.
     pub async fn category_stats(&self) -> Result<Vec<CategoryStat>> {
         self.run(|conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT
-                     category,
+                     COALESCE(category_group, category)        AS group_name,
                      COUNT(*)                            AS questions_asked,
                      COALESCE(SUM(n_answers_received),0) AS total_answers,
                      COALESCE(SUM(n_correct),0)          AS correct_answers
                  FROM questions
-                 GROUP BY category
+                 GROUP BY group_name
                  ORDER BY questions_asked DESC",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(CategoryStat {
-                    category:        r.get(0)?,
+                    category: r.get(0)?,
                     questions_asked: r.get(1)?,
-                    total_answers:   r.get(2)?,
+                    total_answers: r.get(2)?,
                     correct_answers: r.get(3)?,
                 })
             })?;
@@ -568,8 +654,8 @@ impl Db {
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(SpeedEntry {
-                    user_id:      r.get(0)?,
-                    avg_secs:     r.get(1)?,
+                    user_id: r.get(0)?,
+                    avg_secs: r.get(1)?,
                     sample_count: r.get(2)?,
                 })
             })?;
@@ -594,7 +680,7 @@ impl Db {
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(SpeedNearEntry {
-                    user_id:       r.get(0)?,
+                    user_id: r.get(0)?,
                     correct_count: r.get(1)?,
                 })
             })?;
@@ -604,19 +690,19 @@ impl Db {
         .await
     }
 
-    /// Per-category accuracy for a single user (categories with ≥ 2 answers).
+    /// Per-balanced-group accuracy for a single user (groups with ≥ 2 answers).
     pub async fn user_category_stats(&self, user_id: &str) -> Result<Vec<UserCategoryStat>> {
         let user_id = user_id.to_owned();
         self.run(move |conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT
-                     q.category,
+                     COALESCE(q.category_group, q.category) AS group_name,
                      COUNT(*)         AS answered,
                      SUM(a.is_correct) AS correct
                  FROM answers a
                  JOIN questions q ON a.question_id = q.id
                  WHERE a.user_id = ?1
-                 GROUP BY q.category
+                 GROUP BY group_name
                  HAVING COUNT(*) >= 2
                  ORDER BY CAST(SUM(a.is_correct) AS REAL) / COUNT(*) DESC",
             )?;
@@ -624,7 +710,7 @@ impl Db {
                 Ok(UserCategoryStat {
                     category: r.get(0)?,
                     answered: r.get(1)?,
-                    correct:  r.get(2)?,
+                    correct: r.get(2)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()

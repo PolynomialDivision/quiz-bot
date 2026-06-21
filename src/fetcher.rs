@@ -3,15 +3,17 @@
 //! Uses a session token to avoid repeating questions until the full pool is
 //! exhausted, then resets the token automatically.
 
+use std::collections::HashMap;
+
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::{BotContext, state::FetchedQuestion};
+use crate::{state::FetchedQuestion, BotContext};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
-const API_URL:   &str = "https://opentdb.com/api.php";
+const API_URL: &str = "https://opentdb.com/api.php";
 
 /// Category groups for balanced random selection.
 ///
@@ -25,24 +27,53 @@ const API_URL:   &str = "https://opentdb.com/api.php";
 /// The name field matches the `excluded_categories` config option
 /// (case-insensitive; "&" and "and" are treated as equivalent).
 pub const CATEGORY_GROUPS: &[(&str, &[u32])] = &[
-    ("General Knowledge",    &[9]),
-    ("Entertainment",        &[10, 11, 12, 13, 14, 15, 16, 29, 31, 32]),
+    ("General Knowledge", &[9]),
+    ("Entertainment", &[10, 11, 12, 13, 14, 15, 16, 29, 31, 32]),
     ("Science & Technology", &[17, 18, 19, 30]),
-    ("Mythology",            &[20]),
-    ("Sports",               &[21]),
-    ("Geography",            &[22]),
-    ("History",              &[23]),
-    ("Politics",             &[24]),
-    ("Art",                  &[25]),
-    ("Celebrities",          &[26]),
-    ("Animals",              &[27]),
-    ("Vehicles",             &[28]),
+    ("Mythology", &[20]),
+    ("Sports", &[21]),
+    ("Geography", &[22]),
+    ("History", &[23]),
+    ("Politics", &[24]),
+    ("Art", &[25]),
+    ("Celebrities", &[26]),
+    ("Animals", &[27]),
+    ("Vehicles", &[28]),
 ];
 
 /// Normalise a category name for exclusion matching:
 /// lower-case and replace " & " with " and ".
 pub fn normalise(s: &str) -> String {
     s.to_lowercase().replace(" & ", " and ")
+}
+
+/// Map OpenTDB's raw category names back to the bot's balanced groups.
+pub fn category_group_for_category(category: &str) -> Option<&'static str> {
+    let c = normalise(category);
+    match c.as_str() {
+        "general knowledge" => Some("General Knowledge"),
+        "science and nature"
+        | "science: computers"
+        | "science: mathematics"
+        | "science: gadgets" => Some("Science & Technology"),
+        "mythology" => Some("Mythology"),
+        "sports" => Some("Sports"),
+        "geography" => Some("Geography"),
+        "history" => Some("History"),
+        "politics" => Some("Politics"),
+        "art" => Some("Art"),
+        "celebrities" => Some("Celebrities"),
+        "animals" => Some("Animals"),
+        "vehicles" => Some("Vehicles"),
+        _ if c.starts_with("entertainment:") => Some("Entertainment"),
+        _ => None,
+    }
+}
+
+pub fn category_group_label(category: &str) -> String {
+    category_group_for_category(category)
+        .unwrap_or(category)
+        .to_owned()
 }
 
 /// Return the subset of `CATEGORY_GROUPS` not excluded by config.
@@ -59,6 +90,15 @@ pub fn active_groups<'a>(excluded: &[String]) -> Vec<(&'a str, &'a [u32])> {
     } else {
         filtered
     }
+}
+
+pub fn category_is_active(category: &str, excluded: &[String]) -> bool {
+    let Some(group) = category_group_for_category(category) else {
+        return true;
+    };
+    active_groups(excluded)
+        .iter()
+        .any(|(name, _)| normalise(name) == normalise(group))
 }
 
 // ── Resilient HTTP helper ─────────────────────────────────────────────────────
@@ -80,7 +120,7 @@ async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
         match reqwest::get(url).await {
             Ok(resp) => match resp.json::<ApiResponse>().await {
                 Ok(api) => return Ok(api),
-                Err(e)  => {
+                Err(e) => {
                     warn!("OpenTDB: response parse error: {e}");
                     last_err = e.into();
                 }
@@ -92,7 +132,9 @@ async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
         }
     }
 
-    Err(last_err.context(format!("OpenTDB unreachable after {MAX_NET_RETRIES} attempts")))
+    Err(last_err.context(format!(
+        "OpenTDB unreachable after {MAX_NET_RETRIES} attempts"
+    )))
 }
 
 // ── OpenTDB response shapes ───────────────────────────────────────────────────
@@ -111,10 +153,10 @@ struct ApiResponse {
 
 #[derive(Deserialize)]
 struct ApiQuestion {
-    category:          String,
-    difficulty:        String,
-    question:          String,
-    correct_answer:    String,
+    category: String,
+    difficulty: String,
+    question: String,
+    correct_answer: String,
     incorrect_answers: Vec<String>,
 }
 
@@ -158,11 +200,10 @@ async fn ensure_token(ctx: &BotContext) -> anyhow::Result<String> {
 
 /// Reset a token after its question pool is exhausted.
 async fn reset_token(_ctx: &BotContext, token: &str) -> anyhow::Result<()> {
-    let resp: TokenResponse =
-        reqwest::get(format!("{TOKEN_URL}?command=reset&token={token}"))
-            .await?
-            .json()
-            .await?;
+    let resp: TokenResponse = reqwest::get(format!("{TOKEN_URL}?command=reset&token={token}"))
+        .await?
+        .json()
+        .await?;
     if resp.response_code != 0 {
         anyhow::bail!("OpenTDB token reset failed (code {})", resp.response_code);
     }
@@ -189,8 +230,11 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
         }
 
         let token = match ensure_token(ctx).await {
-            Ok(t)  => t,
-            Err(e) => { warn!("ensure_token failed: {e}"); continue; }
+            Ok(t) => t,
+            Err(e) => {
+                warn!("ensure_token failed: {e}");
+                continue;
+            }
         };
 
         // Use the configured category if set; otherwise pick a random group
@@ -212,7 +256,7 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
         }
 
         let resp = match api_get_with_retry(&url).await {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 warn!("OpenTDB prefetch network error (attempt {attempt}): {e}");
                 continue;
@@ -226,10 +270,10 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|q| FetchedQuestion {
-                        category:          decode(&q.category),
-                        difficulty:        decode(&q.difficulty),
-                        question:          decode(&q.question),
-                        correct_answer:    decode(&q.correct_answer),
+                        category: decode(&q.category),
+                        difficulty: decode(&q.difficulty),
+                        question: decode(&q.question),
+                        correct_answer: decode(&q.correct_answer),
                         incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
                     })
                     .collect();
@@ -238,7 +282,9 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 state.cached_questions.extend(questions);
                 state.save(&ctx.state_path).await?;
                 let total = state.cached_questions.len();
-                info!("Prefetched {n} questions from OpenTDB category {category} ({total} in cache)");
+                info!(
+                    "Prefetched {n} questions from OpenTDB category {category} ({total} in cache)"
+                );
                 return Ok(n);
             }
             // Code 3: token expired after 6 h inactivity — clear it and retry.
@@ -266,18 +312,34 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     anyhow::bail!("OpenTDB prefetch failed after {MAX_ATTEMPTS} attempts")
 }
 
-/// Pick `n` category IDs from distinct groups, respecting exclusions.
-/// Groups are shuffled; if n > num_groups we wrap around (some groups used twice).
-fn pick_round_categories(n: usize, excluded: &[String]) -> Vec<u32> {
+/// Pick `n` category IDs from the historically least-used active groups.
+/// Equal counts are shuffled so the sequence does not become deterministic.
+async fn pick_round_categories(ctx: &BotContext, n: usize) -> Vec<u32> {
+    let mut groups = active_groups(&ctx.config.trivia.excluded_categories);
+    let mut counts: HashMap<String, i64> = ctx
+        .db
+        .category_group_counts()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     let mut rng = rand::thread_rng();
-    let mut groups = active_groups(excluded);
-    groups.shuffle(&mut rng);
-    groups
-        .iter()
-        .cycle()
-        .take(n)
-        .map(|(_, ids)| *ids.choose(&mut rng).unwrap())
-        .collect()
+    let mut picked = Vec::with_capacity(n);
+    while picked.len() < n {
+        groups.shuffle(&mut rng);
+        groups.sort_by_key(|(name, _)| counts.get(*name).copied().unwrap_or(0));
+
+        for (name, ids) in &groups {
+            if picked.len() == n {
+                break;
+            }
+            picked.push(*ids.choose(&mut rng).unwrap());
+            *counts.entry((*name).to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    picked
 }
 
 /// Fetch exactly one question from a specific OpenTDB category, skipping
@@ -291,7 +353,7 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
     for attempt in 0..=MAX_SKIP {
         // At most one token-reset per call; network errors get their own retry inside api_get_with_retry.
         let token = match ensure_token(ctx).await {
-            Ok(t)  => t,
+            Ok(t) => t,
             Err(e) => {
                 warn!("fetch_one: ensure_token failed (attempt {attempt}): {e}");
                 if attempt < MAX_SKIP {
@@ -310,7 +372,7 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
         }
 
         let resp = match api_get_with_retry(&url).await {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 warn!("fetch_one: network error (attempt {attempt}): {e}");
                 if attempt < MAX_SKIP {
@@ -324,14 +386,17 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
             0 => {
                 if let Some(q) = resp.results.unwrap_or_default().into_iter().next() {
                     let fetched = FetchedQuestion {
-                        category:          decode(&q.category),
-                        difficulty:        decode(&q.difficulty),
-                        question:          decode(&q.question),
-                        correct_answer:    decode(&q.correct_answer),
+                        category: decode(&q.category),
+                        difficulty: decode(&q.difficulty),
+                        question: decode(&q.question),
+                        correct_answer: decode(&q.correct_answer),
                         incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
                     };
-                    let already_asked =
-                        ctx.db.question_exists(&fetched.question).await.unwrap_or(false);
+                    let already_asked = ctx
+                        .db
+                        .question_exists(&fetched.question)
+                        .await
+                        .unwrap_or(false);
                     if !already_asked || attempt == MAX_SKIP {
                         if attempt == MAX_SKIP && already_asked {
                             warn!("Reusing duplicate question for category {category} — pool may be exhausted");
@@ -339,7 +404,11 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                         return Ok(fetched);
                     }
                     // Duplicate — try again.
-                    info!("Skipping duplicate for category {category} ({}/{})", attempt + 1, MAX_SKIP);
+                    info!(
+                        "Skipping duplicate for category {category} ({}/{})",
+                        attempt + 1,
+                        MAX_SKIP
+                    );
                     continue;
                 }
                 anyhow::bail!("OpenTDB returned empty results for category {category}");
@@ -390,14 +459,17 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         let mut questions = Vec::with_capacity(n);
         for _ in 0..n {
             match next_question(ctx).await {
-                Ok(q)  => questions.push(q),
-                Err(e) => { warn!("next_question fallback failed: {e}"); break; }
+                Ok(q) => questions.push(q),
+                Err(e) => {
+                    warn!("next_question fallback failed: {e}");
+                    break;
+                }
             }
         }
         return questions;
     }
 
-    let categories = pick_round_categories(n, &ctx.config.trivia.excluded_categories);
+    let categories = pick_round_categories(ctx, n).await;
     info!(
         "Pre-fetching {} round questions from categories: {:?}",
         n, categories
@@ -414,13 +486,16 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         }
         match fetch_one(ctx, category).await {
             Ok(q) => {
-                info!("Round question ready: category {category} (\"{}\")", q.category);
+                info!(
+                    "Round question ready: category {category} (\"{}\")",
+                    q.category
+                );
                 questions.push(q);
             }
             Err(e) => {
                 warn!("fetch_one failed for category {category}: {e} — falling back to cache");
                 match next_question(ctx).await {
-                    Ok(q)  => questions.push(q),
+                    Ok(q) => questions.push(q),
                     Err(e2) => warn!("Cache fallback also failed: {e2}"),
                 }
             }
@@ -447,12 +522,23 @@ pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> 
             }
         }
 
-        let q = ctx.state
+        let q = ctx
+            .state
             .lock()
             .await
             .cached_questions
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("OpenTDB returned no questions"))?;
+
+        if ctx.config.trivia.category.is_none()
+            && !category_is_active(&q.category, &ctx.config.trivia.excluded_categories)
+        {
+            info!(
+                "Skipping cached question from excluded category {}",
+                q.category
+            );
+            continue;
+        }
 
         // Trigger a background refill when the cache is getting low.
         {
