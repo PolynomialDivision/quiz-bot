@@ -334,15 +334,17 @@ pub async fn start_quiz(
         }
     }
 
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let local_date = chrono::Utc::now().with_timezone(&tz).date_naive();
+    let leaderboard_month = crate::leaderboard::YearMonth::containing(local_date);
+
     // ── Mark today for this scheduler slot ────────────────────────────────────
     if let Some(ref key) = slot_key {
-        let tz: Tz = ctx
-            .config
-            .schedule
-            .timezone
-            .parse()
-            .unwrap_or(chrono_tz::UTC);
-        let local_date = chrono::Utc::now().with_timezone(&tz).date_naive();
         let mut state = ctx.state.lock().await;
         state.last_quiz_dates.insert(key.clone(), local_date);
         if let Err(e) = state.save(&ctx.state_path).await {
@@ -657,7 +659,7 @@ pub async fn start_quiz(
     }
 
     // ── Round summary ─────────────────────────────────────────────────────────
-    if n_questions > 1 {
+    {
         let mut summary_lines = vec![format!("🏁 Round done · {questions_asked} Qs")];
 
         if round_scores.is_empty() {
@@ -677,6 +679,33 @@ pub async fn start_quiz(
                     _ => "▪️",
                 };
                 summary_lines.push(format!("{medal} {} · {correct}/{questions_asked}", user));
+            }
+        }
+
+        if let Ok((start, end)) = leaderboard_month.utc_bounds(tz) {
+            match (
+                ctx.db.monthly_leaderboard(start, end).await,
+                ctx.db.question_count_between(start, end).await,
+            ) {
+                (Ok(board), Ok(question_count)) => {
+                    summary_lines.push(String::new());
+                    summary_lines.extend(
+                        crate::leaderboard::leaderboard_text(
+                            leaderboard_month.month_name(),
+                            question_count,
+                            &board,
+                        )
+                        .lines()
+                        .map(str::to_owned),
+                    );
+                }
+                (board, count) => {
+                    warn!(
+                        "Could not build monthly round leaderboard: board={:?}, count={:?}",
+                        board.err(),
+                        count.err()
+                    );
+                }
             }
         }
 

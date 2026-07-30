@@ -194,6 +194,16 @@ fn question_is_valid(q: &FetchedQuestion) -> bool {
         .all(|answer| !answer.trim().is_empty() && answers.insert(normalise(answer.trim())))
 }
 
+fn category_can_follow(
+    previous_normalized_group: Option<&str>,
+    candidate_category: &str,
+    active_group_count: usize,
+) -> bool {
+    active_group_count <= 1
+        || previous_normalized_group
+            != Some(normalise(&category_group_label(candidate_category)).as_str())
+}
+
 // ── Token management ──────────────────────────────────────────────────────────
 
 /// Return the stored session token, requesting a fresh one if none exists.
@@ -605,7 +615,8 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
     // We wait between calls so we don't get rate-limited mid-prefetch.
     const RATE_LIMIT_SECS: u64 = 6;
 
-    let mut questions = Vec::with_capacity(n);
+    let mut questions: Vec<FetchedQuestion> = Vec::with_capacity(n);
+    let active_group_count = active_groups(&ctx.config.trivia.excluded_categories).len();
     let recent = ctx
         .db
         .recent_category_groups(ctx.config.trivia.recent_category_window)
@@ -617,10 +628,18 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         if i > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(RATE_LIMIT_SECS)).await;
         }
+        let previous_group = questions
+            .last()
+            .map(|q| normalise(&category_group_label(&q.category)));
         match fetch_one(ctx, choice.category_id).await {
             Ok(q)
                 if category_group_for_category(&q.category)
-                    .is_some_and(|group| normalise(group) == normalise(&choice.group)) =>
+                    .is_some_and(|group| normalise(group) == normalise(&choice.group))
+                    && category_can_follow(
+                        previous_group.as_deref(),
+                        &q.category,
+                        active_group_count,
+                    ) =>
             {
                 info!(
                     "Round question ready: category {} (\"{}\")",
@@ -635,9 +654,10 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
                     requested_group = %choice.group,
                     requested_category_id = choice.category_id,
                     returned_category = %q.category,
-                    "OpenTDB returned an unexpected or recently used category; using cache fallback"
+                    previous_group = ?previous_group,
+                    "OpenTDB returned an unexpected or consecutive category; using diverse fallback"
                 );
-                match next_question_avoiding(ctx, &avoid_groups).await {
+                match next_question_avoiding(ctx, &avoid_groups, previous_group.as_deref()).await {
                     Ok(fallback) => {
                         let group = normalise(&category_group_label(&fallback.category));
                         avoid_groups.insert(group);
@@ -651,7 +671,7 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
                     "fetch_one failed for category {}: {e} — falling back to cache",
                     choice.category_id
                 );
-                match next_question_avoiding(ctx, &avoid_groups).await {
+                match next_question_avoiding(ctx, &avoid_groups, previous_group.as_deref()).await {
                     Ok(q) => {
                         let group = normalise(&category_group_label(&q.category));
                         avoid_groups.insert(group);
@@ -667,28 +687,86 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
 
 async fn next_question_avoiding(
     ctx: &BotContext,
-    avoid_groups: &HashSet<String>,
+    preferred_avoid_groups: &HashSet<String>,
+    previous_group: Option<&str>,
 ) -> anyhow::Result<FetchedQuestion> {
     let is_empty = ctx.state.lock().await.cached_questions.is_empty();
     if is_empty {
         prefetch(ctx).await?;
     }
 
+    if let Some(q) = cached_question_excluding(ctx, preferred_avoid_groups).await {
+        info!(category = %q.category, "Selected preferred diverse cache fallback");
+        return Ok(q);
+    }
+
+    let strict_avoid: HashSet<String> = previous_group.iter().map(|group| normalise(group)).collect();
+    if let Some(q) = cached_question_excluding(ctx, &strict_avoid).await {
+        info!(
+            category = %q.category,
+            excluded_recent = ?preferred_avoid_groups,
+            "Relaxed recent history while preserving consecutive-category exclusion"
+        );
+        return Ok(q);
+    }
+
+    let mut alternatives: Vec<_> = active_groups(&ctx.config.trivia.excluded_categories)
+        .into_iter()
+        .filter(|(name, _)| previous_group != Some(normalise(name).as_str()))
+        .collect();
+    alternatives.shuffle(&mut rand::thread_rng());
+    alternatives.sort_by_key(|(name, _)| preferred_avoid_groups.contains(&normalise(name)));
+
+    for (name, ids) in alternatives.iter().take(2) {
+        let category_id = *ids
+            .choose(&mut rand::thread_rng())
+            .expect("active category group has IDs");
+        match fetch_one(ctx, category_id).await {
+            Ok(q)
+                if category_group_for_category(&q.category)
+                    .is_some_and(|group| normalise(group) == normalise(name))
+                    && category_can_follow(previous_group, &q.category, alternatives.len() + 1) =>
+            {
+                info!(
+                    category_group = %name,
+                    category_id,
+                    "Fetched alternate category after cache fallback miss"
+                );
+                return Ok(q);
+            }
+            Ok(q) => warn!(
+                returned_category = %q.category,
+                previous_group = ?previous_group,
+                "Alternate category fetch still returned the previous group"
+            ),
+            Err(e) => warn!("Alternate category fetch failed for {name} ({category_id}): {e}"),
+        }
+    }
+
+    if !alternatives.is_empty() {
+        anyhow::bail!(
+            "no usable fallback outside previous category {:?}; refusing a consecutive category",
+            previous_group
+        );
+    }
+
+    warn!("Only one active category group; consecutive category is unavoidable");
+    next_question(ctx).await
+}
+
+async fn cached_question_excluding(
+    ctx: &BotContext,
+    excluded_groups: &HashSet<String>,
+) -> Option<FetchedQuestion> {
     let cache_len = ctx.state.lock().await.cached_questions.len();
     for _ in 0..cache_len {
-        let q = ctx
-            .state
-            .lock()
-            .await
-            .cached_questions
-            .pop_front()
-            .ok_or_else(|| anyhow::anyhow!("question cache became empty"))?;
+        let q = ctx.state.lock().await.cached_questions.pop_front()?;
         let group = normalise(&category_group_label(&q.category));
         if !question_is_valid(&q) {
             warn!("Discarding malformed question already present in cache");
             continue;
         }
-        if avoid_groups.contains(&group)
+        if excluded_groups.contains(&group)
             || !category_is_active(&q.category, &ctx.config.trivia.excluded_categories)
         {
             ctx.state.lock().await.cached_questions.push_back(q);
@@ -696,15 +774,10 @@ async fn next_question_avoiding(
         }
         if !ctx.db.question_exists(&q.question).await.unwrap_or(false) {
             info!(category = %q.category, "Selected category-aware cache fallback");
-            return Ok(q);
+            return Some(q);
         }
     }
-
-    warn!(
-        excluded_recent = ?avoid_groups,
-        "No cache fallback satisfied category diversity; relaxing the recent-category window"
-    );
-    next_question(ctx).await
+    None
 }
 
 /// Pop the next question from the cache, skipping any already asked in a
@@ -866,5 +939,12 @@ mod tests {
             category_group_for_category("Science & Nature"),
             Some("Science & Technology")
         );
+    }
+
+    #[test]
+    fn consecutive_normalized_categories_are_rejected_when_alternatives_exist() {
+        assert!(!category_can_follow(Some("geography"), " Geography ", 10));
+        assert!(category_can_follow(Some("geography"), "History", 10));
+        assert!(category_can_follow(Some("geography"), "Geography", 1));
     }
 }

@@ -158,12 +158,17 @@ async fn post_previous_month(
     let result = async {
         let (start, end) = month.utc_bounds(tz)?;
         let entries = ctx.db.monthly_leaderboard(start, end).await?;
+        let question_count = ctx.db.question_count_between(start, end).await?;
         let room = client
             .get_room(&ctx.room_id)
             .ok_or_else(|| anyhow::anyhow!("bot is not in leaderboard room"))?;
         let txn_id: OwnedTransactionId = transaction_id.clone().into();
         let response = room
-            .send(crate::leaderboard::monthly_content(month, &entries))
+            .send(crate::leaderboard::monthly_content(
+                month,
+                question_count,
+                &entries,
+            ))
             .with_transaction_id(txn_id)
             .await?;
         ctx.db

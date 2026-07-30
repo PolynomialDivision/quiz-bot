@@ -23,8 +23,10 @@ pub struct Db {
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct LeaderboardEntry {
     pub user_id: String,
+    pub display_name: Option<String>,
     pub total_correct: i64,
     pub total_questions: i64,
     pub rounds_played: i64,
@@ -34,14 +36,7 @@ pub struct LeaderboardEntry {
     pub wilson_score: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MonthlyLeaderboardEntry {
-    pub user_id: String,
-    pub display_name: Option<String>,
-    pub total_correct: i64,
-    pub total_questions: i64,
-    pub rounds_played: i64,
-}
+pub type MonthlyLeaderboardEntry = LeaderboardEntry;
 
 // ── Wilson score ──────────────────────────────────────────────────────────────
 
@@ -485,23 +480,26 @@ impl Db {
 
 impl Db {
     pub async fn leaderboard(&self) -> Result<Vec<LeaderboardEntry>> {
-        let mut entries = self
+        let entries = self
             .run(|conn| {
                 let mut stmt = conn.prepare_cached(
                     "SELECT
-                     user_id,
-                     SUM(correct_count) AS total_correct,
-                     SUM(total_count)   AS total_questions,
-                     COUNT(*)           AS rounds_played
-                 FROM round_scores
-                 GROUP BY user_id",
+                     rs.user_id,
+                     p.display_name,
+                     SUM(rs.correct_count) AS total_correct,
+                     SUM(rs.total_count)   AS total_questions,
+                     COUNT(*)              AS rounds_played
+                 FROM round_scores rs
+                 LEFT JOIN players p ON p.user_id = rs.user_id
+                 GROUP BY rs.user_id, p.display_name",
                 )?;
                 let rows = stmt.query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -509,28 +507,7 @@ impl Db {
             })
             .await?;
 
-        // Compute Wilson score and sort in Rust — SQLite lacks sqrt() by default.
-        let mut result: Vec<LeaderboardEntry> = entries
-            .drain(..)
-            .map(|(user_id, correct, total, rounds)| LeaderboardEntry {
-                wilson_score: wilson_lower_bound(correct, total),
-                user_id,
-                total_correct: correct,
-                total_questions: total,
-                rounds_played: rounds,
-            })
-            .collect();
-
-        result.sort_by(|a, b| {
-            b.wilson_score
-                .partial_cmp(&a.wilson_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // Tie-break: more questions answered first, then alphabetical.
-                .then(b.total_questions.cmp(&a.total_questions))
-                .then(a.user_id.cmp(&b.user_id))
-        });
-
-        Ok(result)
+        Ok(rank_entries(entries))
     }
 
     pub async fn user_stats(&self, user_id: &str) -> Result<Option<UserStatsRow>> {
@@ -639,7 +616,7 @@ impl Db {
     ) -> Result<Vec<MonthlyLeaderboardEntry>> {
         let start = start_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
         let end = end_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
-        self.run(move |conn| {
+        let entries = self.run(move |conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT rs.user_id,
                         p.display_name,
@@ -652,20 +629,40 @@ impl Db {
                  WHERE r.ended_at IS NOT NULL
                    AND r.started_at >= ?1
                    AND r.started_at < ?2
-                 GROUP BY rs.user_id, p.display_name
-                 ORDER BY total_correct DESC, total_questions DESC, rs.user_id ASC",
+                 GROUP BY rs.user_id, p.display_name",
             )?;
             let rows = stmt.query_map(params![start, end], |r| {
-                Ok(MonthlyLeaderboardEntry {
-                    user_id: r.get(0)?,
-                    display_name: r.get(1)?,
-                    total_correct: r.get(2)?,
-                    total_questions: r.get(3)?,
-                    rounds_played: r.get(4)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(anyhow::Error::from)
+        })
+        .await?;
+        Ok(rank_entries(entries))
+    }
+
+    pub async fn question_count_between(
+        &self,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<i64> {
+        let start = start_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let end = end_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+        self.run(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*)
+                 FROM questions q
+                 JOIN rounds r ON r.id = q.round_id
+                 WHERE r.started_at >= ?1 AND r.started_at < ?2",
+                params![start, end],
+                |r| r.get(0),
+            )?)
         })
         .await
     }
@@ -735,6 +732,32 @@ impl Db {
         })
         .await
     }
+}
+
+fn rank_entries(
+    entries: Vec<(String, Option<String>, i64, i64, i64)>,
+) -> Vec<LeaderboardEntry> {
+    let mut result: Vec<_> = entries
+        .into_iter()
+        .map(
+            |(user_id, display_name, correct, total, rounds)| LeaderboardEntry {
+                user_id,
+                display_name,
+                total_correct: correct,
+                total_questions: total,
+                rounds_played: rounds,
+                wilson_score: wilson_lower_bound(correct, total),
+            },
+        )
+        .collect();
+    result.sort_by(|a, b| {
+        b.wilson_score
+            .partial_cmp(&a.wilson_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.total_questions.cmp(&a.total_questions))
+            .then(a.user_id.cmp(&b.user_id))
+    });
+    result
 }
 
 // ── Extended stats queries ────────────────────────────────────────────────────
@@ -974,5 +997,38 @@ mod tests {
         assert_eq!(entries[1].total_correct, 4);
         assert_eq!(entries[0].display_name.as_deref(), Some("Alice"));
         assert_eq!(entries[1].display_name.as_deref(), Some("Bob"));
+    }
+
+    #[tokio::test]
+    async fn monthly_and_all_time_rank_by_wilson_score() {
+        let db = test_db().await;
+        db.run(|conn| {
+            conn.execute_batch(
+                "INSERT INTO rounds
+                    (id, room_id, started_at, ended_at, n_questions_planned,
+                     n_questions_actual, triggered_by)
+                 VALUES
+                    (1, '!room:example.org', '2026-07-10T12:00:00.000Z',
+                     '2026-07-10T12:05:00.000Z', 100, 100, 'test');
+                 INSERT INTO round_scores
+                    (round_id, user_id, correct_count, total_count)
+                 VALUES
+                    (1, '@lucky:example.org', 5, 5),
+                    (1, '@veteran:example.org', 80, 100);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let monthly = db.monthly_leaderboard(start, end).await.unwrap();
+        let all_time = db.leaderboard().await.unwrap();
+
+        assert_eq!(monthly[0].user_id, "@veteran:example.org");
+        assert_eq!(all_time[0].user_id, "@veteran:example.org");
+        assert!(monthly[0].wilson_score > monthly[1].wilson_score);
+        assert!(all_time[0].wilson_score > all_time[1].wilson_score);
     }
 }

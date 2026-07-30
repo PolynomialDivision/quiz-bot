@@ -12,6 +12,13 @@ pub struct YearMonth {
 }
 
 impl YearMonth {
+    pub fn containing(date: NaiveDate) -> Self {
+        Self {
+            year: date.year(),
+            month: date.month(),
+        }
+    }
+
     pub fn previous(date: NaiveDate) -> Self {
         if date.month() == 1 {
             Self {
@@ -30,7 +37,7 @@ impl YearMonth {
         format!("{:04}-{:02}", self.year, self.month)
     }
 
-    pub fn label(self) -> String {
+    pub fn month_name(self) -> &'static str {
         const MONTHS: [&str; 12] = [
             "January",
             "February",
@@ -45,7 +52,7 @@ impl YearMonth {
             "November",
             "December",
         ];
-        format!("{} {}", MONTHS[(self.month - 1) as usize], self.year)
+        MONTHS[(self.month - 1) as usize]
     }
 
     pub fn utc_bounds(self, tz: Tz) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -80,11 +87,17 @@ fn local_day_start(tz: Tz, date: NaiveDate) -> Result<DateTime<Utc>> {
 }
 
 fn safe_name(entry: &MonthlyLeaderboardEntry) -> String {
+    let fallback = entry
+        .user_id
+        .split(':')
+        .next()
+        .unwrap_or(&entry.user_id)
+        .trim_start_matches('@');
     entry
         .display_name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or(&entry.user_id)
+        .unwrap_or(fallback)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
@@ -107,75 +120,50 @@ fn escape_html(value: &str) -> String {
     escaped
 }
 
-pub fn monthly_content(
-    month: YearMonth,
+pub fn leaderboard_text(
+    title: &str,
+    question_count: i64,
     entries: &[MonthlyLeaderboardEntry],
-) -> RoomMessageEventContent {
-    if entries.is_empty() {
-        let body = format!("📊 {} leaderboard\nNo scores this month.", month.label());
-        return RoomMessageEventContent::text_html(
-            body,
-            format!(
-                "<p><strong>📊 {} leaderboard</strong><br>No scores this month.</p>",
-                escape_html(&month.label())
-            ),
-        );
-    }
-
-    let winning_score = entries[0].total_correct;
-    let winners: Vec<_> = entries
-        .iter()
-        .take_while(|entry| entry.total_correct == winning_score)
-        .map(safe_name)
-        .collect();
-    let winner_word = if winners.len() == 1 {
-        "Winner"
-    } else {
-        "Winners"
-    };
-    let winner_suffix = if winners.len() == 1 { "" } else { " each" };
-    let title = format!("🏆 {} {winner_word}", month.label());
-    let winner_line = format!(
-        "{} — {winning_score} points{winner_suffix}",
-        winners.join(", ")
-    );
-
-    let mut plain = vec![title.clone(), winner_line, String::new()];
-    let mut html = format!(
-        "<p><strong>{}</strong><br>{} — <strong>{winning_score} points{winner_suffix}</strong></p>",
-        escape_html(&title),
-        escape_html(&winners.join(", ")),
-    );
-    let mut previous_score = None;
-    let mut rank = 0;
-
+) -> String {
+    let mut lines = vec![format!("🏆 {title} · {question_count} Qs:")];
     for (index, entry) in entries.iter().enumerate() {
-        if previous_score != Some(entry.total_correct) {
-            rank = index + 1;
-            previous_score = Some(entry.total_correct);
-        }
-        let marker = match rank {
-            1 => "🥇",
-            2 => "🥈",
-            3 => "🥉",
+        let marker = match index {
+            0 => "🥇",
+            1 => "🥈",
+            2 => "🥉",
             _ => "▪️",
         };
-        let name = safe_name(entry);
-        plain.push(format!("{marker} {name}"));
-        plain.push(format!(
-            "{} points · {} questions · {} rounds",
-            entry.total_correct, entry.total_questions, entry.rounds_played
-        ));
-        html.push_str(&format!(
-            "<p>{marker} <strong>{}</strong><br>{} points · {} questions · {} rounds</p>",
-            escape_html(&name),
+        let accuracy = if entry.total_questions > 0 {
+            entry.total_correct * 100 / entry.total_questions
+        } else {
+            0
+        };
+        lines.push(format!(
+            "{marker} {} · {}/{} ({}%) · ⭐{:.0}%",
+            safe_name(entry),
             entry.total_correct,
             entry.total_questions,
-            entry.rounds_played,
+            accuracy,
+            entry.wilson_score * 100.0,
         ));
     }
+    lines.join("\n")
+}
 
-    RoomMessageEventContent::text_html(plain.join("\n"), html)
+pub fn monthly_content(
+    month: YearMonth,
+    question_count: i64,
+    entries: &[MonthlyLeaderboardEntry],
+) -> RoomMessageEventContent {
+    let plain = leaderboard_text(month.month_name(), question_count, entries);
+    let mut html_lines = plain.lines();
+    let header = html_lines.next().unwrap_or_default();
+    let mut html = format!("<strong>{}</strong>", escape_html(header));
+    for line in html_lines {
+        html.push_str("<br>");
+        html.push_str(&escape_html(line));
+    }
+    RoomMessageEventContent::text_html(plain, html)
 }
 
 #[cfg(test)]
@@ -185,13 +173,14 @@ mod tests {
 
     use super::*;
 
-    fn entry(name: &str, score: i64) -> MonthlyLeaderboardEntry {
+    fn entry(name: &str, correct: i64, total: i64) -> MonthlyLeaderboardEntry {
         MonthlyLeaderboardEntry {
             user_id: format!("@{}:example.org", name.to_lowercase()),
             display_name: Some(name.to_owned()),
-            total_correct: score,
-            total_questions: 20,
+            total_correct: correct,
+            total_questions: total,
             rounds_played: 4,
+            wilson_score: crate::db::wilson_lower_bound(correct, total),
         }
     }
 
@@ -225,22 +214,34 @@ mod tests {
     }
 
     #[test]
-    fn tied_winners_and_mobile_lines_are_rendered() {
+    fn monthly_leaderboard_uses_compact_weighted_format() {
         let content = monthly_content(
             YearMonth {
                 year: 2026,
                 month: 7,
             },
-            &[entry("Alice", 12), entry("Bob", 12), entry("Cara", 9)],
+            42,
+            &[entry("Alice", 30, 40), entry("Bob", 12, 20)],
         );
         let MessageType::Text(text) = content.msgtype else {
             panic!("expected text")
         };
-        assert!(text.body.contains("July 2026 Winners"));
-        assert!(text.body.contains("Alice, Bob — 12 points each"));
-        assert!(text.body.contains("🥇 Alice\n12 points"));
-        assert!(text.body.contains("🥇 Bob\n12 points"));
-        assert!(!text.body.contains('|'));
+        assert_eq!(
+            text.body,
+            "🏆 July · 42 Qs:\n\
+             🥇 Alice · 30/40 (75%) · ⭐60%\n\
+             🥈 Bob · 12/20 (60%) · ⭐39%"
+        );
+    }
+
+    #[test]
+    fn all_time_leaderboard_uses_the_same_format() {
+        let text = leaderboard_text("All-time", 653, &[entry("yakari", 98, 130)]);
+        assert_eq!(
+            text,
+            "🏆 All-time · 653 Qs:\n\
+             🥇 yakari · 98/130 (75%) · ⭐67%"
+        );
     }
 
     #[test]
@@ -250,7 +251,8 @@ mod tests {
                 year: 2026,
                 month: 7,
             },
-            &[entry("<Alice & Co>\nAdmin", 12)],
+            12,
+            &[entry("<Alice & Co>\nAdmin", 10, 12)],
         );
         let MessageType::Text(text) = content.msgtype else {
             panic!("expected text")

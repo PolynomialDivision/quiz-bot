@@ -118,34 +118,12 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
     if board.is_empty() {
         return Ok(Some("No scores yet.".to_owned()));
     }
-    let round_count = ctx.db.round_count().await.unwrap_or(0);
-    let mut lines = vec![format!("🏆 **All-time Leaderboard** · {} rounds", round_count)];
-    lines.push(String::new());
-    for (i, entry) in board.iter().enumerate() {
-        let pct = if entry.total_questions > 0 {
-            entry.total_correct * 100 / entry.total_questions
-        } else {
-            0
-        };
-        let medal = match i {
-            0 => "🥇",
-            1 => "🥈",
-            2 => "🥉",
-            _ => "  ",
-        };
-        lines.push(format!(
-            "{medal} {}",
-            entry.user_id,
-        ));
-        lines.push(format!(
-            "{}/{} correct ({}%) · ⭐{:.0}%",
-            entry.total_correct,
-            entry.total_questions,
-            pct,
-            entry.wilson_score * 100.0,
-        ));
-    }
-    Ok(Some(lines.join("\n")))
+    let question_count = ctx.db.question_count().await.unwrap_or(0);
+    Ok(Some(crate::leaderboard::leaderboard_text(
+        "All-time",
+        question_count,
+        &board,
+    )))
 }
 
 // ── !mystats ──────────────────────────────────────────────────────────────────
