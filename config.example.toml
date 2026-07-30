@@ -56,5 +56,12 @@ timezone = "Europe/Berlin"
 # How many questions to fetch per API call (1–50, default 10).
 batch_size = 10
 
+# Category groups to exclude entirely (optional).
+# excluded_categories = ["Sports", "Celebrities"]
+
+# Avoid groups used by this many recently asked questions. This is a preference,
+# so configurations with only a few active categories still work.
+recent_category_window = 5
+
 # Data is stored in SQLite at $STORE_PATH/quiz.db — no separate database
 # process or configuration required.

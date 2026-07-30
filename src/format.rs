@@ -91,9 +91,11 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
             if token.len() > 4 && token.contains(':') {
                 let label = label_for(token);
                 plain.push_str(label);
-                html.push_str(&format!(
-                    r#"<a href="https://matrix.to/#/{token}">{label}</a>"#
-                ));
+                html.push_str(r#"<a href="https://matrix.to/#/"#);
+                push_escaped(&mut html, token);
+                html.push_str(r#"">"#);
+                push_escaped(&mut html, label);
+                html.push_str("</a>");
                 found = true;
                 pos += token_len;
                 continue;
@@ -122,6 +124,19 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         RoomMessageEventContent::text_html(plain, html)
     } else {
         RoomMessageEventContent::text_plain(text)
+    }
+}
+
+fn push_escaped(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
     }
 }
 
@@ -213,5 +228,19 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains(">Alice Smith<"));
         assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+    }
+
+    #[test]
+    fn with_names_escapes_display_name_html() {
+        let mut names = HashMap::new();
+        names.insert(
+            "@alice:example.org".to_owned(),
+            "<Alice & Co>".to_owned(),
+        );
+        let c = mentionify_with_names("@alice:example.org", &names);
+        let (_, html) = bodies(&c);
+        let html = html.expect("should have HTML body");
+        assert!(html.contains("&lt;Alice &amp; Co&gt;"));
+        assert!(!html.contains("><Alice"));
     }
 }

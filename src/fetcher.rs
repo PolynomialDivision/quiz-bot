@@ -3,10 +3,11 @@
 //! Uses a session token to avoid repeating questions until the full pool is
 //! exhausted, then resets the token automatically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -44,7 +45,12 @@ pub const CATEGORY_GROUPS: &[(&str, &[u32])] = &[
 /// Normalise a category name for exclusion matching:
 /// lower-case and replace " & " with " and ".
 pub fn normalise(s: &str) -> String {
-    s.to_lowercase().replace(" & ", " and ")
+    s.trim()
+        .to_lowercase()
+        .replace('&', " and ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Map OpenTDB's raw category names back to the bot's balanced groups.
@@ -171,6 +177,23 @@ fn decode(s: &str) -> String {
         .unwrap_or_else(|| s.to_owned())
 }
 
+fn question_is_valid(q: &FetchedQuestion) -> bool {
+    if q.category.trim().is_empty()
+        || q.difficulty.trim().is_empty()
+        || q.question.trim().is_empty()
+        || q.correct_answer.trim().is_empty()
+        || q.incorrect_answers.len() != 3
+    {
+        return false;
+    }
+
+    let mut answers = HashSet::new();
+    answers.insert(normalise(q.correct_answer.trim()));
+    q.incorrect_answers
+        .iter()
+        .all(|answer| !answer.trim().is_empty() && answers.insert(normalise(answer.trim())))
+}
+
 // ── Token management ──────────────────────────────────────────────────────────
 
 /// Return the stored session token, requesting a fresh one if none exists.
@@ -265,7 +288,7 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
 
         match resp.response_code {
             0 => {
-                let questions: Vec<FetchedQuestion> = resp
+                let decoded: Vec<FetchedQuestion> = resp
                     .results
                     .unwrap_or_default()
                     .into_iter()
@@ -277,7 +300,19 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                         incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
                     })
                     .collect();
+                let total_decoded = decoded.len();
+                let questions: Vec<_> = decoded.into_iter().filter(question_is_valid).collect();
                 let n = questions.len();
+                if n < total_decoded {
+                    warn!(
+                        "OpenTDB category {category}: discarded {} malformed questions",
+                        total_decoded - n
+                    );
+                }
+                if n == 0 {
+                    warn!("OpenTDB category {category}: response contained no usable questions");
+                    continue;
+                }
                 let mut state = ctx.state.lock().await;
                 state.cached_questions.extend(questions);
                 state.save(&ctx.state_path).await?;
@@ -312,34 +347,121 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
     anyhow::bail!("OpenTDB prefetch failed after {MAX_ATTEMPTS} attempts")
 }
 
-/// Pick `n` category IDs from the historically least-used active groups.
-/// Equal counts are shuffled so the sequence does not become deterministic.
-async fn pick_round_categories(ctx: &BotContext, n: usize) -> Vec<u32> {
-    let mut groups = active_groups(&ctx.config.trivia.excluded_categories);
-    let mut counts: HashMap<String, i64> = ctx
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CategoryChoice {
+    group: String,
+    category_id: u32,
+}
+
+/// Prefer groups outside the recent window, then choose the least-used group.
+/// Recent exclusions are relaxed when necessary and groups are not repeated
+/// within a round until every active group has been used.
+fn select_round_categories<R: Rng + ?Sized>(
+    groups: &[(&str, &[u32])],
+    initial_counts: &HashMap<String, i64>,
+    recent: &[String],
+    n: usize,
+    rng: &mut R,
+) -> Vec<CategoryChoice> {
+    let mut counts = initial_counts.clone();
+    let recent_norm: HashSet<String> = recent.iter().map(|name| normalise(name)).collect();
+    let mut used_in_round = HashSet::new();
+    let mut choices: Vec<CategoryChoice> = Vec::with_capacity(n);
+
+    while choices.len() < n {
+        if used_in_round.len() == groups.len() {
+            used_in_round.clear();
+        }
+
+        let available: Vec<_> = groups
+            .iter()
+            .copied()
+            .filter(|(name, _)| !used_in_round.contains(&normalise(name)))
+            .collect();
+        let last_group = choices.last().map(|choice| normalise(&choice.group));
+        let non_repeating: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|(name, _)| {
+                groups.len() == 1 || last_group.as_deref() != Some(normalise(name).as_str())
+            })
+            .collect();
+        let available = if non_repeating.is_empty() {
+            available
+        } else {
+            non_repeating
+        };
+        let preferred: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|(name, _)| !recent_norm.contains(&normalise(name)))
+            .collect();
+        let pool = if preferred.is_empty() {
+            &available
+        } else {
+            &preferred
+        };
+        let min_count = pool
+            .iter()
+            .map(|(name, _)| counts.get(*name).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let least_used: Vec<_> = pool
+            .iter()
+            .copied()
+            .filter(|(name, _)| counts.get(*name).copied().unwrap_or(0) == min_count)
+            .collect();
+        let (name, ids) = least_used.choose(rng).expect("active category pool is non-empty");
+        let category_id = ids
+            .choose(rng)
+            .copied()
+            .expect("category group has IDs");
+
+        choices.push(CategoryChoice {
+            group: (*name).to_owned(),
+            category_id,
+        });
+        used_in_round.insert(normalise(name));
+        *counts.entry((*name).to_owned()).or_insert(0) += 1;
+    }
+
+    choices
+}
+
+async fn pick_round_categories(ctx: &BotContext, n: usize) -> Vec<CategoryChoice> {
+    let groups = active_groups(&ctx.config.trivia.excluded_categories);
+    let counts: HashMap<String, i64> = ctx
         .db
         .category_group_counts()
         .await
         .unwrap_or_default()
         .into_iter()
         .collect();
-
+    let recent = ctx
+        .db
+        .recent_category_groups(ctx.config.trivia.recent_category_window)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Could not load recent category history: {e}");
+            Vec::new()
+        });
+    let candidate_names: Vec<_> = groups.iter().map(|(name, _)| *name).collect();
+    info!(
+        candidates = ?candidate_names,
+        excluded_recent = ?recent,
+        lifetime_counts = ?counts,
+        "Selecting round categories"
+    );
     let mut rng = rand::thread_rng();
-    let mut picked = Vec::with_capacity(n);
-    while picked.len() < n {
-        groups.shuffle(&mut rng);
-        groups.sort_by_key(|(name, _)| counts.get(*name).copied().unwrap_or(0));
-
-        for (name, ids) in &groups {
-            if picked.len() == n {
-                break;
-            }
-            picked.push(*ids.choose(&mut rng).unwrap());
-            *counts.entry((*name).to_owned()).or_insert(0) += 1;
-        }
+    let choices = select_round_categories(&groups, &counts, &recent, n, &mut rng);
+    for choice in &choices {
+        info!(
+            category_group = %choice.group,
+            category_id = choice.category_id,
+            "Selected round category"
+        );
     }
-
-    picked
+    choices
 }
 
 /// Fetch exactly one question from a specific OpenTDB category, skipping
@@ -392,6 +514,10 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                         correct_answer: decode(&q.correct_answer),
                         incorrect_answers: q.incorrect_answers.iter().map(|s| decode(s)).collect(),
                     };
+                    if !question_is_valid(&fetched) {
+                        warn!("Discarding malformed OpenTDB question for category {category}");
+                        continue;
+                    }
                     let already_asked = ctx
                         .db
                         .question_exists(&fetched.question)
@@ -480,28 +606,105 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
     const RATE_LIMIT_SECS: u64 = 6;
 
     let mut questions = Vec::with_capacity(n);
-    for (i, category) in categories.into_iter().enumerate() {
+    let recent = ctx
+        .db
+        .recent_category_groups(ctx.config.trivia.recent_category_window)
+        .await
+        .unwrap_or_default();
+    let mut avoid_groups: HashSet<String> = recent.iter().map(|name| normalise(name)).collect();
+
+    for (i, choice) in categories.into_iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(RATE_LIMIT_SECS)).await;
         }
-        match fetch_one(ctx, category).await {
-            Ok(q) => {
+        match fetch_one(ctx, choice.category_id).await {
+            Ok(q)
+                if category_group_for_category(&q.category)
+                    .is_some_and(|group| normalise(group) == normalise(&choice.group)) =>
+            {
                 info!(
-                    "Round question ready: category {category} (\"{}\")",
+                    "Round question ready: category {} (\"{}\")",
+                    choice.category_id,
                     q.category
                 );
+                avoid_groups.insert(normalise(&choice.group));
                 questions.push(q);
             }
+            Ok(q) => {
+                warn!(
+                    requested_group = %choice.group,
+                    requested_category_id = choice.category_id,
+                    returned_category = %q.category,
+                    "OpenTDB returned an unexpected or recently used category; using cache fallback"
+                );
+                match next_question_avoiding(ctx, &avoid_groups).await {
+                    Ok(fallback) => {
+                        let group = normalise(&category_group_label(&fallback.category));
+                        avoid_groups.insert(group);
+                        questions.push(fallback);
+                    }
+                    Err(e) => warn!("Cache fallback also failed: {e}"),
+                }
+            }
             Err(e) => {
-                warn!("fetch_one failed for category {category}: {e} — falling back to cache");
-                match next_question(ctx).await {
-                    Ok(q) => questions.push(q),
+                warn!(
+                    "fetch_one failed for category {}: {e} — falling back to cache",
+                    choice.category_id
+                );
+                match next_question_avoiding(ctx, &avoid_groups).await {
+                    Ok(q) => {
+                        let group = normalise(&category_group_label(&q.category));
+                        avoid_groups.insert(group);
+                        questions.push(q);
+                    }
                     Err(e2) => warn!("Cache fallback also failed: {e2}"),
                 }
             }
         }
     }
     questions
+}
+
+async fn next_question_avoiding(
+    ctx: &BotContext,
+    avoid_groups: &HashSet<String>,
+) -> anyhow::Result<FetchedQuestion> {
+    let is_empty = ctx.state.lock().await.cached_questions.is_empty();
+    if is_empty {
+        prefetch(ctx).await?;
+    }
+
+    let cache_len = ctx.state.lock().await.cached_questions.len();
+    for _ in 0..cache_len {
+        let q = ctx
+            .state
+            .lock()
+            .await
+            .cached_questions
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("question cache became empty"))?;
+        let group = normalise(&category_group_label(&q.category));
+        if !question_is_valid(&q) {
+            warn!("Discarding malformed question already present in cache");
+            continue;
+        }
+        if avoid_groups.contains(&group)
+            || !category_is_active(&q.category, &ctx.config.trivia.excluded_categories)
+        {
+            ctx.state.lock().await.cached_questions.push_back(q);
+            continue;
+        }
+        if !ctx.db.question_exists(&q.question).await.unwrap_or(false) {
+            info!(category = %q.category, "Selected category-aware cache fallback");
+            return Ok(q);
+        }
+    }
+
+    warn!(
+        excluded_recent = ?avoid_groups,
+        "No cache fallback satisfied category diversity; relaxing the recent-category window"
+    );
+    next_question(ctx).await
 }
 
 /// Pop the next question from the cache, skipping any already asked in a
@@ -529,6 +732,11 @@ pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> 
             .cached_questions
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("OpenTDB returned no questions"))?;
+
+        if !question_is_valid(&q) {
+            warn!("Discarding malformed question already present in cache");
+            continue;
+        }
 
         if ctx.config.trivia.category.is_none()
             && !category_is_active(&q.category, &ctx.config.trivia.excluded_categories)
@@ -575,4 +783,88 @@ pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> 
     }
 
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use super::*;
+
+    #[test]
+    fn underused_group_is_not_selected_three_rounds_in_a_row() {
+        let groups: &[(&str, &[u32])] = &[
+            ("Politics", &[24]),
+            ("History", &[23]),
+            ("Art", &[25]),
+        ];
+        let mut counts = HashMap::from([
+            ("Politics".to_owned(), 0),
+            ("History".to_owned(), 50),
+            ("Art".to_owned(), 50),
+        ]);
+        let mut recent = Vec::new();
+        let mut selected = Vec::new();
+        let mut rng = StdRng::seed_from_u64(7);
+
+        for _ in 0..3 {
+            let choice = select_round_categories(groups, &counts, &recent, 1, &mut rng)
+                .pop()
+                .unwrap();
+            *counts.entry(choice.group.clone()).or_default() += 1;
+            recent.insert(0, choice.group.clone());
+            recent.truncate(2);
+            selected.push(choice.group);
+        }
+
+        assert_eq!(selected[0], "Politics");
+        assert_ne!(selected[1], "Politics");
+        assert_ne!(selected[2], "Politics");
+    }
+
+    #[test]
+    fn a_round_uses_distinct_groups_when_enough_are_active() {
+        let groups: &[(&str, &[u32])] = &[
+            ("Politics", &[24]),
+            ("History", &[23]),
+            ("Art", &[25]),
+            ("Animals", &[27]),
+        ];
+        let mut rng = StdRng::seed_from_u64(9);
+        let choices = select_round_categories(groups, &HashMap::new(), &[], 4, &mut rng);
+        let unique: HashSet<_> = choices.iter().map(|choice| &choice.group).collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn small_category_pools_relax_without_adjacent_repeats() {
+        let groups: &[(&str, &[u32])] = &[("Politics", &[24]), ("History", &[23])];
+        let recent = vec!["Politics".to_owned(), "History".to_owned()];
+        let mut rng = StdRng::seed_from_u64(11);
+        let choices = select_round_categories(groups, &HashMap::new(), &recent, 5, &mut rng);
+
+        assert_eq!(choices.len(), 5);
+        assert!(choices.windows(2).all(|pair| pair[0].group != pair[1].group));
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_answers() {
+        let malformed = FetchedQuestion {
+            category: "History".to_owned(),
+            difficulty: "easy".to_owned(),
+            question: "Question?".to_owned(),
+            correct_answer: "Same".to_owned(),
+            incorrect_answers: vec!["same".to_owned(), "Other".to_owned(), "Third".to_owned()],
+        };
+        assert!(!question_is_valid(&malformed));
+    }
+
+    #[test]
+    fn category_aliases_are_normalized_consistently() {
+        assert_eq!(normalise("  Science  &  Technology "), "science and technology");
+        assert_eq!(
+            category_group_for_category("Science & Nature"),
+            Some("Science & Technology")
+        );
+    }
 }

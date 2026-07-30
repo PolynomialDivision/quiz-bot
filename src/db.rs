@@ -4,7 +4,7 @@
 //! state.json.  No separate process or configuration required.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection};
 use std::{
     collections::HashMap,
@@ -32,6 +32,15 @@ pub struct LeaderboardEntry {
     /// Ranges 0..1; penalises small sample sizes so occasional lucky players
     /// don't outrank consistent regulars.
     pub wilson_score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonthlyLeaderboardEntry {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub total_correct: i64,
+    pub total_questions: i64,
+    pub rounds_played: i64,
 }
 
 // ── Wilson score ──────────────────────────────────────────────────────────────
@@ -146,6 +155,8 @@ impl Db {
                 .context("Applying DB schema")?;
             conn.execute_batch(include_str!("../migrations/002_fix_round_totals.sql"))
                 .context("Backfilling round_scores.total_count")?;
+            conn.execute_batch(include_str!("../migrations/003_monthly_leaderboard.sql"))
+                .context("Applying monthly leaderboard schema")?;
             Self::migrate_category_group_column(conn)
                 .context("Migrating questions.category_group")?;
             Ok(())
@@ -305,15 +316,34 @@ impl Db {
         .await
     }
 
-    pub async fn finish_round(&self, round_id: i64, n_actual: i32) -> Result<()> {
+    pub async fn finish_round_with_scores(
+        &self,
+        round_id: i64,
+        n_actual: i32,
+        scores: &HashMap<String, (u32, u32)>,
+    ) -> Result<()> {
+        let scores = scores.clone();
         self.run(move |conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "UPDATE rounds
                  SET ended_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                      n_questions_actual = ?1
                  WHERE id = ?2",
                 params![n_actual, round_id],
             )?;
+            for (user_id, &(correct, total)) in &scores {
+                tx.execute(
+                    "INSERT INTO round_scores
+                        (round_id, user_id, correct_count, total_count)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (round_id, user_id) DO UPDATE
+                       SET correct_count = excluded.correct_count,
+                           total_count = excluded.total_count",
+                    params![round_id, user_id, correct as i64, total as i64],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -451,34 +481,6 @@ impl Db {
     }
 }
 
-// ── Round scores ──────────────────────────────────────────────────────────────
-
-impl Db {
-    pub async fn write_round_scores(
-        &self,
-        round_id: i64,
-        scores: &HashMap<String, (u32, u32)>,
-    ) -> Result<()> {
-        let scores = scores.clone();
-        self.run(move |conn| {
-            let tx = conn.transaction()?;
-            for (user_id, &(correct, total)) in &scores {
-                tx.execute(
-                    "INSERT INTO round_scores (round_id, user_id, correct_count, total_count)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (round_id, user_id) DO UPDATE
-                       SET correct_count = excluded.correct_count,
-                           total_count   = excluded.total_count",
-                    params![round_id, user_id, correct as i64, total as i64],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
-}
-
 // ── Stats queries ─────────────────────────────────────────────────────────────
 
 impl Db {
@@ -581,7 +583,11 @@ impl Db {
         let question_text = question_text.to_owned();
         self.run(move |conn| {
             Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM questions WHERE question_text = ?1)",
+                "SELECT EXISTS(
+                    SELECT 1 FROM questions
+                    WHERE question_text = ?1
+                       OR lower(trim(question_text)) = lower(trim(?1))
+                 )",
                 params![question_text],
                 |r| r.get::<_, bool>(0),
             )?)
@@ -600,6 +606,132 @@ impl Db {
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+    }
+
+    pub async fn recent_category_groups(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.run(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COALESCE(category_group, category)
+                 FROM questions
+                 ORDER BY asked_at DESC, id DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        })
+        .await
+    }
+}
+
+// ── Monthly leaderboard ──────────────────────────────────────────────────────
+
+impl Db {
+    pub async fn monthly_leaderboard(
+        &self,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Vec<MonthlyLeaderboardEntry>> {
+        let start = start_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let end = end_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+        self.run(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT rs.user_id,
+                        p.display_name,
+                        SUM(rs.correct_count) AS total_correct,
+                        SUM(rs.total_count) AS total_questions,
+                        COUNT(*) AS rounds_played
+                 FROM round_scores rs
+                 JOIN rounds r ON r.id = rs.round_id
+                 LEFT JOIN players p ON p.user_id = rs.user_id
+                 WHERE r.ended_at IS NOT NULL
+                   AND r.started_at >= ?1
+                   AND r.started_at < ?2
+                 GROUP BY rs.user_id, p.display_name
+                 ORDER BY total_correct DESC, total_questions DESC, rs.user_id ASC",
+            )?;
+            let rows = stmt.query_map(params![start, end], |r| {
+                Ok(MonthlyLeaderboardEntry {
+                    user_id: r.get(0)?,
+                    display_name: r.get(1)?,
+                    total_correct: r.get(2)?,
+                    total_questions: r.get(3)?,
+                    rounds_played: r.get(4)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(anyhow::Error::from)
+        })
+        .await
+    }
+
+    /// Atomically claim a month for posting. A stale claim can be reclaimed;
+    /// Matrix's deterministic transaction ID makes that retry idempotent.
+    pub async fn try_claim_monthly_post(
+        &self,
+        period: &str,
+        transaction_id: &str,
+    ) -> Result<bool> {
+        let period = period.to_owned();
+        let transaction_id = transaction_id.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO monthly_leaderboard_posts
+                    (period, transaction_id)
+                 VALUES (?1, ?2)",
+                params![period, transaction_id],
+            )?;
+            let claimed = if inserted == 1 {
+                true
+            } else {
+                tx.execute(
+                    "UPDATE monthly_leaderboard_posts
+                     SET claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE period = ?1
+                       AND posted_at IS NULL
+                       AND claimed_at < strftime(
+                           '%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes'
+                       )",
+                    params![period],
+                )? == 1
+            };
+            tx.commit()?;
+            Ok(claimed)
+        })
+        .await
+    }
+
+    pub async fn complete_monthly_post(&self, period: &str, event_id: &str) -> Result<()> {
+        let period = period.to_owned();
+        let event_id = event_id.to_owned();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE monthly_leaderboard_posts
+                 SET posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     matrix_event_id = ?2
+                 WHERE period = ?1",
+                params![period, event_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn release_monthly_post(&self, period: &str) -> Result<()> {
+        let period = period.to_owned();
+        self.run(move |conn| {
+            conn.execute(
+                "DELETE FROM monthly_leaderboard_posts
+                 WHERE period = ?1 AND posted_at IS NULL",
+                params![period],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -760,5 +892,87 @@ impl Db {
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    async fn test_db() -> Db {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.migrate().await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn monthly_post_claim_is_idempotent() {
+        let db = test_db().await;
+        assert!(
+            db.try_claim_monthly_post("2026-07", "monthly-2026-07")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.try_claim_monthly_post("2026-07", "monthly-2026-07")
+                .await
+                .unwrap()
+        );
+
+        db.complete_monthly_post("2026-07", "$event").await.unwrap();
+        db.release_monthly_post("2026-07").await.unwrap();
+        assert!(
+            !db.try_claim_monthly_post("2026-07", "monthly-2026-07")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn monthly_leaderboard_respects_half_open_month_bounds_and_ties() {
+        let db = test_db().await;
+        db.run(|conn| {
+            conn.execute_batch(
+                "INSERT INTO players (user_id, display_name) VALUES
+                    ('@alice:example.org', 'Alice'),
+                    ('@bob:example.org', 'Bob');
+                 INSERT INTO rounds
+                    (id, room_id, started_at, ended_at, n_questions_planned,
+                     n_questions_actual, triggered_by)
+                 VALUES
+                    (1, '!room:example.org', '2026-06-30T23:59:59.000Z',
+                     '2026-07-01T00:05:00.000Z', 5, 5, 'test'),
+                    (2, '!room:example.org', '2026-07-01T00:00:00.000Z',
+                     '2026-07-01T00:05:00.000Z', 5, 5, 'test'),
+                    (3, '!room:example.org', '2026-07-31T23:59:59.000Z',
+                     '2026-08-01T00:05:00.000Z', 5, 5, 'test'),
+                    (4, '!room:example.org', '2026-08-01T00:00:00.000Z',
+                     '2026-08-01T00:05:00.000Z', 5, 5, 'test');
+                 INSERT INTO round_scores
+                    (round_id, user_id, correct_count, total_count)
+                 VALUES
+                    (1, '@alice:example.org', 5, 5),
+                    (2, '@alice:example.org', 4, 5),
+                    (3, '@bob:example.org', 4, 5),
+                    (4, '@alice:example.org', 5, 5);",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let entries = db.monthly_leaderboard(start, end).await.unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].total_correct, 4);
+        assert_eq!(entries[1].total_correct, 4);
+        assert_eq!(entries[0].display_name.as_deref(), Some("Alice"));
+        assert_eq!(entries[1].display_name.as_deref(), Some("Bob"));
     }
 }

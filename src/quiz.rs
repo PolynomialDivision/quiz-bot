@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono_tz::Tz;
 use matrix_sdk::{
@@ -273,6 +273,9 @@ pub async fn start_quiz(
     skip_reminder: bool,
     slot_key: Option<String>,
 ) -> anyhow::Result<()> {
+    let _run_guard = Arc::clone(&ctx.quiz_run_lock)
+        .try_lock_owned()
+        .map_err(|_| anyhow::anyhow!("a quiz round is already running"))?;
     let n_questions = ctx.config.schedule.questions_per_round.max(1);
     let timeout = ctx.config.schedule.answer_timeout_secs;
     let inter_pause = ctx.config.schedule.inter_question_secs;
@@ -645,11 +648,12 @@ pub async fn start_quiz(
         entry.1 = questions_asked;
     }
 
-    if let Err(e) = ctx.db.finish_round(round_id, questions_asked as i32).await {
-        error!("DB finish_round failed: {e}");
-    }
-    if let Err(e) = ctx.db.write_round_scores(round_id, &round_scores).await {
-        error!("DB write_round_scores failed: {e}");
+    if let Err(e) = ctx
+        .db
+        .finish_round_with_scores(round_id, questions_asked as i32, &round_scores)
+        .await
+    {
+        error!("DB finish_round_with_scores failed: {e}");
     }
 
     // ── Round summary ─────────────────────────────────────────────────────────
@@ -676,55 +680,14 @@ pub async fn start_quiz(
             }
         }
 
-        match ctx.db.leaderboard().await {
-            Ok(board) if !board.is_empty() => {
-                let q_count = ctx.db.question_count().await.unwrap_or(0);
-                summary_lines.push(String::new());
-                summary_lines.push(format!("🏆 All-time · {q_count} Qs:"));
-                for (i, entry) in board.iter().take(5).enumerate() {
-                    let pct = if entry.total_questions > 0 {
-                        (entry.total_correct * 100 / entry.total_questions) as u32
-                    } else {
-                        0
-                    };
-                    let medal = match i {
-                        0 => "🥇",
-                        1 => "🥈",
-                        2 => "🥉",
-                        _ => "▪️",
-                    };
-                    summary_lines.push(format!(
-                        "{medal} {} · {}/{} ({}%) · ⭐{:.0}%",
-                        entry.user_id,
-                        entry.total_correct,
-                        entry.total_questions,
-                        pct,
-                        entry.wilson_score * 100.0,
-                    ));
-                }
-
-                let mut uid_set: std::collections::HashSet<&str> =
-                    round_scores.keys().map(String::as_str).collect();
-                for e in board.iter().take(5) {
-                    uid_set.insert(&e.user_id);
-                }
-                let uid_vec: Vec<&str> = uid_set.into_iter().collect();
-                let names = fetch_names(&room, &uid_vec).await;
-                room.send(crate::format::mentionify_with_names(
-                    &summary_lines.join("\n"),
-                    &names,
-                ))
-                .await
-                .ok();
-            }
-            Ok(_) | Err(_) => {
-                room.send(RoomMessageEventContent::text_plain(
-                    &summary_lines.join("\n"),
-                ))
-                .await
-                .ok();
-            }
-        }
+        let user_ids: Vec<&str> = round_scores.keys().map(String::as_str).collect();
+        let names = fetch_names(&room, &user_ids).await;
+        room.send(crate::format::mentionify_with_names(
+            &summary_lines.join("\n"),
+            &names,
+        ))
+        .await
+        .ok();
     }
 
     info!("Quiz round finished ({questions_asked} questions)");

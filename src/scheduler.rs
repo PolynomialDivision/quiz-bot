@@ -1,6 +1,6 @@
-use chrono::Timelike;
+use chrono::{Datelike, Timelike};
 use chrono_tz::Tz;
-use matrix_sdk::Client;
+use matrix_sdk::{ruma::OwnedTransactionId, Client};
 use tracing::{error, info, warn};
 
 use crate::{BotContext, config::ScheduleConfig, state::ScheduledOnce};
@@ -54,8 +54,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
 
         // Another quiz round already running?
         {
-            let aq = ctx.active_quiz.lock().await;
-            if aq.is_some() {
+            if ctx.quiz_run_lock.try_lock().is_err() {
                 warn!(
                     "Scheduler: fire time for slot {time_str} \
                      but a quiz is already in progress — skipping"
@@ -110,8 +109,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         }
 
         {
-            let aq = ctx.active_quiz.lock().await;
-            if aq.is_some() {
+            if ctx.quiz_run_lock.try_lock().is_err() {
                 warn!(
                     "One-time quiz at {} would fire now but a quiz is already running — dropped",
                     entry.quiz_time,
@@ -129,6 +127,66 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
                 error!("One-time quiz error: {e}");
             }
         });
+    }
+
+    // Let quizzes crossing midnight finish before freezing the previous month.
+    if local_date.day() > 1 || now_hour >= 1 {
+        post_previous_month(ctx, client, tz, local_date).await?;
+    }
+
+    Ok(())
+}
+
+async fn post_previous_month(
+    ctx: &BotContext,
+    client: &Client,
+    tz: Tz,
+    local_date: chrono::NaiveDate,
+) -> anyhow::Result<()> {
+    let month = crate::leaderboard::YearMonth::previous(local_date);
+    let period = month.period();
+    let transaction_id = format!("quiz-monthly-leaderboard-{period}");
+
+    if !ctx
+        .db
+        .try_claim_monthly_post(&period, &transaction_id)
+        .await?
+    {
+        return Ok(());
+    }
+
+    let result = async {
+        let (start, end) = month.utc_bounds(tz)?;
+        let entries = ctx.db.monthly_leaderboard(start, end).await?;
+        let room = client
+            .get_room(&ctx.room_id)
+            .ok_or_else(|| anyhow::anyhow!("bot is not in leaderboard room"))?;
+        let txn_id: OwnedTransactionId = transaction_id.clone().into();
+        let response = room
+            .send(crate::leaderboard::monthly_content(month, &entries))
+            .with_transaction_id(txn_id)
+            .await?;
+        ctx.db
+            .complete_monthly_post(&period, response.response.event_id.as_str())
+            .await?;
+        info!(
+            period,
+            participants = entries.len(),
+            "Posted monthly leaderboard"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        if let Err(release_error) = ctx.db.release_monthly_post(&period).await {
+            error!(
+                "Monthly leaderboard {period} failed: {error}; \
+                 additionally failed to release claim: {release_error}"
+            );
+        } else {
+            warn!("Monthly leaderboard {period} failed; will retry: {error}");
+        }
     }
 
     Ok(())

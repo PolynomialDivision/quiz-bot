@@ -94,7 +94,7 @@ where
 }
 fn default_timezone() -> String { "UTC".to_owned() }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct TriviaConfig {
     /// OpenTDB category ID (see https://opentdb.com/api_category.php).
     /// Omit for random category.
@@ -112,9 +112,26 @@ pub struct TriviaConfig {
     /// Matching is case-insensitive and ignores "&" vs "and".
     #[serde(default)]
     pub excluded_categories: Vec<String>,
+    /// Number of recently asked category groups to avoid. This is relaxed
+    /// automatically when the active category pool is too small.
+    #[serde(default = "default_recent_category_window")]
+    pub recent_category_window: usize,
 }
 
 fn default_batch_size() -> u32 { 10 }
+fn default_recent_category_window() -> usize { 5 }
+
+impl Default for TriviaConfig {
+    fn default() -> Self {
+        Self {
+            category: None,
+            difficulty: None,
+            batch_size: default_batch_size(),
+            excluded_categories: Vec::new(),
+            recent_category_window: default_recent_category_window(),
+        }
+    }
+}
 
 #[derive(Deserialize, Default)]
 pub struct ExplainerConfig {
@@ -126,3 +143,15 @@ pub struct ExplainerConfig {
 }
 
 fn default_explainer_model() -> String { "llama-3.3-70b-versatile".to_owned() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trivia_defaults_enable_recent_category_history() {
+        let config = TriviaConfig::default();
+        assert_eq!(config.batch_size, 10);
+        assert_eq!(config.recent_category_window, 5);
+    }
+}

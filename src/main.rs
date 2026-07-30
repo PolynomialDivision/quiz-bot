@@ -30,6 +30,7 @@ mod db;
 mod explainer;
 mod fetcher;
 mod format;
+mod leaderboard;
 mod quiz;
 mod scheduler;
 mod state;
@@ -60,6 +61,7 @@ pub struct BotContext {
     pub admin_users: HashSet<OwnedUserId>,
     pub room_id:     OwnedRoomId,
     pub active_quiz: Arc<Mutex<Option<quiz::ActiveQuiz>>>,
+    pub quiz_run_lock: Arc<Mutex<()>>,
     pub client:      Client,
     pub db:          Arc<db::Db>,
 }
@@ -81,6 +83,11 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Reading config {config_path}"))?,
     )
     .context("Parsing config")?;
+    config
+        .schedule
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .with_context(|| format!("Invalid schedule timezone {:?}", config.schedule.timezone))?;
     let config = Arc::new(config);
 
     let store_path = PathBuf::from(
@@ -130,6 +137,7 @@ async fn main() -> Result<()> {
         admin_users,
         room_id:     room_id.clone(),
         active_quiz: Arc::new(Mutex::new(None)),
+        quiz_run_lock: Arc::new(Mutex::new(())),
         client:      client.clone(),
         db,
     };

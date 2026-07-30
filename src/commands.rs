@@ -39,11 +39,8 @@ fn require_admin(ctx: &BotContext, sender: &OwnedUserId) -> Result<()> {
 async fn cmd_startquiz(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
-    {
-        let aq = ctx.active_quiz.lock().await;
-        if aq.is_some() {
-            return Ok(Some("⚠️ A quiz is already in progress!".to_owned()));
-        }
+    if ctx.quiz_run_lock.try_lock().is_err() {
+        return Ok(Some("⚠️ A quiz is already in progress!".to_owned()));
     }
 
     let ctx2 = ctx.clone();
@@ -122,7 +119,7 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         return Ok(Some("No scores yet.".to_owned()));
     }
     let round_count = ctx.db.round_count().await.unwrap_or(0);
-    let mut lines = vec![format!("🏆 **Leaderboard** · {} rounds", round_count)];
+    let mut lines = vec![format!("🏆 **All-time Leaderboard** · {} rounds", round_count)];
     lines.push(String::new());
     for (i, entry) in board.iter().enumerate() {
         let pct = if entry.total_questions > 0 {
@@ -137,8 +134,11 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
             _ => "  ",
         };
         lines.push(format!(
-            "{medal} {} · {}/{} ({}%) · ⭐{:.0}%",
+            "{medal} {}",
             entry.user_id,
+        ));
+        lines.push(format!(
+            "{}/{} correct ({}%) · ⭐{:.0}%",
             entry.total_correct,
             entry.total_questions,
             pct,
@@ -355,10 +355,14 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
         None => {
             let excluded = &ctx.config.trivia.excluded_categories;
             if excluded.is_empty() {
-                lines.push("🗂️ All categories · random".to_owned());
+                lines.push("🗂️ All categories · balanced".to_owned());
             } else {
-                lines.push(format!("🗂️ Random · excluding: {}", excluded.join(", ")));
+                lines.push(format!("🗂️ Balanced · excluding: {}", excluded.join(", ")));
             }
+            lines.push(format!(
+                "🔀 Avoiding the last {} category groups",
+                ctx.config.trivia.recent_category_window
+            ));
         }
     }
 
@@ -459,8 +463,8 @@ async fn cmd_schedulequiz(
 
     // Collect all tokens after the command name, stripping any surrounding quotes.
     let time_arg = body
-        .splitn(2, char::is_whitespace)
-        .nth(1)
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest)
         .unwrap_or("")
         .trim()
         .trim_matches(|c| c == '"' || c == '\'');
@@ -566,8 +570,8 @@ async fn cmd_cancelquiz(
     require_admin(ctx, sender)?;
 
     let time_arg = body
-        .splitn(2, char::is_whitespace)
-        .nth(1)
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest)
         .unwrap_or("")
         .trim()
         .trim_matches(|c| c == '"' || c == '\'');
