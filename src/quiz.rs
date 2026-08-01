@@ -96,6 +96,15 @@ fn shuffle_choices(q: &state::FetchedQuestion) -> (Vec<String>, u8) {
     (choices, correct_index)
 }
 
+/// How many questions this round should actually run for, given how many
+/// were successfully preloaded and validated ahead of time. `None` means the
+/// round has nothing to work with and should be skipped rather than started
+/// with zero questions.
+fn resolve_round_length(gathered: usize, configured: u32) -> Option<u32> {
+    let len = (gathered as u32).min(configured);
+    (len > 0).then_some(len)
+}
+
 fn difficulty_icon(d: &str) -> &'static str {
     match d {
         "easy" => "🟢",
@@ -344,12 +353,39 @@ pub async fn start_quiz(
     let leaderboard_month = crate::leaderboard::YearMonth::containing(local_date);
 
     // ── Mark today for this scheduler slot ────────────────────────────────────
+    // Marked regardless of prefetch outcome below: a slot only ever gets one
+    // fire attempt per day (the scheduler's fire window is a single minute),
+    // so there is nothing to gain by leaving it unmarked on failure, and
+    // doing so before we know the outcome keeps a restart from double-firing.
     if let Some(ref key) = slot_key {
         let mut state = ctx.state.lock().await;
         state.last_quiz_dates.insert(key.clone(), local_date);
         if let Err(e) = state.save(&ctx.state_path).await {
             error!("Failed to persist last_quiz_dates: {e}");
         }
+    }
+
+    // ── Resolve the preloaded question set ────────────────────────────────────
+    //
+    // The round runs entirely off this set — no on-demand fetching happens
+    // once the round starts. If OpenTDB couldn't supply the full count within
+    // its retry/time budget (see `fetch_round_questions`), we shorten the
+    // round to what's actually usable instead of discovering the shortfall
+    // mid-round. A round that comes up completely empty is skipped outright.
+    let questions: Vec<state::FetchedQuestion> = prefetch_handle.await.unwrap_or_default();
+    let Some(round_len) = resolve_round_length(questions.len(), n_questions) else {
+        error!("Round prefetch returned no usable questions — skipping this round");
+        room.send(RoomMessageEventContent::text_plain(
+            "⚠️ Couldn't prepare any questions for this round (OpenTDB unavailable) — skipping.",
+        ))
+        .await
+        .ok();
+        return Ok(());
+    };
+    if round_len < n_questions {
+        warn!(
+            "Round prefetch supplied {round_len}/{n_questions} questions — shortening round"
+        );
     }
 
     // ── Create round in DB ────────────────────────────────────────────────────
@@ -362,7 +398,7 @@ pub async fn start_quiz(
         .db
         .create_round(&db::RoundParams {
             room_id: ctx.room_id.as_str(),
-            n_questions_planned: n_questions as i32,
+            n_questions_planned: round_len as i32,
             triggered_by: &triggered_by,
             config_answer_timeout: timeout as i32,
             config_questions_per_round: n_questions as i32,
@@ -374,31 +410,20 @@ pub async fn start_quiz(
 
     let mut round_scores: HashMap<String, (u32, u32)> = HashMap::new();
     let mut questions_asked = 0u32;
+    let mut questions_iter = questions.into_iter().take(round_len as usize);
 
-    // Await the prefetch task started before the reminder.
-    let mut prefetched = prefetch_handle.await.unwrap_or_default();
-    let mut prefetched_iter = prefetched.drain(..);
-
-    for q_num in 1..=n_questions {
-        // ── Fetch question ────────────────────────────────────────────────────
-        let fetched = match prefetched_iter.next() {
-            Some(q) => q,
-            None => {
-                error!("Pre-fetched questions exhausted at question {q_num}");
-                room.send(RoomMessageEventContent::text_plain(
-                    "⚠️ Could not fetch question · ending round early.",
-                ))
-                .await
-                .ok();
-                break;
-            }
-        };
+    for q_num in 1..=round_len {
+        // Guaranteed to succeed: `round_len` was capped to the number of
+        // questions actually gathered above.
+        let fetched = questions_iter
+            .next()
+            .expect("questions_iter has at least round_len items");
 
         let (choices, correct_index) = shuffle_choices(&fetched);
         let category_group = fetcher::category_group_label(&fetched.category);
 
         // ── Post question ─────────────────────────────────────────────────────
-        let qt = question_text(q_num, n_questions, &fetched, &choices, timeout, timeout);
+        let qt = question_text(q_num, round_len, &fetched, &choices, timeout, timeout);
         let initial_text = if q_num == 1 {
             format!("@room\n{qt}")
         } else {
@@ -415,7 +440,7 @@ pub async fn start_quiz(
             .await
             .map_err(|e| anyhow::anyhow!("send question failed: {e}"))?;
         let q_event_id: OwnedEventId = resp.response.event_id;
-        info!("Q {q_num}/{n_questions}: posted (event {q_event_id}, correct slot {correct_index})");
+        info!("Q {q_num}/{round_len}: posted (event {q_event_id}, correct slot {correct_index})");
 
         // ── Insert question in DB ─────────────────────────────────────────────
         let question_id = ctx
@@ -463,7 +488,7 @@ pub async fn start_quiz(
             remaining -= EDIT_INTERVAL;
             room.send(make_edit(
                 q_event_id.clone(),
-                &question_text(q_num, n_questions, &fetched, &choices, timeout, remaining),
+                &question_text(q_num, round_len, &fetched, &choices, timeout, remaining),
             ))
             .await
             .ok();
@@ -471,7 +496,7 @@ pub async fn start_quiz(
         tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
         room.send(make_edit(
             q_event_id.clone(),
-            &question_text(q_num, n_questions, &fetched, &choices, timeout, 0),
+            &question_text(q_num, round_len, &fetched, &choices, timeout, 0),
         ))
         .await
         .ok();
@@ -557,7 +582,7 @@ pub async fn start_quiz(
                 .join(", ");
             result_lines.push(format!("❌ {wrong_str}"));
         }
-        if q_num < n_questions {
+        if q_num < round_len {
             result_lines.push(format!("⏭️ Next in {inter_pause}s"));
         }
 
@@ -636,7 +661,7 @@ pub async fn start_quiz(
             }
         }
 
-        if q_num < n_questions {
+        if q_num < round_len {
             tokio::time::sleep(tokio::time::Duration::from_secs(inter_pause)).await;
         }
     }
@@ -721,4 +746,29 @@ pub async fn start_quiz(
 
     info!("Quiz round finished ({questions_asked} questions)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_round_length_caps_at_questions_gathered() {
+        assert_eq!(resolve_round_length(3, 5), Some(3));
+    }
+
+    #[test]
+    fn resolve_round_length_caps_at_configured_count() {
+        assert_eq!(resolve_round_length(10, 5), Some(5));
+    }
+
+    #[test]
+    fn resolve_round_length_matches_when_exact() {
+        assert_eq!(resolve_round_length(5, 5), Some(5));
+    }
+
+    #[test]
+    fn resolve_round_length_is_none_when_nothing_was_gathered() {
+        assert_eq!(resolve_round_length(0, 5), None);
+    }
 }

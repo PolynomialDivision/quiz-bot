@@ -4,17 +4,56 @@
 //! exhausted, then resets the token automatically.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{state::FetchedQuestion, BotContext};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
 const API_URL: &str = "https://opentdb.com/api.php";
+
+// ── Global request throttle ───────────────────────────────────────────────────
+//
+// OpenTDB enforces roughly one request per 5 s per IP, across *all* endpoints
+// and tokens. Every call site used to manage its own ad hoc delays (a fixed
+// sleep between round categories, a sleep only after an explicit rate-limit
+// response, …), which meant bursts of near-simultaneous requests — e.g. one
+// `fetch_one` call skipping several duplicate questions — routinely blew
+// through the limit. OpenTDB then returned response_code 5 for every request
+// in the burst, which silently ate through each call's bounded retry budget
+// before a single one succeeded. Serializing every request through one gate
+// removes that failure mode at the source instead of papering over it with
+// more retries.
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(5_500);
+
+static LAST_REQUEST: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+/// How much longer to wait before the next request is allowed, given when
+/// the previous one went out. Pure and independent of the global clock/state
+/// so the spacing math can be unit-tested without real sleeps.
+fn remaining_wait(previous_request: Instant, now: Instant, min_interval: Duration) -> Duration {
+    min_interval.saturating_sub(now.saturating_duration_since(previous_request))
+}
+
+/// Block until it's safe to issue another OpenTDB request without tripping
+/// the per-IP rate limit. Must be called immediately before every request.
+async fn throttle() {
+    let mut last = LAST_REQUEST.lock().await;
+    if let Some(prev) = *last {
+        let wait = remaining_wait(prev, Instant::now(), MIN_REQUEST_INTERVAL);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    *last = Some(Instant::now());
+}
 
 /// Category groups for balanced random selection.
 ///
@@ -123,6 +162,7 @@ async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
             warn!("OpenTDB: network retry {attempt}/{MAX_NET_RETRIES} in {delay}s");
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
+        throttle().await;
         match reqwest::get(url).await {
             Ok(resp) => match resp.json::<ApiResponse>().await {
                 Ok(api) => return Ok(api),
@@ -214,6 +254,7 @@ async fn ensure_token(ctx: &BotContext) -> anyhow::Result<String> {
             return Ok(tok.clone());
         }
     }
+    throttle().await;
     let resp: TokenResponse = reqwest::get(format!("{TOKEN_URL}?command=request"))
         .await?
         .json()
@@ -233,6 +274,7 @@ async fn ensure_token(ctx: &BotContext) -> anyhow::Result<String> {
 
 /// Reset a token after its question pool is exhausted.
 async fn reset_token(_ctx: &BotContext, token: &str) -> anyhow::Result<()> {
+    throttle().await;
     let resp: TokenResponse = reqwest::get(format!("{TOKEN_URL}?command=reset&token={token}"))
         .await?
         .json()
@@ -611,9 +653,15 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         n, categories
     );
 
-    // OpenTDB enforces ~1 request per 5 s per IP (response_code 5).
-    // We wait between calls so we don't get rate-limited mid-prefetch.
-    const RATE_LIMIT_SECS: u64 = 6;
+    // Spacing between requests is handled centrally by `throttle()`, so no
+    // per-call sleep is needed here. What we do bound is total wall-clock
+    // time: per-slot fallbacks (cache miss → alternate category → alternate
+    // category) can each cost several throttled requests, and this runs
+    // during the pre-quiz reminder window, so it must not run indefinitely.
+    // Any slots left unfilled when the budget expires are simply omitted —
+    // the caller shortens the round rather than fetching on demand later.
+    const ROUND_PREFETCH_BUDGET: Duration = Duration::from_secs(180);
+    let deadline = Instant::now() + ROUND_PREFETCH_BUDGET;
 
     let mut questions: Vec<FetchedQuestion> = Vec::with_capacity(n);
     let active_group_count = active_groups(&ctx.config.trivia.excluded_categories).len();
@@ -624,9 +672,15 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
         .unwrap_or_default();
     let mut avoid_groups: HashSet<String> = recent.iter().map(|name| normalise(name)).collect();
 
-    for (i, choice) in categories.into_iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(RATE_LIMIT_SECS)).await;
+    for choice in categories {
+        if Instant::now() >= deadline {
+            warn!(
+                gathered = questions.len(),
+                requested = n,
+                "Round prefetch budget ({:?}) exhausted — proceeding with questions gathered so far",
+                ROUND_PREFETCH_BUDGET
+            );
+            break;
         }
         let previous_group = questions
             .last()
@@ -682,6 +736,17 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
             }
         }
     }
+
+    if questions.len() < n {
+        warn!(
+            gathered = questions.len(),
+            requested = n,
+            "Round prefetch produced fewer questions than requested — round will be shortened"
+        );
+    } else {
+        info!(gathered = questions.len(), "Round prefetch complete");
+    }
+
     questions
 }
 
@@ -863,6 +928,31 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
+
+    #[test]
+    fn remaining_wait_is_zero_once_the_interval_has_elapsed() {
+        let t0 = Instant::now();
+        let after_interval = t0 + MIN_REQUEST_INTERVAL;
+        assert_eq!(remaining_wait(t0, after_interval, MIN_REQUEST_INTERVAL), Duration::ZERO);
+        let well_after = t0 + MIN_REQUEST_INTERVAL + Duration::from_secs(60);
+        assert_eq!(remaining_wait(t0, well_after, MIN_REQUEST_INTERVAL), Duration::ZERO);
+    }
+
+    #[test]
+    fn remaining_wait_covers_exactly_the_gap_to_the_interval() {
+        let t0 = Instant::now();
+        let one_second_in = t0 + Duration::from_secs(1);
+        assert_eq!(
+            remaining_wait(t0, one_second_in, Duration::from_secs(5)),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn remaining_wait_at_the_same_instant_is_the_full_interval() {
+        let now = Instant::now();
+        assert_eq!(remaining_wait(now, now, MIN_REQUEST_INTERVAL), MIN_REQUEST_INTERVAL);
+    }
 
     #[test]
     fn underused_group_is_not_selected_three_rounds_in_a_row() {
