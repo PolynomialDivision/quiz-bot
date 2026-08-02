@@ -1,5 +1,5 @@
+pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig, VerificationConfig};
 use serde::Deserialize;
-pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -21,6 +21,8 @@ pub struct SecurityConfig {
     pub admin_users: Vec<String>,
     #[serde(default)]
     pub encryption_strategy: EncryptionStrategy,
+    #[serde(default)]
+    pub verification: VerificationConfig,
 }
 
 #[derive(Deserialize)]
@@ -43,7 +45,10 @@ pub struct ScheduleConfig {
     /// The list is sorted and each entry fires at that many seconds before
     /// the quiz, with the largest value determining when the scheduler wakes.
     /// Set to `0` or `[]` to disable.  Default: `[300]` (one reminder, 5 min).
-    #[serde(default = "default_reminder_before_secs", deserialize_with = "deserialize_reminders")]
+    #[serde(
+        default = "default_reminder_before_secs",
+        deserialize_with = "deserialize_reminders"
+    )]
     pub reminder_before_secs: Vec<u64>,
     /// IANA timezone used for quiz scheduling (e.g. "Europe/Berlin").
     #[serde(default = "default_timezone")]
@@ -54,16 +59,28 @@ impl ScheduleConfig {
     /// Parse `"HH:MM"` into `(hour, minute)`.  Returns `None` on invalid input.
     pub fn parse_quiz_time(s: &str) -> Option<(u32, u32)> {
         let (h, m) = s.split_once(':')?;
-        let hour: u32   = h.trim().parse().ok()?;
+        let hour: u32 = h.trim().parse().ok()?;
         let minute: u32 = m.trim().parse().ok()?;
-        if hour < 24 && minute < 60 { Some((hour, minute)) } else { None }
+        if hour < 24 && minute < 60 {
+            Some((hour, minute))
+        } else {
+            None
+        }
     }
 }
 
-fn default_answer_timeout() -> u64 { 60 }
-fn default_questions_per_round() -> u32 { 5 }
-fn default_inter_question_secs() -> u64 { 10 }
-fn default_reminder_before_secs() -> Vec<u64> { vec![300] }
+fn default_answer_timeout() -> u64 {
+    60
+}
+fn default_questions_per_round() -> u32 {
+    5
+}
+fn default_inter_question_secs() -> u64 {
+    10
+}
+fn default_reminder_before_secs() -> Vec<u64> {
+    vec![300]
+}
 
 /// Accepts either a bare integer (`300`) or an array (`[300, 60]`).
 fn deserialize_reminders<'de, D>(d: D) -> Result<Vec<u64>, D::Error>
@@ -85,14 +102,18 @@ where
         fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u64>, A::Error> {
             let mut out = Vec::new();
             while let Some(v) = seq.next_element::<u64>()? {
-                if v > 0 { out.push(v); }
+                if v > 0 {
+                    out.push(v);
+                }
             }
             Ok(out)
         }
     }
     d.deserialize_any(V)
 }
-fn default_timezone() -> String { "UTC".to_owned() }
+fn default_timezone() -> String {
+    "UTC".to_owned()
+}
 
 #[derive(Deserialize)]
 pub struct TriviaConfig {
@@ -118,8 +139,12 @@ pub struct TriviaConfig {
     pub recent_category_window: usize,
 }
 
-fn default_batch_size() -> u32 { 10 }
-fn default_recent_category_window() -> usize { 5 }
+fn default_batch_size() -> u32 {
+    10
+}
+fn default_recent_category_window() -> usize {
+    5
+}
 
 impl Default for TriviaConfig {
     fn default() -> Self {
@@ -142,7 +167,9 @@ pub struct ExplainerConfig {
     pub model: String,
 }
 
-fn default_explainer_model() -> String { "llama-3.3-70b-versatile".to_owned() }
+fn default_explainer_model() -> String {
+    "llama-3.3-70b-versatile".to_owned()
+}
 
 #[cfg(test)]
 mod tests {
