@@ -262,6 +262,23 @@ impl Db {
         }
         Ok(())
     }
+
+    /// All known display names, keyed by user ID. Used to render mention
+    /// pills with a friendly label in contexts (e.g. command replies) that
+    /// have no live room query to draw fresher names from — see
+    /// `format::mentionify_with_names`.
+    pub async fn player_display_names(&self) -> Result<HashMap<String, String>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT user_id, display_name FROM players WHERE display_name IS NOT NULL",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+    }
 }
 
 // ── Rounds ────────────────────────────────────────────────────────────────────
@@ -1030,5 +1047,22 @@ mod tests {
         assert_eq!(all_time[0].user_id, "@veteran:example.org");
         assert!(monthly[0].wilson_score > monthly[1].wilson_score);
         assert!(all_time[0].wilson_score > all_time[1].wilson_score);
+    }
+
+    #[tokio::test]
+    async fn player_display_names_omits_unset_names() {
+        let db = test_db().await;
+        db.upsert_player("@alice:example.org", Some("Alice"))
+            .await
+            .unwrap();
+        db.upsert_player("@ghost:example.org", None).await.unwrap();
+
+        let names = db.player_display_names().await.unwrap();
+
+        assert_eq!(
+            names.get("@alice:example.org").map(String::as_str),
+            Some("Alice")
+        );
+        assert!(!names.contains_key("@ghost:example.org"));
     }
 }

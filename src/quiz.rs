@@ -755,6 +755,10 @@ pub async fn start_quiz(
             }
         }
 
+        // Kept so its player names can be added to the mention map below —
+        // `leaderboard_text` embeds raw mxids that only this round's podium
+        // (via `fetch_names`) would otherwise resolve.
+        let mut monthly_board: Option<Vec<db::MonthlyLeaderboardEntry>> = None;
         if let Ok((start, end)) = leaderboard_month.utc_bounds(tz) {
             match (
                 ctx.db.monthly_leaderboard(start, end).await,
@@ -771,6 +775,7 @@ pub async fn start_quiz(
                         .lines()
                         .map(str::to_owned),
                     );
+                    monthly_board = Some(board);
                 }
                 (board, count) => {
                     warn!(
@@ -782,8 +787,15 @@ pub async fn start_quiz(
             }
         }
 
+        // Mention names: start from the monthly board's stored display names
+        // (covers players outside this round), then let this round's live
+        // room-state lookup override with fresher names for its participants.
         let user_ids: Vec<&str> = round_scores.keys().map(String::as_str).collect();
-        let names = fetch_names(&room, &user_ids).await;
+        let mut names = monthly_board
+            .as_deref()
+            .map(crate::leaderboard::mention_names)
+            .unwrap_or_default();
+        names.extend(fetch_names(&room, &user_ids).await);
         room.send(crate::format::mentionify_with_names(
             &summary_lines.join("\n"),
             &names,

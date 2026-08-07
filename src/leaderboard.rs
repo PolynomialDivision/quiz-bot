@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 
-use crate::db::MonthlyLeaderboardEntry;
+use crate::{db::MonthlyLeaderboardEntry, format};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct YearMonth {
@@ -86,46 +88,34 @@ fn local_day_start(tz: Tz, date: NaiveDate) -> Result<DateTime<Utc>> {
     ))
 }
 
-fn safe_name(entry: &MonthlyLeaderboardEntry) -> String {
-    let fallback = entry
-        .user_id
-        .split(':')
-        .next()
-        .unwrap_or(&entry.user_id)
-        .trim_start_matches('@');
-    entry
-        .display_name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(fallback)
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>()
-        .trim()
-        .to_owned()
+/// Build the mention-name map for a set of leaderboard entries: user ID →
+/// sanitized display name, ready for `format::mentionify_with_names`. Entries
+/// with no (or blank) display name are omitted so the caller's mention
+/// pipeline falls back to its own localpart-derived label.
+pub fn mention_names(entries: &[MonthlyLeaderboardEntry]) -> HashMap<String, String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = format::sanitize_display_name(entry.display_name.as_deref()?)?;
+            Some((entry.user_id.clone(), name))
+        })
+        .collect()
 }
 
-fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
+/// Render the leaderboard as plain text with each player's raw Matrix user
+/// ID embedded (e.g. `🥇 @alice:example.org · 12/15 ...`) rather than a
+/// display name. Callers MUST pass the result through `format::mentionify`
+/// or `format::mentionify_with_names` before sending — that is what turns
+/// the embedded IDs into proper mention pills (and, given a name map from
+/// `mention_names`, labels them with the player's display name). This keeps
+/// leaderboard output using the exact same mention path as the in-round
+/// score summary instead of a second, separate formatting implementation.
 pub fn leaderboard_text(
     title: &str,
     question_count: i64,
     entries: &[MonthlyLeaderboardEntry],
 ) -> String {
-    let mut lines = vec![format!("🏆 {title} · {question_count} Qs:")];
+    let mut lines = vec![format!("**🏆 {title} · {question_count} Qs:**")];
     for (index, entry) in entries.iter().enumerate() {
         let marker = match index {
             0 => "🥇",
@@ -140,7 +130,7 @@ pub fn leaderboard_text(
         };
         lines.push(format!(
             "{marker} {} · {}/{} ({}%) · ⭐{:.0}%",
-            safe_name(entry),
+            entry.user_id,
             entry.total_correct,
             entry.total_questions,
             accuracy,
@@ -156,14 +146,7 @@ pub fn monthly_content(
     entries: &[MonthlyLeaderboardEntry],
 ) -> RoomMessageEventContent {
     let plain = leaderboard_text(month.month_name(), question_count, entries);
-    let mut html_lines = plain.lines();
-    let header = html_lines.next().unwrap_or_default();
-    let mut html = format!("<strong>{}</strong>", escape_html(header));
-    for line in html_lines {
-        html.push_str("<br>");
-        html.push_str(&escape_html(line));
-    }
-    RoomMessageEventContent::text_html(plain, html)
+    format::mentionify_with_names(&plain, &mention_names(entries))
 }
 
 #[cfg(test)]
@@ -181,6 +164,25 @@ mod tests {
             total_questions: total,
             rounds_played: 4,
             wilson_score: crate::db::wilson_lower_bound(correct, total),
+        }
+    }
+
+    fn entry_without_display_name(localpart: &str, correct: i64, total: i64) -> MonthlyLeaderboardEntry {
+        MonthlyLeaderboardEntry {
+            user_id: format!("@{localpart}:example.org"),
+            display_name: None,
+            total_correct: correct,
+            total_questions: total,
+            rounds_played: 4,
+            wilson_score: crate::db::wilson_lower_bound(correct, total),
+        }
+    }
+
+    /// Extract (plain_body, Option<html_body>) from a RoomMessageEventContent.
+    fn bodies(c: &RoomMessageEventContent) -> (String, Option<String>) {
+        match &c.msgtype {
+            MessageType::Text(t) => (t.body.clone(), t.formatted.as_ref().map(|f| f.body.clone())),
+            _ => panic!("unexpected msgtype"),
         }
     }
 
@@ -214,7 +216,35 @@ mod tests {
     }
 
     #[test]
-    fn monthly_leaderboard_uses_compact_weighted_format() {
+    fn leaderboard_text_embeds_raw_mxids_for_the_mention_pipeline() {
+        // `leaderboard_text` is a contract for callers that route the result
+        // through `format::mentionify`/`mentionify_with_names` — it must not
+        // bake in display names itself, or those callers would double up on
+        // (or bypass) the shared mention formatting.
+        let text = leaderboard_text("All-time", 653, &[entry("Yakari", 98, 130)]);
+        assert_eq!(
+            text,
+            "**🏆 All-time · 653 Qs:**\n\
+             🥇 @yakari:example.org · 98/130 (75%) · ⭐67%"
+        );
+    }
+
+    #[test]
+    fn mention_names_omits_entries_without_a_usable_display_name() {
+        let entries = [
+            entry("Alice", 1, 1),
+            entry_without_display_name("ghost", 0, 1),
+        ];
+        let names = mention_names(&entries);
+        assert_eq!(
+            names.get("@alice:example.org").map(String::as_str),
+            Some("Alice")
+        );
+        assert!(!names.contains_key("@ghost:example.org"));
+    }
+
+    #[test]
+    fn monthly_leaderboard_uses_mention_pills_with_display_names() {
         let content = monthly_content(
             YearMonth {
                 year: 2026,
@@ -223,43 +253,89 @@ mod tests {
             42,
             &[entry("Alice", 30, 40), entry("Bob", 12, 20)],
         );
-        let MessageType::Text(text) = content.msgtype else {
-            panic!("expected text")
-        };
+        let (plain, html) = bodies(&content);
+        let html = html.expect("should have HTML body");
+
+        // Plain body reads exactly as before — mentionify replaces each
+        // embedded mxid with its display name in the plain text too.
         assert_eq!(
-            text.body,
+            plain,
             "🏆 July · 42 Qs:\n\
              🥇 Alice · 30/40 (75%) · ⭐60%\n\
              🥈 Bob · 12/20 (60%) · ⭐39%"
         );
+        // HTML body carries real mention pills, not just bold text.
+        assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+        assert!(html.contains(">Alice<"));
+        assert!(html.contains(r#"href="https://matrix.to/#/@bob:example.org""#));
+        assert!(html.contains(">Bob<"));
+        assert!(html.contains("<strong>"), "header should still be bold");
     }
 
     #[test]
-    fn all_time_leaderboard_uses_the_same_format() {
-        let text = leaderboard_text("All-time", 653, &[entry("yakari", 98, 130)]);
-        assert_eq!(
-            text,
-            "🏆 All-time · 653 Qs:\n\
-             🥇 yakari · 98/130 (75%) · ⭐67%"
+    fn leaderboard_falls_back_to_localpart_when_display_name_is_missing() {
+        let content = monthly_content(
+            YearMonth {
+                year: 2026,
+                month: 7,
+            },
+            5,
+            &[entry_without_display_name("mysterious", 3, 5)],
         );
+        let (plain, html) = bodies(&content);
+        let html = html.expect("should have HTML body");
+        assert!(plain.contains("mysterious"));
+        assert!(html.contains(r#"href="https://matrix.to/#/@mysterious:example.org""#));
+        assert!(html.contains(">mysterious<"));
+    }
+
+    #[test]
+    fn all_time_leaderboard_reply_uses_the_same_mention_pipeline_as_monthly() {
+        // Mirrors how a command reply (e.g. !scores) assembles its content:
+        // `leaderboard_text` + a names map, fed into the same
+        // `mentionify_with_names` helper the round score uses.
+        let entries = [entry("Yakari", 98, 130)];
+        let content = format::mentionify_with_names(
+            &leaderboard_text("All-time", 653, &entries),
+            &mention_names(&entries),
+        );
+        let (plain, html) = bodies(&content);
+        let html = html.expect("should have HTML body");
+        assert_eq!(
+            plain,
+            "🏆 All-time · 653 Qs:\n\
+             🥇 Yakari · 98/130 (75%) · ⭐67%"
+        );
+        assert!(html.contains(r#"href="https://matrix.to/#/@yakari:example.org""#));
+        assert!(html.contains(">Yakari<"));
     }
 
     #[test]
     fn display_names_are_escaped_in_html_and_sanitized_in_plain_text() {
+        // A real mxid never contains whitespace/control characters — only
+        // the free-text display name does, so give it a clean user_id here
+        // (unlike `entry()`, which derives both from the same input).
+        let messy = MonthlyLeaderboardEntry {
+            user_id: "@alice:example.org".to_owned(),
+            display_name: Some("<Alice & Co>\nAdmin".to_owned()),
+            total_correct: 10,
+            total_questions: 12,
+            rounds_played: 4,
+            wilson_score: crate::db::wilson_lower_bound(10, 12),
+        };
         let content = monthly_content(
             YearMonth {
                 year: 2026,
                 month: 7,
             },
             12,
-            &[entry("<Alice & Co>\nAdmin", 10, 12)],
+            &[messy],
         );
-        let MessageType::Text(text) = content.msgtype else {
-            panic!("expected text")
-        };
-        assert!(text.body.contains("<Alice & Co> Admin"));
-        let html = &text.formatted.unwrap().body;
+        let (plain, html) = bodies(&content);
+        let html = html.expect("should have HTML body");
+        assert!(plain.contains("<Alice & Co> Admin"));
         assert!(html.contains("&lt;Alice &amp; Co&gt; Admin"));
-        assert!(!html.contains("<Alice"));
+        assert!(!html.contains("><Alice"));
+        assert!(html.contains("https://matrix.to/#/@"), "still a mention pill");
     }
 }

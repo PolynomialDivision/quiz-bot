@@ -24,6 +24,20 @@ pub fn mentionify_with_names(
     })
 }
 
+/// Clean a display name for use as a mention pill label: collapse control
+/// characters (e.g. an embedded newline) to spaces and trim. Returns `None`
+/// when the name is empty after cleaning, so callers can fall back to the
+/// localpart-derived label instead of showing a blank pill.
+pub fn sanitize_display_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 // ── Internals ─────────────────────────────────────────────────────────────────
 
 fn default_label(token: &str) -> &str {
@@ -228,6 +242,19 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains(">Alice Smith<"));
         assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+    }
+
+    #[test]
+    fn sanitize_display_name_collapses_control_chars_and_trims() {
+        assert_eq!(
+            sanitize_display_name("  <Alice & Co>\nAdmin  "),
+            Some("<Alice & Co> Admin".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_display_name_is_none_for_blank_input() {
+        assert_eq!(sanitize_display_name("   \n\t "), None);
     }
 
     #[test]

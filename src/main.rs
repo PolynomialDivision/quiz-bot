@@ -37,13 +37,16 @@ use config::Config;
 use mxbot_common::verify::VerificationService;
 use state::State;
 
-/// Build a thread reply.
+/// Attach thread relation metadata to an already-built message content.
 /// `root`     — the thread root event (m.thread event_id).
 /// `reply_to` — the specific event being quoted (m.in_reply_to).
 ///              Pass `ev.event_id` so the reply quotes the command message,
 ///              not the thread root.
-fn thread_reply(text: &str, root: OwnedEventId, reply_to: OwnedEventId) -> RoomMessageEventContent {
-    let mut content = format::mentionify(text);
+fn threadify(
+    mut content: RoomMessageEventContent,
+    root: OwnedEventId,
+    reply_to: OwnedEventId,
+) -> RoomMessageEventContent {
     content.relates_to = Some(Relation::Thread(Thread::reply(root, reply_to)));
     content
 }
@@ -238,20 +241,24 @@ async fn main() -> Result<()> {
                 match commands::handle(&ctx, &ev.sender, body).await {
                     Ok(Some(reply)) => {
                         if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(&reply, thread_root, ev.event_id.clone()))
+                            // Command replies (leaderboards, speed stats, …)
+                            // embed raw mxids for any player they mention —
+                            // resolve them to display names via the same
+                            // mention pipeline the round score uses.
+                            let names = ctx.db.player_display_names().await.unwrap_or_default();
+                            let content = format::mentionify_with_names(&reply, &names);
+                            r.send(threadify(content, thread_root, ev.event_id.clone()))
                                 .await
                                 .ok();
                         }
                     }
                     Err(e) if e.to_string() == "__not_admin__" => {
                         if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(
-                                "❌ This command requires admin privileges.",
-                                thread_root,
-                                ev.event_id.clone(),
-                            ))
-                            .await
-                            .ok();
+                            let content =
+                                format::mentionify("❌ This command requires admin privileges.");
+                            r.send(threadify(content, thread_root, ev.event_id.clone()))
+                                .await
+                                .ok();
                         }
                     }
                     Ok(None) => {}
