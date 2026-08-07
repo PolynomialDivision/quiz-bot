@@ -276,6 +276,10 @@ async fn main() -> Result<()> {
             let ctx = ctx.clone();
             let bot_user_id = bot_user_id.clone();
             async move {
+                // Routine, high-volume, and uninteresting: the bot's own
+                // tap-to-answer reactions and anything outside the quiz
+                // room. Not logged — logging every one would drown out the
+                // reactions that actually matter below.
                 if ev.sender == bot_user_id {
                     return;
                 }
@@ -286,22 +290,67 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                let choice_index = match ev.content.relates_to.key.as_str() {
+                let key = ev.content.relates_to.key.as_str();
+                let choice_index = match key {
                     "🇦" => 0u8,
                     "🇧" => 1,
                     "🇨" => 2,
                     "🇩" => 3,
+                    // Not an answer reaction (e.g. 👍 on some other message) —
+                    // this is the overwhelming majority of room reactions, so
+                    // stays silent too.
                     _ => return,
                 };
 
-                let reacted_to = ev.content.relates_to.event_id.as_str().to_owned();
-                let user = ev.sender.as_str().to_owned();
+                let reacted_to = ev.content.relates_to.event_id.clone();
+                let sender = ev.sender.as_str().to_owned();
 
+                // From here on, a real answer-shaped reaction was received —
+                // every outcome is logged so a lost answer can be traced.
                 let mut aq = ctx.active_quiz.lock().await;
-                if let Some(quiz) = aq.as_mut() {
-                    if quiz.event_id.as_str() == reacted_to {
-                        quiz.record_answer(user, choice_index, "reaction");
+                let result =
+                    quiz::apply_reaction(&mut aq, &reacted_to, sender.clone(), choice_index);
+                match result {
+                    quiz::ReactionResult::Accepted(quiz::AnswerOutcome::New) => info!(
+                        reaction_event_id = %ev.event_id,
+                        reacted_to = %reacted_to,
+                        sender = %sender,
+                        key,
+                        received_at = %ev.origin_server_ts.get(),
+                        "Reaction accepted"
+                    ),
+                    quiz::ReactionResult::Accepted(quiz::AnswerOutcome::Replaced { previous }) => {
+                        info!(
+                            reaction_event_id = %ev.event_id,
+                            reacted_to = %reacted_to,
+                            sender = %sender,
+                            key,
+                            received_at = %ev.origin_server_ts.get(),
+                            previous_choice = previous,
+                            "Reaction accepted — replaced previous answer"
+                        )
                     }
+                    quiz::ReactionResult::Accepted(quiz::AnswerOutcome::Unchanged) => info!(
+                        reaction_event_id = %ev.event_id,
+                        reacted_to = %reacted_to,
+                        sender = %sender,
+                        key,
+                        "Reaction ignored — duplicate of the sender's existing answer"
+                    ),
+                    quiz::ReactionResult::WrongQuestion => info!(
+                        reaction_event_id = %ev.event_id,
+                        reacted_to = %reacted_to,
+                        sender = %sender,
+                        key,
+                        "Reaction ignored — targets a different (stale) question"
+                    ),
+                    quiz::ReactionResult::NoActiveQuestion => info!(
+                        reaction_event_id = %ev.event_id,
+                        reacted_to = %reacted_to,
+                        sender = %sender,
+                        key,
+                        "Reaction ignored — no quiz question is currently active"
+                    ),
                 }
             }
         }

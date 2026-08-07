@@ -55,21 +55,43 @@ pub struct ActiveQuiz {
     pub correct_index: u8,
 }
 
+/// Outcome of `ActiveQuiz::record_answer`, so callers (the reaction/text
+/// answer handlers in `main.rs`) can log precisely what happened rather than
+/// silently writing into the map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// First answer recorded for this user on this question.
+    New,
+    /// The user had already answered; this changed their recorded choice.
+    Replaced { previous: u8 },
+    /// The user had already answered this same choice — a no-op duplicate.
+    Unchanged,
+}
+
 impl ActiveQuiz {
     /// Record or update a user's answer.  Sets `changed_answer = true` when
     /// the user picks a different option than their previous one.
-    pub fn record_answer(&mut self, user_id: String, choice: u8, source: &'static str) {
+    pub fn record_answer(
+        &mut self,
+        user_id: String,
+        choice: u8,
+        source: &'static str,
+    ) -> AnswerOutcome {
         let now = chrono::Utc::now();
+        let mut outcome = AnswerOutcome::New;
         self.answers
             .entry(user_id)
             .and_modify(|r| {
-                let changed = r.choice != choice;
+                outcome = if r.choice == choice {
+                    AnswerOutcome::Unchanged
+                } else {
+                    let previous = r.choice;
+                    r.changed_answer = true;
+                    AnswerOutcome::Replaced { previous }
+                };
                 r.choice = choice;
                 r.source = source;
                 r.submitted_at = now;
-                if changed {
-                    r.changed_answer = true;
-                }
             })
             .or_insert(AnswerRecord {
                 choice,
@@ -77,6 +99,39 @@ impl ActiveQuiz {
                 submitted_at: now,
                 changed_answer: false,
             });
+        outcome
+    }
+}
+
+/// What happened to an incoming answer reaction, for the caller to log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactionResult {
+    /// It targeted the active question and was recorded.
+    Accepted(AnswerOutcome),
+    /// A quiz question is active, but this reaction targets a different
+    /// (older) event — e.g. a late reaction to a previous question.
+    WrongQuestion,
+    /// No quiz question is currently active at all.
+    NoActiveQuestion,
+}
+
+/// Apply an incoming answer reaction to whatever question is currently
+/// active, if any. Pure aside from mutating `active_quiz` in place (no I/O),
+/// so the acceptance rules — matching the active question, ignoring a stale
+/// one, ignoring reactions with nothing active — are unit-testable without a
+/// live Matrix room or event.
+pub fn apply_reaction(
+    active_quiz: &mut Option<ActiveQuiz>,
+    reacted_to: &OwnedEventId,
+    sender: String,
+    choice: u8,
+) -> ReactionResult {
+    match active_quiz {
+        Some(quiz) if &quiz.event_id == reacted_to => {
+            ReactionResult::Accepted(quiz.record_answer(sender, choice, "reaction"))
+        }
+        Some(_) => ReactionResult::WrongQuestion,
+        None => ReactionResult::NoActiveQuestion,
     }
 }
 
@@ -199,95 +254,215 @@ async fn send_question_with_retry(
 
 // ── Reaction reconciliation ───────────────────────────────────────────────────
 
-/// Fetch all reactions from the server after the countdown and merge them into
-/// the in-memory answer map.  Users found only on the server (missed on the
-/// stream) are added with source "reconciled" and submitted_at = now.
+/// Fetch one page of reactions related to `q_event_id`, retrying transient
+/// failures. This query is the one mechanism that recovers a reaction the
+/// live sync stream missed (e.g. it arrived while `start_quiz` was already
+/// draining `active_quiz` for evaluation) — a single failed request here
+/// must not silently disable it. Mirrors the retry shape used elsewhere
+/// (see `send_question_with_retry`).
+///
+/// Uses `Room::relations`, which transparently decrypts each returned event,
+/// filtering only by relation type (`m.annotation`) rather than by the
+/// plaintext `m.reaction` event type. In an encrypted room, reactions travel
+/// wrapped as `m.room.encrypted` at the wire level, so a plaintext
+/// event-type filter — as this used to do via a raw, non-decrypting API
+/// call — matches nothing and silently returns an empty page. Filtering
+/// client-side (below) after decryption works regardless of room encryption.
+async fn fetch_relations_page(
+    room: &Room,
+    q_event_id: &OwnedEventId,
+    from: Option<String>,
+) -> matrix_sdk::Result<matrix_sdk::room::Relations> {
+    use matrix_sdk::room::{IncludeRelations, RelationsOptions};
+    use matrix_sdk::ruma::events::relation::RelationType;
+
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_err = None;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s
+            warn!(
+                question_event_id = %q_event_id,
+                "Reaction reconciliation query failed — retry {attempt}/{MAX_ATTEMPTS} in {delay}s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        }
+        let options = RelationsOptions {
+            from: from.clone(),
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
+            ..Default::default()
+        };
+        match room.relations(q_event_id.clone(), options).await {
+            Ok(relations) => return Ok(relations),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.expect("loop runs MAX_ATTEMPTS >= 1 time"))
+}
+
+/// Fetch all reactions from the server after the countdown and merge them
+/// into the in-memory answer map. This is the authoritative check at
+/// evaluation time: it doesn't matter whether the live sync stream had
+/// already delivered (and processed) a given reaction by the time the
+/// question closed, only whether the homeserver has it. Users found only on
+/// the server (missed on the stream) are added with source "reconciled" and
+/// submitted_at = now.
 async fn reconcile_reactions(
     client: &Client,
     room: &Room,
     q_event_id: &OwnedEventId,
     answers: &mut HashMap<String, AnswerRecord>,
 ) {
-    use matrix_sdk::ruma::{
-        api::client::relations::get_relating_events_with_rel_type_and_event_type::v1 as api,
-        events::{relation::RelationType, AnyMessageLikeEvent, TimelineEventType},
-    };
+    use matrix_sdk::ruma::events::AnyMessageLikeEvent;
 
     let mut server_answers: HashMap<String, u8> = HashMap::new();
-    let mut query_succeeded = false;
     let mut from: Option<String> = None;
+    let mut fully_synced = false;
+    let mut undecryptable = 0u32;
 
     loop {
-        let mut req = api::Request::new(
-            room.room_id().to_owned(),
-            q_event_id.clone(),
-            RelationType::Annotation,
-            TimelineEventType::from("m.reaction"),
-        );
-        req.from = from.clone();
-        match client.send(req).await {
-            Ok(resp) => {
-                query_succeeded = true;
-                for raw in &resp.chunk {
-                    let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else {
-                        continue;
-                    };
-                    let Some(orig) = ev.as_original() else {
-                        continue;
-                    };
-                    // Skip the bot's own 🇦🇧🇨🇩 reactions it posted for tap-to-answer.
-                    if client
-                        .user_id()
-                        .map(|id| id == orig.sender)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let choice = match orig.content.relates_to.key.as_str() {
-                        "🇦" => 0u8,
-                        "🇧" => 1,
-                        "🇨" => 2,
-                        "🇩" => 3,
-                        _ => continue,
-                    };
-                    server_answers
-                        .entry(orig.sender.as_str().to_owned())
-                        .or_insert(choice);
-                }
-                match resp.next_batch {
-                    Some(token) => from = Some(token),
-                    None => break,
-                }
-            }
+        let relations = match fetch_relations_page(room, q_event_id, from.clone()).await {
+            Ok(r) => r,
             Err(e) => {
-                warn!("Reaction reconciliation failed: {e}");
+                warn!(
+                    question_event_id = %q_event_id,
+                    "Reaction reconciliation failed after retries — evaluating with \
+                     live-stream answers only: {e}"
+                );
+                break;
+            }
+        };
+
+        for event in &relations.chunk {
+            if event.kind.is_utd() {
+                undecryptable += 1;
+                continue;
+            }
+            let Ok(AnyMessageLikeEvent::Reaction(ev)) =
+                event.kind.raw().deserialize_as_unchecked::<AnyMessageLikeEvent>()
+            else {
+                continue;
+            };
+            let Some(orig) = ev.as_original() else {
+                continue; // Redacted — the user un-reacted; correctly excluded.
+            };
+            // Skip the bot's own 🇦🇧🇨🇩 reactions it posted for tap-to-answer.
+            if client
+                .user_id()
+                .map(|id| id == orig.sender)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let choice = match orig.content.relates_to.key.as_str() {
+                "🇦" => 0u8,
+                "🇧" => 1,
+                "🇨" => 2,
+                "🇩" => 3,
+                _ => continue,
+            };
+            // `Room::relations` defaults to backward (most-recent-first)
+            // order, so the first entry seen per sender is their latest
+            // reaction — relevant if a client doesn't auto-redact a
+            // superseded reaction before sending the new one.
+            server_answers
+                .entry(orig.sender.as_str().to_owned())
+                .or_insert(choice);
+        }
+
+        match relations.next_batch_token {
+            Some(token) => from = Some(token),
+            None => {
+                fully_synced = true;
                 break;
             }
         }
     }
 
-    if !query_succeeded {
+    if undecryptable > 0 {
+        warn!(
+            question_event_id = %q_event_id,
+            count = undecryptable,
+            "Some reactions to this question could not be decrypted and were ignored"
+        );
+    }
+
+    if !fully_synced {
+        // Only a partial (or no) view of the server's reaction state is
+        // available. Trusting it would risk *dropping* answers the live
+        // stream already recorded correctly — worse than doing nothing.
         return;
     }
 
-    let now = chrono::Utc::now();
+    let before = answers.len();
+    let summary = merge_reconciled_answers(answers, &server_answers, chrono::Utc::now());
 
-    // The stream never sees m.room.redaction events, so it can hold a stale
-    // reaction answer after the user removed it.  The server's current reaction
-    // set is authoritative.
-    //
-    // Rules:
-    //  • Reaction answer + user gone from server  → remove (they un-reacted)
-    //  • Text answer (!a/!b/…) + not on server   → keep (text can't be un-sent)
-    //  • Reaction answer + server has same choice → keep stream (timestamp intact)
-    //  • Reaction answer + server has diff choice → server wins (missed redact + re-react)
-    //  • User missing from stream entirely        → add from server
+    if !summary.is_empty() {
+        info!(
+            question_event_id = %q_event_id,
+            before,
+            after = answers.len(),
+            added = ?summary.added,
+            corrected = ?summary.corrected,
+            removed = ?summary.removed,
+            "Reconciled reactions against server state"
+        );
+    }
+}
 
-    // Step 1: drop stale reaction answers for users who removed all reactions.
+/// What `merge_reconciled_answers` changed, for logging.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconciliationSummary {
+    /// Users present on the server but missing from the live stream —
+    /// e.g. a reaction that arrived just before the deadline and hadn't
+    /// been processed (or was processed after `active_quiz` was already
+    /// drained) when the countdown ended.
+    added: Vec<String>,
+    /// Users whose live-stream answer didn't match the server's current
+    /// reaction (e.g. they changed their answer via a second reaction that
+    /// their client didn't redact the first one for).
+    corrected: Vec<String>,
+    /// Users whose reaction-sourced answer was recorded live but is no
+    /// longer present on the server (they un-reacted before the deadline).
+    removed: Vec<String>,
+}
+
+impl ReconciliationSummary {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.corrected.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Merge the server's authoritative reaction state (`server_answers`) into
+/// the live-stream-collected `answers`, in place. Pure aside from the
+/// caller-supplied `now` (used as `submitted_at` for answers added here),
+/// so the merge rules can be unit-tested without a network round trip.
+///
+/// The stream never sees `m.room.redaction` events, so it can hold a stale
+/// reaction answer after the user removed it — the server's current
+/// reaction set is authoritative. Rules:
+///  • Reaction answer + user gone from server  → remove (they un-reacted)
+///  • Text answer (!a/!b/…) + not on server    → keep (text can't be un-sent)
+///  • Reaction answer + server has same choice → keep stream (timestamp intact)
+///  • Reaction answer + server has diff choice → server wins (missed redact + re-react)
+///  • User missing from stream entirely        → add from server
+fn merge_reconciled_answers(
+    answers: &mut HashMap<String, AnswerRecord>,
+    server_answers: &HashMap<String, u8>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ReconciliationSummary {
+    let removed: Vec<String> = answers
+        .iter()
+        .filter(|(user_id, rec)| rec.source != "text" && !server_answers.contains_key(*user_id))
+        .map(|(user_id, _)| user_id.clone())
+        .collect();
     answers.retain(|user_id, rec| rec.source == "text" || server_answers.contains_key(user_id));
 
-    // Step 2: correct / fill in from server.
-    for (user_id, &server_choice) in &server_answers {
+    let mut added = Vec::new();
+    let mut corrected = Vec::new();
+    for (user_id, &server_choice) in server_answers {
         answers
             .entry(user_id.clone())
             .and_modify(|r| {
@@ -296,15 +471,21 @@ async fn reconcile_reactions(
                     r.choice = server_choice;
                     r.source = "reconciled";
                     r.changed_answer = true;
+                    corrected.push(user_id.clone());
                 }
             })
-            .or_insert(AnswerRecord {
-                choice: server_choice,
-                source: "reconciled",
-                submitted_at: now,
-                changed_answer: false,
+            .or_insert_with(|| {
+                added.push(user_id.clone());
+                AnswerRecord {
+                    choice: server_choice,
+                    source: "reconciled",
+                    submitted_at: now,
+                    changed_answer: false,
+                }
             });
     }
+
+    ReconciliationSummary { added, corrected, removed }
 }
 
 // ── Quiz runner ───────────────────────────────────────────────────────────────
@@ -550,12 +731,20 @@ pub async fn start_quiz(
         .ok();
 
         // Drain active quiz.
+        let evaluated_at = chrono::Utc::now();
         let mut answers: HashMap<String, AnswerRecord> = {
             let mut aq = ctx.active_quiz.lock().await;
             let a = aq.as_ref().map(|q| q.answers.clone()).unwrap_or_default();
             *aq = None;
             a
         };
+        info!(
+            question_event_id = %q_event_id,
+            evaluated_at = %evaluated_at.to_rfc3339(),
+            recorded = answers.len(),
+            senders = ?answers.keys().collect::<Vec<_>>(),
+            "Freezing answers for evaluation (pre-reconciliation)"
+        );
 
         // ── Reconcile reactions from server ───────────────────────────────────
         reconcile_reactions(&client, &room, &q_event_id, &mut answers).await;
@@ -830,5 +1019,197 @@ mod tests {
     #[test]
     fn resolve_round_length_is_none_when_nothing_was_gathered() {
         assert_eq!(resolve_round_length(0, 5), None);
+    }
+
+    // ── Reaction handling ───────────────────────────────────────────────────
+
+    fn event_id(s: &str) -> OwnedEventId {
+        s.try_into().unwrap()
+    }
+
+    fn answer(choice: u8, source: &'static str) -> AnswerRecord {
+        AnswerRecord {
+            choice,
+            source,
+            submitted_at: chrono::Utc::now(),
+            changed_answer: false,
+        }
+    }
+
+    fn active_quiz(question: &str) -> ActiveQuiz {
+        ActiveQuiz {
+            event_id: event_id(question),
+            answers: HashMap::new(),
+            correct_index: 0,
+        }
+    }
+
+    #[test]
+    fn record_answer_first_time_is_new() {
+        let mut quiz = active_quiz("$q1:example.org");
+        let outcome = quiz.record_answer("@alice:example.org".to_owned(), 0, "reaction");
+        assert_eq!(outcome, AnswerOutcome::New);
+        assert_eq!(quiz.answers["@alice:example.org"].choice, 0);
+    }
+
+    #[test]
+    fn record_answer_changing_choice_is_replaced_and_flagged() {
+        let mut quiz = active_quiz("$q1:example.org");
+        quiz.record_answer("@alice:example.org".to_owned(), 0, "reaction");
+        let outcome = quiz.record_answer("@alice:example.org".to_owned(), 2, "reaction");
+        assert_eq!(outcome, AnswerOutcome::Replaced { previous: 0 });
+        assert_eq!(quiz.answers["@alice:example.org"].choice, 2);
+        assert!(quiz.answers["@alice:example.org"].changed_answer);
+    }
+
+    #[test]
+    fn record_answer_duplicate_reaction_is_unchanged() {
+        let mut quiz = active_quiz("$q1:example.org");
+        quiz.record_answer("@alice:example.org".to_owned(), 1, "reaction");
+        let outcome = quiz.record_answer("@alice:example.org".to_owned(), 1, "reaction");
+        assert_eq!(outcome, AnswerOutcome::Unchanged);
+        assert!(!quiz.answers["@alice:example.org"].changed_answer);
+    }
+
+    #[test]
+    fn apply_reaction_accepts_for_the_active_question() {
+        let mut active = Some(active_quiz("$q1:example.org"));
+        let result = apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@alice:example.org".to_owned(),
+            0,
+        );
+        assert_eq!(result, ReactionResult::Accepted(AnswerOutcome::New));
+        assert!(active.unwrap().answers.contains_key("@alice:example.org"));
+    }
+
+    #[test]
+    fn apply_reaction_ignores_a_reaction_to_a_stale_question() {
+        let mut active = Some(active_quiz("$q2:example.org"));
+        let result = apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"), // an older, already-closed question
+            "@alice:example.org".to_owned(),
+            0,
+        );
+        assert_eq!(result, ReactionResult::WrongQuestion);
+        assert!(active.unwrap().answers.is_empty());
+    }
+
+    #[test]
+    fn apply_reaction_ignores_when_no_question_is_active() {
+        let mut active: Option<ActiveQuiz> = None;
+        let result = apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@alice:example.org".to_owned(),
+            0,
+        );
+        assert_eq!(result, ReactionResult::NoActiveQuestion);
+    }
+
+    #[test]
+    fn apply_reaction_records_multiple_near_simultaneous_senders() {
+        // Concurrent reactions are serialized through the same mutex the
+        // real handler locks, so back-to-back calls model that correctly.
+        let mut active = Some(active_quiz("$q1:example.org"));
+        apply_reaction(&mut active, &event_id("$q1:example.org"), "@a:x.org".to_owned(), 0);
+        apply_reaction(&mut active, &event_id("$q1:example.org"), "@b:x.org".to_owned(), 1);
+        apply_reaction(&mut active, &event_id("$q1:example.org"), "@c:x.org".to_owned(), 2);
+        let answers = active.unwrap().answers;
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers["@a:x.org"].choice, 0);
+        assert_eq!(answers["@b:x.org"].choice, 1);
+        assert_eq!(answers["@c:x.org"].choice, 2);
+    }
+
+    // ── Reconciliation merge ─────────────────────────────────────────────────
+
+    #[test]
+    fn merge_adds_a_reaction_the_live_stream_missed() {
+        // Models a reaction sent just before the deadline: fully delivered
+        // to the homeserver, but not yet processed (or processed after
+        // `active_quiz` was already drained) by the live stream.
+        let mut answers = HashMap::new();
+        let server = HashMap::from([("@late:example.org".to_owned(), 2u8)]);
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert_eq!(summary.added, vec!["@late:example.org".to_owned()]);
+        assert_eq!(answers["@late:example.org"].choice, 2);
+        assert_eq!(answers["@late:example.org"].source, "reconciled");
+    }
+
+    #[test]
+    fn merge_does_not_lose_an_answer_already_received_live() {
+        // The core finalization-robustness guarantee: an answer the live
+        // stream already recorded, and that the server agrees with, must
+        // survive reconciliation untouched (including its original
+        // timestamp/source).
+        let mut answers = HashMap::new();
+        answers.insert("@alice:example.org".to_owned(), answer(1, "reaction"));
+        let server = HashMap::from([("@alice:example.org".to_owned(), 1u8)]);
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert!(summary.is_empty());
+        assert_eq!(answers["@alice:example.org"].source, "reaction");
+        assert_eq!(answers.len(), 1);
+    }
+
+    #[test]
+    fn merge_corrects_a_changed_answer_the_stream_missed() {
+        let mut answers = HashMap::new();
+        answers.insert("@alice:example.org".to_owned(), answer(0, "reaction"));
+        let server = HashMap::from([("@alice:example.org".to_owned(), 3u8)]);
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert_eq!(summary.corrected, vec!["@alice:example.org".to_owned()]);
+        assert_eq!(answers["@alice:example.org"].choice, 3);
+        assert!(answers["@alice:example.org"].changed_answer);
+    }
+
+    #[test]
+    fn merge_removes_an_answer_the_user_un_reacted() {
+        let mut answers = HashMap::new();
+        answers.insert("@alice:example.org".to_owned(), answer(0, "reaction"));
+        let server = HashMap::new(); // no reaction present anymore
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert_eq!(summary.removed, vec!["@alice:example.org".to_owned()]);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn merge_never_drops_a_text_answer() {
+        let mut answers = HashMap::new();
+        answers.insert("@alice:example.org".to_owned(), answer(0, "text"));
+        let server = HashMap::new(); // text answers have no server-side reaction
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert!(summary.is_empty());
+        assert_eq!(answers["@alice:example.org"].source, "text");
+    }
+
+    #[test]
+    fn merge_handles_multiple_senders_reacting_at_once() {
+        let mut answers = HashMap::new();
+        answers.insert("@already:example.org".to_owned(), answer(0, "reaction"));
+        let server = HashMap::from([
+            ("@already:example.org".to_owned(), 0u8),
+            ("@new1:example.org".to_owned(), 1u8),
+            ("@new2:example.org".to_owned(), 3u8),
+        ]);
+
+        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+
+        assert_eq!(answers.len(), 3);
+        assert_eq!(summary.added.len(), 2);
+        assert!(summary.added.contains(&"@new1:example.org".to_owned()));
+        assert!(summary.added.contains(&"@new2:example.org".to_owned()));
     }
 }
