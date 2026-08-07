@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Context;
 use chrono_tz::Tz;
 use matrix_sdk::{
     ruma::{
@@ -162,6 +163,38 @@ fn question_text(
 fn make_edit(event_id: OwnedEventId, text: &str) -> RoomMessageEventContent {
     RoomMessageEventContent::text_plain(text)
         .make_replacement(ReplacementMetadata::new(event_id, None))
+}
+
+/// Post the round's question message, retrying transient send failures.
+///
+/// This is the one send in the round loop that the round cannot proceed
+/// without. Observed in production: a homeserver-side hiccup (sync/auth
+/// 503s) can fail a single request for ~30 s before recovering on its own.
+/// Without a retry here, that single failed request used to abort the
+/// entire round via `?` — losing every remaining question and leaving the
+/// round's DB record permanently unfinished. Mirrors the retry shape already
+/// used for OpenTDB requests in fetcher.rs.
+async fn send_question_with_retry(
+    room: &Room,
+    content: &RoomMessageEventContent,
+) -> anyhow::Result<OwnedEventId> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s, 8 s, 16 s
+            warn!("Posting question failed — retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        }
+        match room.send(content.clone()).await {
+            Ok(resp) => return Ok(resp.response.event_id),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.expect("loop runs MAX_ATTEMPTS >= 1 time"))
+        .context(format!("failed to post question after {MAX_ATTEMPTS} attempts"))
 }
 
 // ── Reaction reconciliation ───────────────────────────────────────────────────
@@ -435,11 +468,26 @@ pub async fn start_quiz(
             m.room = true;
             q_content = q_content.add_mentions(m);
         }
-        let resp = room
-            .send(q_content)
-            .await
-            .map_err(|e| anyhow::anyhow!("send question failed: {e}"))?;
-        let q_event_id: OwnedEventId = resp.response.event_id;
+        let q_event_id = match send_question_with_retry(&room, &q_content).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    round_id,
+                    q_num,
+                    round_len,
+                    questions_asked,
+                    "Ending round early — could not post question after retries: {e:#}"
+                );
+                room.send(RoomMessageEventContent::text_plain(format!(
+                    "⚠️ Lost connection to Matrix while posting Q{q_num}/{round_len} — \
+                     ending round early ({questions_asked} question{} completed).",
+                    if questions_asked == 1 { "" } else { "s" }
+                )))
+                .await
+                .ok();
+                break;
+            }
+        };
         info!("Q {q_num}/{round_len}: posted (event {q_event_id}, correct slot {correct_index})");
 
         // ── Insert question in DB ─────────────────────────────────────────────
