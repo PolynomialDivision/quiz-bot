@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::{
+    events::{room::message::RoomMessageEventContent, Mentions},
+    OwnedUserId,
+};
 
 /// Scan `text` for Matrix user IDs and return a `RoomMessageEventContent`
 /// with HTML mention pills showing the localpart as the pill label.
@@ -59,6 +62,14 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
     let mut in_bold  = false;
 
     let mut in_strike = false;
+    // Every MXID pill rendered below must also land in `m.mentions` on this
+    // same event — that field, not the HTML pill, is what current Matrix
+    // clients/servers use to decide push notifications and highlights.
+    // Without it, a mentioned user's notification depends on legacy
+    // homeserver text-scanning of the plain body, which can miss the
+    // intended pill entirely or fire on an unrelated message that happens
+    // to contain their display name as a text.
+    let mut mentioned: BTreeSet<OwnedUserId> = BTreeSet::new();
 
     while pos < text.len() {
         // ── **bold** markers ──────────────────────────────────────────────────
@@ -111,6 +122,9 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
                 push_escaped(&mut html, label);
                 html.push_str("</a>");
                 found = true;
+                if let Ok(uid) = OwnedUserId::try_from(token) {
+                    mentioned.insert(uid);
+                }
                 pos += token_len;
                 continue;
             }
@@ -134,10 +148,16 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
     if in_bold   { html.push_str("</strong>"); }
     if in_strike { html.push_str("</del>"); }
 
-    if found {
+    let content = if found {
         RoomMessageEventContent::text_html(plain, html)
     } else {
         RoomMessageEventContent::text_plain(text)
+    };
+
+    if mentioned.is_empty() {
+        content
+    } else {
+        content.add_mentions(Mentions::with_user_ids(mentioned))
     }
 }
 
@@ -158,6 +178,10 @@ fn push_escaped(out: &mut String, value: &str) {
 mod tests {
     use matrix_sdk::ruma::events::room::message::MessageType;
     use super::*;
+
+    fn uid(s: &str) -> OwnedUserId {
+        <&matrix_sdk::ruma::UserId>::try_from(s).unwrap().to_owned()
+    }
 
     /// Extract (plain_body, Option<html_body>) from a RoomMessageEventContent.
     fn bodies(c: &RoomMessageEventContent) -> (String, Option<String>) {
@@ -269,5 +293,43 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains("&lt;Alice &amp; Co&gt;"));
         assert!(!html.contains("><Alice"));
+    }
+
+    #[test]
+    fn mentionify_sets_m_mentions_on_the_same_event() {
+        // The HTML pill alone does not notify anyone — current Matrix
+        // clients/servers key push/highlight behaviour off `m.mentions`.
+        // This must be set on the very event carrying the pill, not sent
+        // (or omitted) separately.
+        let c = mentionify("Hello @alice:example.org!");
+        let mentions = c.mentions.expect("m.mentions must be set");
+        assert_eq!(mentions.user_ids, [uid("@alice:example.org")].into_iter().collect());
+        assert!(!mentions.room);
+    }
+
+    #[test]
+    fn mentionify_with_names_sets_m_mentions_for_every_pill() {
+        let mut names = HashMap::new();
+        names.insert("@alice:example.org".to_owned(), "Alice".to_owned());
+        let c = mentionify_with_names("@alice:example.org and @bob:example.org", &names);
+        let mentions = c.mentions.expect("m.mentions must be set");
+        assert_eq!(mentions.user_ids.len(), 2);
+        assert!(mentions.user_ids.contains(&uid("@alice:example.org")));
+        assert!(mentions.user_ids.contains(&uid("@bob:example.org")));
+    }
+
+    #[test]
+    fn no_mxid_means_no_mentions_field() {
+        let c = mentionify("no mentions here");
+        assert!(c.mentions.is_none());
+    }
+
+    #[test]
+    fn invalid_mxid_token_gets_a_pill_but_no_mention() {
+        // Not a syntactically valid Matrix user ID (empty server name) —
+        // still rendered as a pill for backwards-compatible display, but it
+        // must not be added to m.mentions since it can't resolve to anyone.
+        let c = mentionify("@alice:");
+        assert!(c.mentions.is_none());
     }
 }
