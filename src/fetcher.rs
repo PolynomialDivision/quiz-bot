@@ -1,23 +1,45 @@
 //! Fetches trivia questions from the Open Trivia Database (opentdb.com).
 //!
-//! Uses a session token to avoid repeating questions until the full pool is
-//! exhausted, then resets the token automatically.
+//! Two independent, complementary defenses against repeats:
+//!  - An OpenTDB **session token** (`token=...` on every question request):
+//!    OpenTDB itself won't hand back a question already served to that
+//!    token, until the token's pool for the query is exhausted
+//!    (`response_code = 4`), at which point it's reset (not replaced —
+//!    reset keeps the same token, just clears its "seen" list) so the same
+//!    token keeps being reused indefinitely. The token is persisted in
+//!    `state.json` and requested at most once (see [`ensure_token`]).
+//!  - The bot's own persistent, cross-restart question history in SQLite
+//!    (see `crate::db::Db::question_recently_asked`), which catches
+//!    duplicates the token can't: OpenTDB's per-token memory doesn't
+//!    survive a token reset/replacement, and it can't detect near-dupes
+//!    that differ only in punctuation. The DB check runs on every
+//!    candidate regardless of what the token already filtered out.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::{DateTime, Utc};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{state::FetchedQuestion, BotContext};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
 const API_URL: &str = "https://opentdb.com/api.php";
+
+/// How long a question stays "recently asked" (and therefore avoided) after
+/// it's served. Some OpenTDB categories have well under 100 questions total,
+/// so deduping against unbounded history means those pools permanently
+/// exhaust and every draw becomes a forced repeat. Letting matches age out
+/// after ~2 months keeps the pool usable indefinitely while still keeping
+/// any individual question rare on the timescale a player would notice.
+pub const QUESTION_REUSE_COOLDOWN_DAYS: i64 = 60;
 
 // ── Global request throttle ───────────────────────────────────────────────────
 //
@@ -185,7 +207,7 @@ async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
 
 // ── OpenTDB response shapes ───────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct TokenResponse {
     response_code: u8,
     token: Option<String>,
@@ -245,20 +267,105 @@ fn category_can_follow(
 }
 
 // ── Token management ──────────────────────────────────────────────────────────
+//
+// Every question request (`prefetch`, `fetch_one`) carries `token=...`, so
+// OpenTDB itself skips questions already served to this token. The token is
+// cached in `ctx.state.opentdb_token` (persisted to state.json) so it's
+// requested once, not per question, and survives a bot restart.
+//
+// `next_question`'s low-cache background prefetch (spawned via
+// `tokio::spawn`, not covered by the round-level `quiz_run_lock`) can run
+// concurrently with a round's own `fetch_one` calls. Without synchronization
+// two callers could both see no cached token and each request/reset one
+// independently, splitting OpenTDB's own dedup memory across two live
+// tokens. `TOKEN_OP_LOCK` serializes token creation/reset so at most one
+// such operation is ever in flight.
 
-/// Return the stored session token, requesting a fresh one if none exists.
-async fn ensure_token(ctx: &BotContext) -> anyhow::Result<String> {
-    {
-        let state = ctx.state.lock().await;
-        if let Some(tok) = &state.opentdb_token {
-            return Ok(tok.clone());
-        }
-    }
+/// Serializes OpenTDB token creation and reset. Held only while a network
+/// round trip for the token itself is in flight — ordinary question
+/// requests (the hot path) never touch this lock.
+static TOKEN_OP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Short, non-reversible identifier for correlating token log lines —
+/// never log the token itself, since it's a live credential against a
+/// third-party API (anyone holding it can drain our request budget).
+fn token_fingerprint(token: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// `GET {base}?command=request` — ask OpenTDB for a brand-new session token.
+async fn request_token_at(base: &str) -> anyhow::Result<TokenResponse> {
     throttle().await;
-    let resp: TokenResponse = reqwest::get(format!("{TOKEN_URL}?command=request"))
+    Ok(reqwest::get(format!("{base}?command=request"))
         .await?
         .json()
-        .await?;
+        .await?)
+}
+
+/// `GET {base}?command=reset&token=...` — clear a token's "already served"
+/// memory so it can be reused. The token string itself is unchanged.
+async fn reset_token_at(base: &str, token: &str) -> anyhow::Result<TokenResponse> {
+    throttle().await;
+    Ok(reqwest::get(format!("{base}?command=reset&token={token}"))
+        .await?
+        .json()
+        .await?)
+}
+
+/// Double-checked-locking "get or create" for a cached value that must only
+/// ever be produced once under concurrent callers: return the cached value
+/// if present; otherwise take `op_lock`, re-check (another caller may have
+/// just filled it while we were waiting), and only call `fetch` if it's
+/// still empty.
+///
+/// Not used by production code — `ensure_token` needs the exact same
+/// shape but operates on `ctx.state` (a `Mutex<State>`, not a bare
+/// `Mutex<Option<String>>`), so it's hand-written rather than calling
+/// this. This exists purely so the double-checked-locking algorithm
+/// itself — the thing that makes concurrent `ensure_token` calls safe —
+/// has a direct, network-free, non-BotContext test: see
+/// `token_tests::acquire_token_single_flights_concurrent_callers`.
+#[cfg(test)]
+async fn acquire_token<F, Fut>(
+    cached: &Mutex<Option<String>>,
+    op_lock: &Mutex<()>,
+    fetch: F,
+) -> anyhow::Result<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    if let Some(tok) = cached.lock().await.clone() {
+        return Ok(tok);
+    }
+    let _guard = op_lock.lock().await;
+    if let Some(tok) = cached.lock().await.clone() {
+        return Ok(tok);
+    }
+    let token = fetch().await?;
+    *cached.lock().await = Some(token.clone());
+    Ok(token)
+}
+
+/// Return the stored session token, requesting a fresh one only if none is
+/// cached yet. Concurrent callers are serialized by `TOKEN_OP_LOCK` — see
+/// the module-level doc comment on ``Token management``.
+///
+/// `token_url` is injectable so tests can point this at a local mock
+/// server; production call sites always pass the `TOKEN_URL` constant.
+async fn ensure_token(ctx: &BotContext, token_url: &str) -> anyhow::Result<String> {
+    if let Some(tok) = ctx.state.lock().await.opentdb_token.clone() {
+        return Ok(tok);
+    }
+    let _guard = TOKEN_OP_LOCK.lock().await;
+    if let Some(tok) = ctx.state.lock().await.opentdb_token.clone() {
+        debug!("OpenTDB token was obtained by a concurrent caller while waiting");
+        return Ok(tok);
+    }
+
+    let resp = request_token_at(token_url).await?;
     if resp.response_code != 0 {
         anyhow::bail!("OpenTDB token request failed (code {})", resp.response_code);
     }
@@ -268,21 +375,47 @@ async fn ensure_token(ctx: &BotContext) -> anyhow::Result<String> {
         state.opentdb_token = Some(token.clone());
         state.save(&ctx.state_path).await?;
     }
-    info!("Obtained new OpenTDB session token");
+    info!(token_fp = %token_fingerprint(&token), "Obtained new OpenTDB session token");
     Ok(token)
 }
 
-/// Reset a token after its question pool is exhausted.
-async fn reset_token(_ctx: &BotContext, token: &str) -> anyhow::Result<()> {
-    throttle().await;
-    let resp: TokenResponse = reqwest::get(format!("{TOKEN_URL}?command=reset&token={token}"))
-        .await?
-        .json()
-        .await?;
+/// Reset a token after its question pool is exhausted (`response_code = 4`).
+/// The token string is unchanged — only its "already served" memory is
+/// cleared — so callers keep using the same value afterward; nothing needs
+/// to be re-persisted to `state.json`. Serialized by `TOKEN_OP_LOCK` so two
+/// concurrent code-4 responses for the same token don't both reset it.
+///
+/// Takes no `BotContext`/state at all — by construction, a reset can never
+/// clear the cached token (the earlier bug: the old code did exactly that
+/// right after a successful reset, discarding a token that was still
+/// perfectly valid and forcing a wasted extra "request new token" call).
+async fn reset_token(token: &str, token_url: &str) -> anyhow::Result<()> {
+    let _guard = TOKEN_OP_LOCK.lock().await;
+    let resp = reset_token_at(token_url, token).await?;
     if resp.response_code != 0 {
         anyhow::bail!("OpenTDB token reset failed (code {})", resp.response_code);
     }
-    info!("Reset OpenTDB session token");
+    info!(token_fp = %token_fingerprint(token), "Reset OpenTDB session token (pool exhausted)");
+    Ok(())
+}
+
+/// Clear the cached token, but only if it still matches `token` — a
+/// concurrent caller may have already replaced it with a fresh one while
+/// this now-stale request was in flight, and we must not discard that.
+/// Used when OpenTDB reports the token invalid/expired (`response_code = 3`).
+async fn clear_token_if_matches(ctx: &BotContext, token: &str) -> anyhow::Result<()> {
+    let _guard = TOKEN_OP_LOCK.lock().await;
+    let mut state = ctx.state.lock().await;
+    if state.opentdb_token.as_deref() == Some(token) {
+        state.opentdb_token = None;
+        state.save(&ctx.state_path).await?;
+        info!(
+            token_fp = %token_fingerprint(token),
+            "Cleared invalid/expired OpenTDB session token"
+        );
+    } else {
+        debug!("Skipped clearing OpenTDB token — already replaced by a concurrent caller");
+    }
     Ok(())
 }
 
@@ -304,7 +437,7 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
 
-        let token = match ensure_token(ctx).await {
+        let token = match ensure_token(ctx, TOKEN_URL).await {
             Ok(t) => t,
             Err(e) => {
                 warn!("ensure_token failed: {e}");
@@ -377,16 +510,16 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
             // Code 3: token expired after 6 h inactivity — clear it and retry.
             3 if !token_refreshed => {
                 warn!("OpenTDB session token expired, requesting a new one");
-                let mut state = ctx.state.lock().await;
-                state.opentdb_token = None;
-                state.save(&ctx.state_path).await?;
+                clear_token_if_matches(ctx, &token).await?;
                 token_refreshed = true;
             }
             3 => warn!("OpenTDB token still not found after refresh — retrying"),
-            // Code 4: every question for the current query has been seen — reset.
+            // Code 4: every question for the current query has been seen —
+            // reset it. Reset keeps the same token value, so it stays
+            // cached in state.json; nothing to persist here.
             4 if !token_refreshed => {
                 warn!("OpenTDB token exhausted, resetting");
-                reset_token(ctx, &token).await?;
+                reset_token(&token, TOKEN_URL).await?;
                 token_refreshed = true;
             }
             4 => warn!("OpenTDB token still exhausted after reset — retrying"),
@@ -517,16 +650,21 @@ async fn pick_round_categories(ctx: &BotContext, n: usize) -> Vec<CategoryChoice
 }
 
 /// Fetch exactly one question from a specific OpenTDB category, skipping
-/// already-asked questions.  Does not touch the shared cache.
+/// questions asked within the reuse cooldown (see
+/// [`QUESTION_REUSE_COOLDOWN_DAYS`]).  Does not touch the shared cache.
 async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQuestion> {
     const MAX_SKIP: usize = 5;
     let difficulty = ctx.config.trivia.difficulty.clone();
 
     let mut token_refreshed = false;
+    // Best duplicate seen so far, kept only in case every attempt turns out
+    // to be a within-cooldown repeat: we'd rather resurface the one that's
+    // gone longest without being asked than whichever was drawn last.
+    let mut best_duplicate: Option<(FetchedQuestion, Option<DateTime<Utc>>)> = None;
 
     for attempt in 0..=MAX_SKIP {
         // At most one token-reset per call; network errors get their own retry inside api_get_with_retry.
-        let token = match ensure_token(ctx).await {
+        let token = match ensure_token(ctx, TOKEN_URL).await {
             Ok(t) => t,
             Err(e) => {
                 warn!("fetch_one: ensure_token failed (attempt {attempt}): {e}");
@@ -570,16 +708,40 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                         warn!("Discarding malformed OpenTDB question for category {category}");
                         continue;
                     }
-                    let already_asked = ctx
+                    let recently_asked = ctx
                         .db
-                        .question_exists(&fetched.question)
+                        .question_recently_asked(&fetched.question, QUESTION_REUSE_COOLDOWN_DAYS)
                         .await
                         .unwrap_or(false);
-                    if !already_asked || attempt == MAX_SKIP {
-                        if attempt == MAX_SKIP && already_asked {
-                            warn!("Reusing duplicate question for category {category} — pool may be exhausted");
-                        }
+                    if !recently_asked {
                         return Ok(fetched);
+                    }
+
+                    let last_asked_at = ctx
+                        .db
+                        .question_last_asked_at(&fetched.question)
+                        .await
+                        .unwrap_or(None);
+                    let is_better = match &best_duplicate {
+                        None => true,
+                        Some((_, best_at)) => last_asked_at < *best_at,
+                    };
+                    if is_better {
+                        best_duplicate = Some((fetched, last_asked_at));
+                    }
+
+                    if attempt == MAX_SKIP {
+                        // Every candidate this call drew was within the reuse
+                        // cooldown — pool for this category is genuinely tight
+                        // right now. Resurface whichever has gone longest
+                        // without being asked rather than a fresher repeat.
+                        let (chosen, chosen_at) =
+                            best_duplicate.expect("set above on this iteration");
+                        warn!(
+                            "Reusing duplicate question for category {category} \
+                             (last asked {chosen_at:?}) — pool within cooldown window"
+                        );
+                        return Ok(chosen);
                     }
                     // Duplicate — try again.
                     info!(
@@ -594,19 +756,19 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
             // Code 3: token expired — clear and retry once.
             3 if !token_refreshed => {
                 warn!("OpenTDB token not found (expired) for category {category}, refreshing");
-                let mut state = ctx.state.lock().await;
-                state.opentdb_token = None;
-                state.save(&ctx.state_path).await?;
+                clear_token_if_matches(ctx, &token).await?;
                 token_refreshed = true;
             }
             3 => anyhow::bail!("OpenTDB token not found even after refresh"),
-            // Code 4: token exhausted — reset and retry once.
+            // Code 4: token exhausted — reset and retry once. Reset keeps
+            // the same token value (it just clears the "already served"
+            // memory), so — unlike code 3 — the cached token must NOT be
+            // discarded here: doing so would throw away a token that was
+            // just successfully reset and force a wasted extra round trip
+            // to request a brand-new one on the next attempt.
             4 if !token_refreshed => {
                 warn!("OpenTDB token exhausted for category {category}, resetting");
-                reset_token(ctx, &token).await?;
-                let mut state = ctx.state.lock().await;
-                state.opentdb_token = None;
-                state.save(&ctx.state_path).await?;
+                reset_token(&token, TOKEN_URL).await?;
                 token_refreshed = true;
             }
             4 => anyhow::bail!("OpenTDB token still exhausted after reset"),
@@ -837,7 +999,12 @@ async fn cached_question_excluding(
             ctx.state.lock().await.cached_questions.push_back(q);
             continue;
         }
-        if !ctx.db.question_exists(&q.question).await.unwrap_or(false) {
+        let recently_asked = ctx
+            .db
+            .question_recently_asked(&q.question, QUESTION_REUSE_COOLDOWN_DAYS)
+            .await
+            .unwrap_or(false);
+        if !recently_asked {
             info!(category = %q.category, "Selected category-aware cache fallback");
             return Some(q);
         }
@@ -853,6 +1020,9 @@ async fn cached_question_excluding(
 /// OpenTDB pool has been exhausted.
 pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> {
     const MAX_SKIP: usize = 30;
+    // Best duplicate seen so far, used only if every candidate this call
+    // pops turns out to be within the reuse cooldown — see `fetch_one`.
+    let mut best_duplicate: Option<(FetchedQuestion, Option<DateTime<Utc>>)> = None;
 
     for attempt in 0..=MAX_SKIP {
         // Ensure the cache has at least one item.
@@ -899,19 +1069,35 @@ pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> 
             }
         }
 
-        // Check whether this question has already been asked in a past round.
-        let already_asked = ctx.db.question_exists(&q.question).await.unwrap_or(false);
-        if !already_asked {
+        // Check whether this question was asked within the reuse cooldown.
+        let recently_asked = ctx
+            .db
+            .question_recently_asked(&q.question, QUESTION_REUSE_COOLDOWN_DAYS)
+            .await
+            .unwrap_or(false);
+        if !recently_asked {
             return Ok(q);
         }
 
+        let last_asked_at = ctx.db.question_last_asked_at(&q.question).await.unwrap_or(None);
+        let is_better = match &best_duplicate {
+            None => true,
+            Some((_, best_at)) => last_asked_at < *best_at,
+        };
+        if is_better {
+            best_duplicate = Some((q, last_asked_at));
+        }
+
         if attempt == MAX_SKIP {
-            // Entire reachable pool seems exhausted — reuse rather than hang.
+            // Entire reachable pool is within the cooldown window — reuse
+            // rather than hang, but prefer whichever duplicate has gone
+            // longest without being asked.
+            let (chosen, chosen_at) = best_duplicate.expect("set above on this iteration");
             warn!(
-                "Skipped {MAX_SKIP} duplicate questions — \
-                 OpenTDB pool may be exhausted, reusing a question."
+                "Skipped {MAX_SKIP} duplicate questions — pool within cooldown window, \
+                 reusing the least-recently-asked one (last asked {chosen_at:?})."
             );
-            return Ok(q);
+            return Ok(chosen);
         }
 
         info!(
@@ -1036,5 +1222,403 @@ mod tests {
         assert!(!category_can_follow(Some("geography"), " Geography ", 10));
         assert!(category_can_follow(Some("geography"), "History", 10));
         assert!(category_can_follow(Some("geography"), "Geography", 1));
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    //! Exercises the real `ensure_token` / `reset_token` /
+    //! `clear_token_if_matches` functions — not a reimplementation —
+    //! against a local mock OpenTDB server (`wiremock`) and a real,
+    //! network-free `BotContext` (matrix-sdk's own `MockClientBuilder`,
+    //! gated behind its `testing` feature).
+
+    use std::{collections::HashSet, path::Path, sync::Arc};
+
+    use matrix_sdk::ruma::RoomId;
+    use tokio::sync::Mutex as TokioMutex;
+    use wiremock::{
+        matchers::{method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    use super::*;
+    use crate::{config::Config, state::State, BotContext};
+
+    const TEST_CONFIG_TOML: &str = r#"
+        [matrix]
+        homeserver   = "http://localhost"
+        user_id      = "@bot:example.org"
+        access_token = "test-token"
+        device_id    = "TESTDEV"
+
+        [schedule]
+        room_id    = "!room:example.org"
+        quiz_times = ["12:00"]
+    "#;
+
+    /// A real `BotContext` — real in-memory DB, real (network-free) matrix
+    /// Client, real `State` backed by `state_path` — so `ensure_token(ctx)`
+    /// runs exactly as it does in production.
+    async fn test_ctx(state_path: std::path::PathBuf) -> BotContext {
+        let client = matrix_sdk::test_utils::client::MockClientBuilder::new(None)
+            .unlogged()
+            .build()
+            .await;
+        let db = Arc::new(crate::db::Db::open(Path::new(":memory:")).await.unwrap());
+        db.migrate().await.unwrap();
+        let config: Config = toml::from_str(TEST_CONFIG_TOML).unwrap();
+
+        BotContext {
+            state: Arc::new(TokioMutex::new(State::default())),
+            state_path,
+            config: Arc::new(config),
+            admin_users: HashSet::new(),
+            room_id: <&RoomId>::try_from("!room:example.org").unwrap().to_owned(),
+            active_quiz: Arc::new(TokioMutex::new(None)),
+            quiz_run_lock: Arc::new(TokioMutex::new(())),
+            client,
+            db,
+        }
+    }
+
+    fn temp_state_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "quiz-bot-token-test-{name}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn token_response_body(token: &str) -> serde_json::Value {
+        serde_json::json!({ "response_code": 0, "token": token })
+    }
+
+    // ── normal use ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ensure_token_requests_once_and_reuses_the_cached_value() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-abc")))
+            .expect(1) // must be called exactly once, not once per question
+            .mount(&server)
+            .await;
+
+        let ctx = test_ctx(temp_state_path("normal-use")).await;
+        let base = format!("{}/api_token.php", server.uri());
+
+        let first = ensure_token(&ctx, &base).await.unwrap();
+        let second = ensure_token(&ctx, &base).await.unwrap();
+
+        assert_eq!(first, "tok-abc");
+        assert_eq!(second, "tok-abc");
+        // wiremock verifies `.expect(1)` on drop — a second HTTP call would
+        // fail this test.
+    }
+
+    // ── restart / recovery ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn token_survives_a_simulated_restart_without_a_second_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-persisted")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = format!("{}/api_token.php", server.uri());
+        let state_path = temp_state_path("restart");
+
+        {
+            let ctx = test_ctx(state_path.clone()).await;
+            let token = ensure_token(&ctx, &base).await.unwrap();
+            assert_eq!(token, "tok-persisted");
+        } // ctx (and its in-memory state) dropped — simulates process exit.
+
+        {
+            // Fresh BotContext loading state from the same file, as happens
+            // on a real restart.
+            let mut ctx = test_ctx(state_path.clone()).await;
+            ctx.state = Arc::new(TokioMutex::new(State::load(&state_path).await.unwrap()));
+            let token = ensure_token(&ctx, &base).await.unwrap();
+            assert_eq!(token, "tok-persisted");
+        }
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    // ── exhausted token (response_code = 4) ─────────────────────────────
+
+    #[tokio::test]
+    async fn reset_keeps_the_same_token_cached_no_second_token_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-xyz")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "reset"))
+            .and(query_param("token", "tok-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response_code": 0, "token": serde_json::Value::Null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = test_ctx(temp_state_path("exhausted")).await;
+        let base = format!("{}/api_token.php", server.uri());
+
+        let token = ensure_token(&ctx, &base).await.unwrap();
+        assert_eq!(token, "tok-xyz");
+
+        // The real `reset_token` used by fetch_one/prefetch's code-4
+        // handler — it takes no `ctx`/state at all, so by construction it
+        // cannot clear the cached token (the bug that was fixed: the old
+        // code did exactly that right after a successful reset, discarding
+        // a token that was still valid and forcing a wasted second
+        // "request new token" call).
+        reset_token(&token, &base).await.unwrap();
+
+        let token_after_reset = ctx.state.lock().await.opentdb_token.clone();
+        assert_eq!(
+            token_after_reset.as_deref(),
+            Some("tok-xyz"),
+            "resetting a token must not discard it from the cache"
+        );
+
+        // Confirms no second `command=request` call happened: `.expect(1)`
+        // on the mock above is checked when `server` drops at end of test.
+    }
+
+    // ── invalid / expired token (response_code = 3) ─────────────────────
+
+    #[tokio::test]
+    async fn clear_token_if_matches_removes_a_stale_token() {
+        let ctx = test_ctx(temp_state_path("invalid")).await;
+        ctx.state.lock().await.opentdb_token = Some("stale-token".to_owned());
+
+        clear_token_if_matches(&ctx, "stale-token").await.unwrap();
+
+        assert_eq!(ctx.state.lock().await.opentdb_token, None);
+    }
+
+    #[tokio::test]
+    async fn clear_token_if_matches_preserves_a_token_replaced_concurrently() {
+        // Simulates: request A reads "old-token", gets a stale code-3 for it;
+        // meanwhile request B already replaced the cache with "new-token".
+        // A's cleanup must not clobber B's fresh token.
+        let ctx = test_ctx(temp_state_path("invalid-race")).await;
+        ctx.state.lock().await.opentdb_token = Some("new-token".to_owned());
+
+        clear_token_if_matches(&ctx, "old-token").await.unwrap();
+
+        assert_eq!(
+            ctx.state.lock().await.opentdb_token.as_deref(),
+            Some("new-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_re_requested_after_being_cleared() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-1")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-2")))
+            .mount(&server)
+            .await;
+
+        let ctx = test_ctx(temp_state_path("expired")).await;
+        let base = format!("{}/api_token.php", server.uri());
+
+        let first = ensure_token(&ctx, &base).await.unwrap();
+        assert_eq!(first, "tok-1");
+
+        // OpenTDB reports "Token Not Found" (expired after 6h idle).
+        clear_token_if_matches(&ctx, &first).await.unwrap();
+
+        let second = ensure_token(&ctx, &base).await.unwrap();
+        assert_eq!(second, "tok-2");
+    }
+
+    // ── API errors ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn token_request_at_parses_a_non_zero_response_code_without_erroring() {
+        // `request_token_at` is a pure fetch-and-parse — it hands the
+        // response code back for the caller to interpret, rather than
+        // deciding for itself what's an error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response_code": 2, "token": serde_json::Value::Null
+            })))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/api_token.php", server.uri());
+        let resp = request_token_at(&base).await.unwrap();
+        assert_eq!(resp.response_code, 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_token_surfaces_a_non_zero_response_code_as_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response_code": 2, "token": serde_json::Value::Null
+            })))
+            .mount(&server)
+            .await;
+
+        let ctx = test_ctx(temp_state_path("bad-code")).await;
+        let base = format!("{}/api_token.php", server.uri());
+
+        let err = ensure_token(&ctx, &base).await.unwrap_err();
+        assert!(format!("{err:#}").contains("code 2"), "error was: {err:#}");
+        // A failed token request must not poison the cache — a later
+        // retry should still be possible.
+        assert_eq!(ctx.state.lock().await.opentdb_token, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_get_with_retry_recovers_from_transient_failures() {
+        let server = MockServer::start().await;
+        // First two requests: HTTP 500. Third: a valid, empty result set.
+        Mock::given(method("GET"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response_code": 0, "results": []
+            })))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/api.php", server.uri());
+        // start_paused lets the exponential backoff between retries
+        // (1s, 2s, ...) elapse instantly instead of costing real wall time.
+        let resp = api_get_with_retry(&url).await.unwrap();
+        assert_eq!(resp.response_code, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_get_with_retry_gives_up_after_max_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/api.php", server.uri());
+        let result = api_get_with_retry(&url).await;
+        assert!(result.is_err(), "should give up rather than retry forever");
+    }
+
+    // ── concurrent requests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_ensure_token_calls_request_the_token_exactly_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api_token.php"))
+            .and(query_param("command", "request"))
+            // A small delay widens the window for two callers to race past
+            // the first (unlocked) cache check before either has written
+            // the result back — the scenario `TOKEN_OP_LOCK` must prevent
+            // from producing two independent token requests.
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(token_response_body("tok-concurrent"))
+                    .set_delay(std::time::Duration::from_millis(50)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = Arc::new(test_ctx(temp_state_path("concurrent")).await);
+        let base = format!("{}/api_token.php", server.uri());
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ctx = Arc::clone(&ctx);
+            let base = base.clone();
+            handles.push(tokio::spawn(
+                async move { ensure_token(&ctx, &base).await.unwrap() },
+            ));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        assert!(
+            results.iter().all(|t| t == "tok-concurrent"),
+            "every concurrent caller must observe the single winning token"
+        );
+        // `.expect(1)` on the mock (checked on drop) proves only one HTTP
+        // request actually went out despite 8 concurrent callers.
+    }
+
+    #[tokio::test]
+    async fn acquire_token_single_flights_concurrent_callers() {
+        // Same property as above, but against the decoupled, network-free
+        // `acquire_token` primitive directly.
+        let cached = Arc::new(Mutex::new(None));
+        let op_lock = Arc::new(Mutex::new(()));
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let cached = Arc::clone(&cached);
+            let op_lock = Arc::clone(&op_lock);
+            let call_count = Arc::clone(&call_count);
+            handles.push(tokio::spawn(async move {
+                acquire_token(&cached, &op_lock, || {
+                    let call_count = Arc::clone(&call_count);
+                    async move {
+                        call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok("only-token".to_owned())
+                    }
+                })
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(results.iter().all(|t| t == "only-token"));
     }
 }

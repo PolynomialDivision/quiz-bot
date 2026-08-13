@@ -154,6 +154,10 @@ impl Db {
                 .context("Applying monthly leaderboard schema")?;
             Self::migrate_category_group_column(conn)
                 .context("Migrating questions.category_group")?;
+            Self::migrate_normalized_text_column(conn)
+                .context("Migrating questions.normalized_text")?;
+            conn.execute_batch(include_str!("../migrations/004_question_reuse_policy.sql"))
+                .context("Applying question reuse policy schema")?;
             Ok(())
         })
         .await?;
@@ -195,6 +199,62 @@ impl Db {
 
         Ok(())
     }
+
+    /// Add and backfill `questions.normalized_text`, used to catch
+    /// near-duplicate questions that differ only in punctuation/whitespace
+    /// (e.g. OpenTDB entries for the same fact that quote the answer
+    /// differently — `Who painted "The Starry Night"?` vs `Who painted the
+    /// Starry Night?`). Plain SQL can't strip punctuation portably, so the
+    /// column is populated here rather than in a .sql migration.
+    fn migrate_normalized_text_column(conn: &mut Connection) -> Result<()> {
+        let has_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(questions)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            let names = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|name| name == "normalized_text")
+        };
+
+        if !has_column {
+            conn.execute("ALTER TABLE questions ADD COLUMN normalized_text TEXT", [])?;
+        }
+
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT id, question_text
+                 FROM questions
+                 WHERE normalized_text IS NULL OR normalized_text = ''",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let tx = conn.transaction()?;
+        for (id, question_text) in rows {
+            let normalized = normalize_question_text(&question_text);
+            tx.execute(
+                "UPDATE questions SET normalized_text = ?1 WHERE id = ?2",
+                params![normalized, id],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+}
+
+/// Fold a question down to a form suitable for near-duplicate comparison:
+/// lower-case, punctuation stripped entirely (not just quotes), whitespace
+/// collapsed. Two OpenTDB entries that differ only in how they quote a
+/// title or phrase (`"The Starry Night"` vs `the Starry Night`) normalize
+/// to the same string.
+pub fn normalize_question_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 // ── Key-value helpers ─────────────────────────────────────────────────────────
@@ -391,15 +451,16 @@ impl Db {
         let correct_index = p.correct_index as i32;
         let correct_answer = p.correct_answer_text.to_owned();
         let timeout = p.answer_timeout_secs;
+        let normalized_text = normalize_question_text(&question_text);
 
         self.run(move |conn| {
             conn.execute(
                 "INSERT INTO questions
                    (round_id, question_num, matrix_event_id,
                     category, category_group, difficulty, question_text,
-                    choices, correct_index, correct_answer_text,
+                    normalized_text, choices, correct_index, correct_answer_text,
                     answer_timeout_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     round_id,
                     question_num,
@@ -408,6 +469,7 @@ impl Db {
                     category_group,
                     difficulty,
                     question_text,
+                    normalized_text,
                     choices_json,
                     correct_index,
                     correct_answer,
@@ -573,18 +635,54 @@ impl Db {
             .await
     }
 
-    pub async fn question_exists(&self, question_text: &str) -> Result<bool> {
-        let question_text = question_text.to_owned();
+    /// True if a question matching `question_text` — exact text, or
+    /// [`normalize_question_text`]-equal (catches near-duplicates that only
+    /// differ in punctuation/whitespace, e.g. quoted vs. unquoted titles) —
+    /// was asked within the last `cooldown_days` days.
+    ///
+    /// Matches older than the cooldown don't count: without an expiry,
+    /// dedup against unbounded history means small OpenTDB category pools
+    /// (some have well under 100 questions) permanently exhaust and every
+    /// draw becomes a forced repeat. Aging matches out lets the pool
+    /// recycle instead — see `fetcher::QUESTION_REUSE_COOLDOWN_DAYS`.
+    pub async fn question_recently_asked(
+        &self,
+        question_text: &str,
+        cooldown_days: i64,
+    ) -> Result<bool> {
+        let normalized = normalize_question_text(question_text);
+        let cutoff = (Utc::now() - chrono::Duration::days(cooldown_days))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
         self.run(move |conn| {
             Ok(conn.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM questions
-                    WHERE question_text = ?1
-                       OR lower(trim(question_text)) = lower(trim(?1))
+                    WHERE normalized_text = ?1 AND asked_at >= ?2
                  )",
-                params![question_text],
+                params![normalized, cutoff],
                 |r| r.get::<_, bool>(0),
             )?)
+        })
+        .await
+    }
+
+    /// When a question matching `question_text` (by normalized text) was
+    /// last asked, if ever. Used to break ties among duplicate candidates
+    /// in favour of whichever has gone longest without being repeated,
+    /// rather than accepting whichever duplicate happened to be drawn last.
+    pub async fn question_last_asked_at(&self, question_text: &str) -> Result<Option<DateTime<Utc>>> {
+        let normalized = normalize_question_text(question_text);
+        self.run(move |conn| {
+            let raw: Option<String> = conn.query_row(
+                "SELECT MAX(asked_at) FROM questions WHERE normalized_text = ?1",
+                params![normalized],
+                |r| r.get(0),
+            )?;
+            Ok(raw.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }))
         })
         .await
     }
@@ -949,6 +1047,187 @@ mod tests {
         db
     }
 
+    /// Insert a question via the normal `insert_question` path (so
+    /// `normalized_text` is computed exactly as production code computes
+    /// it), backdating `asked_at` to `age_days` ago. Returns the round id.
+    async fn insert_question_aged(db: &Db, text: &str, age_days: i64) -> i64 {
+        let round_id = db
+            .create_round(&RoundParams {
+                room_id: "!room:example.org",
+                n_questions_planned: 1,
+                triggered_by: "test",
+                config_answer_timeout: 30,
+                config_questions_per_round: 1,
+                config_timezone: "UTC",
+                config_category_id: None,
+                config_difficulty: None,
+            })
+            .await
+            .unwrap();
+        db.insert_question(&QuestionParams {
+            round_id,
+            question_num: 1,
+            matrix_event_id: None,
+            category: "General Knowledge",
+            category_group: "General Knowledge",
+            difficulty: "easy",
+            question_text: text,
+            choices: &["a".to_owned(), "b".to_owned(), "c".to_owned(), "d".to_owned()],
+            correct_index: 0,
+            correct_answer_text: "a",
+            answer_timeout_secs: 30,
+        })
+        .await
+        .unwrap();
+        if age_days != 0 {
+            let asked_at = (Utc::now() - chrono::Duration::days(age_days))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            db.run(move |conn| {
+                conn.execute(
+                    "UPDATE questions SET asked_at = ?1 WHERE round_id = ?2",
+                    params![asked_at, round_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        round_id
+    }
+
+    #[tokio::test]
+    async fn exact_duplicate_is_recently_asked() {
+        let db = test_db().await;
+        insert_question_aged(&db, "Who painted the Mona Lisa?", 0).await;
+
+        assert!(db
+            .question_recently_asked("Who painted the Mona Lisa?", 60)
+            .await
+            .unwrap());
+        // Case/whitespace-insensitive too.
+        assert!(db
+            .question_recently_asked("  who painted the mona lisa?  ", 60)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_punctuation_variant_is_recently_asked() {
+        let db = test_db().await;
+        insert_question_aged(&db, r#"Who painted "The Starry Night"?"#, 0).await;
+
+        // Same fact, quoted differently — must still be caught so the bot
+        // doesn't ask what is effectively the same question twice.
+        assert!(db
+            .question_recently_asked("Who painted the Starry Night?", 60)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrelated_question_is_not_recently_asked() {
+        let db = test_db().await;
+        insert_question_aged(&db, "Who painted the Mona Lisa?", 0).await;
+
+        assert!(!db
+            .question_recently_asked("What is the capital of France?", 60)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn question_ages_out_of_the_cooldown_and_becomes_reusable() {
+        let db = test_db().await;
+        insert_question_aged(&db, "Who painted the Mona Lisa?", 90).await;
+
+        // Asked 90 days ago; a 60-day cooldown must not still block it —
+        // this is the reuse policy that keeps small category pools from
+        // permanently exhausting.
+        assert!(!db
+            .question_recently_asked("Who painted the Mona Lisa?", 60)
+            .await
+            .unwrap());
+        // But a longer cooldown still catches it.
+        assert!(db
+            .question_recently_asked("Who painted the Mona Lisa?", 120)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn last_asked_at_reports_the_most_recent_occurrence() {
+        let db = test_db().await;
+        insert_question_aged(&db, "Who painted the Mona Lisa?", 40).await;
+        insert_question_aged(&db, "Who painted the Mona Lisa?", 5).await;
+
+        let last = db
+            .question_last_asked_at("Who painted the Mona Lisa?")
+            .await
+            .unwrap()
+            .expect("should have a last-asked timestamp");
+        let age = Utc::now() - last;
+        assert!(age.num_days() <= 6, "expected ~5 days old, got {age:?}");
+    }
+
+    #[tokio::test]
+    async fn history_survives_a_simulated_restart() {
+        // Not ":memory:" — a real file, closed and reopened, to prove
+        // dedup history is backed by disk rather than lost on process
+        // restart.
+        let path = std::env::temp_dir().join(format!(
+            "quiz-bot-test-restart-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        {
+            let db = Db::open(&path).await.unwrap();
+            db.migrate().await.unwrap();
+            insert_question_aged(&db, "Who painted the Mona Lisa?", 0).await;
+        } // `db` dropped here — simulates the process exiting.
+
+        {
+            let db = Db::open(&path).await.unwrap();
+            db.migrate().await.unwrap();
+            assert!(
+                db.question_recently_asked("Who painted the Mona Lisa?", 60)
+                    .await
+                    .unwrap(),
+                "dedup history must persist across a restart"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_question_checks_and_inserts_do_not_corrupt_state() {
+        let db = Arc::new(test_db().await);
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                let text = format!("Concurrent question {}", i % 3);
+                let _ = db.question_recently_asked(&text, 60).await.unwrap();
+                insert_question_aged(&db, &text, 0).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // All 10 inserts must have landed — concurrent access must not
+        // silently drop or corrupt rows.
+        assert_eq!(db.question_count().await.unwrap(), 10);
+        for i in 0..3 {
+            let text = format!("Concurrent question {i}");
+            assert!(db.question_recently_asked(&text, 60).await.unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn monthly_post_claim_is_idempotent() {
         let db = test_db().await;
@@ -1066,3 +1345,4 @@ mod tests {
         assert!(!names.contains_key("@ghost:example.org"));
     }
 }
+

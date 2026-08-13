@@ -25,6 +25,11 @@ toml               = "0.8"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+wiremock    = "0.6"
+matrix-sdk  = { version = "0.18", features = ["testing"] }
+tokio       = { version = "1", features = ["test-util"] }
+
 [patch.crates-io]
 matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
 matrix-sdk-base   = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }

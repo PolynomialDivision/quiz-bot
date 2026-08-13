@@ -66,3 +66,42 @@ impl State {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "quiz-bot-state-test-{name}-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    #[tokio::test]
+    async fn opentdb_token_survives_a_save_and_load_round_trip() {
+        // The OpenTDB session token must be requested at most once per
+        // bot lifetime, not once per question — this is what lets a fresh
+        // `State::load` after a restart pick the persisted token back up
+        // instead of `ensure_token` requesting a new one.
+        let path = temp_path("token-roundtrip");
+        let state = State {
+            opentdb_token: Some("persisted-token".to_owned()),
+            ..State::default()
+        };
+        state.save(&path).await.unwrap();
+
+        let loaded = State::load(&path).await.unwrap();
+        assert_eq!(loaded.opentdb_token.as_deref(), Some("persisted-token"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_state_file_defaults_to_no_cached_token() {
+        let path = temp_path("missing");
+        let loaded = State::load(&path).await.unwrap();
+        assert_eq!(loaded.opentdb_token, None);
+    }
+}
