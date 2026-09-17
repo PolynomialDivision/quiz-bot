@@ -137,6 +137,10 @@ pub struct TriviaConfig {
     /// automatically when the active category pool is too small.
     #[serde(default = "default_recent_category_window")]
     pub recent_category_window: usize,
+    /// Optional secondary question source: TriviaQA questions with
+    /// LLM-generated wrong answers. Disabled by default.
+    #[serde(default)]
+    pub triviaqa: TriviaQaConfig,
 }
 
 fn default_batch_size() -> u32 {
@@ -154,6 +158,55 @@ impl Default for TriviaConfig {
             batch_size: default_batch_size(),
             excluded_categories: Vec::new(),
             recent_category_window: default_recent_category_window(),
+            triviaqa: TriviaQaConfig::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TriviaQaConfig {
+    /// Off by default — TriviaQA questions need an LLM call (via
+    /// `[explainer].api_key`) to generate wrong answers, and the dataset
+    /// must be downloaded once before it can supply any questions.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where to download the dataset from on first use (once — see
+    /// `crate::triviaqa`). Point this straight at the official release
+    /// (e.g. https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz)
+    /// — the bot reads `.tar.gz` archives natively, picking the
+    /// `*-dev.json` split out of the bundle (see
+    /// `triviaqa::PREFERRED_ARCHIVE_ENTRIES`), so no local extraction or
+    /// re-hosting is needed. Plain JSON or gzip-compressed JSON matching
+    /// TriviaQA's schema
+    /// (`{"Data": [{"Question": ..., "Answer": {"Value": ..., "Aliases": [...]}}]}`)
+    /// also works, e.g. to point at your own mirror/subset.
+    pub dataset_url: Option<String>,
+    /// Cap on how many QA pairs to ingest from the dataset (the full
+    /// unfiltered set is very large). Default 20,000.
+    #[serde(default = "default_triviaqa_max_pool_size")]
+    pub max_pool_size: usize,
+    /// Fraction of quiz questions drawn from TriviaQA when enabled and the
+    /// pool has usable questions available (0.0–1.0). The rest — and any
+    /// slot TriviaQA can't fill (pool exhausted, LLM distractor generation
+    /// failed) — falls back to OpenTDB. Default 0.3.
+    #[serde(default = "default_triviaqa_mix_ratio")]
+    pub mix_ratio: f64,
+}
+
+fn default_triviaqa_max_pool_size() -> usize {
+    20_000
+}
+fn default_triviaqa_mix_ratio() -> f64 {
+    0.3
+}
+
+impl Default for TriviaQaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dataset_url: None,
+            max_pool_size: default_triviaqa_max_pool_size(),
+            mix_ratio: default_triviaqa_mix_ratio(),
         }
     }
 }

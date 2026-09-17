@@ -28,7 +28,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::{state::FetchedQuestion, BotContext};
+use crate::{state::FetchedQuestion, triviaqa, BotContext};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
 const API_URL: &str = "https://opentdb.com/api.php";
@@ -115,6 +115,12 @@ pub fn normalise(s: &str) -> String {
 }
 
 /// Map OpenTDB's raw category names back to the bot's balanced groups.
+///
+/// Also accepts the group labels themselves (e.g. "History", "Science &
+/// Technology") as input, not just OpenTDB's specific sub-category names —
+/// needed so a source with no sub-categories of its own (TriviaQA, which
+/// classifies straight into one of these 12 groups; see `crate::triviaqa`)
+/// maps back to itself instead of falling through to `None`.
 pub fn category_group_for_category(category: &str) -> Option<&'static str> {
     let c = normalise(category);
     match c.as_str() {
@@ -122,7 +128,8 @@ pub fn category_group_for_category(category: &str) -> Option<&'static str> {
         "science and nature"
         | "science: computers"
         | "science: mathematics"
-        | "science: gadgets" => Some("Science & Technology"),
+        | "science: gadgets"
+        | "science and technology" => Some("Science & Technology"),
         "mythology" => Some("Mythology"),
         "sports" => Some("Sports"),
         "geography" => Some("Geography"),
@@ -132,6 +139,7 @@ pub fn category_group_for_category(category: &str) -> Option<&'static str> {
         "celebrities" => Some("Celebrities"),
         "animals" => Some("Animals"),
         "vehicles" => Some("Vehicles"),
+        "entertainment" => Some("Entertainment"),
         _ if c.starts_with("entertainment:") => Some("Entertainment"),
         _ => None,
     }
@@ -141,6 +149,18 @@ pub fn category_group_label(category: &str) -> String {
     category_group_for_category(category)
         .unwrap_or(category)
         .to_owned()
+}
+
+/// Which balanced group a raw OpenTDB category ID belongs to, if any.
+/// Used to keep a fixed `trivia.category` config in sync with TriviaQA's
+/// own group classification (see `crate::triviaqa::next_question`), so a
+/// fixed-category round only offers TriviaQA questions from the matching
+/// group instead of an unrelated mix.
+pub fn category_group_for_id(id: u32) -> Option<&'static str> {
+    CATEGORY_GROUPS
+        .iter()
+        .find(|(_, ids)| ids.contains(&id))
+        .map(|(name, _)| *name)
 }
 
 /// Return the subset of `CATEGORY_GROUPS` not excluded by config.
@@ -844,6 +864,23 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
             );
             break;
         }
+        if triviaqa::should_offer(ctx) {
+            let exclude: HashSet<String> = questions
+                .iter()
+                .map(|q| crate::db::normalize_question_text(&q.question))
+                .collect();
+            match triviaqa::next_question(ctx, &exclude).await {
+                Ok(q) => {
+                    info!(question = %q.question, "Round question ready: TriviaQA");
+                    questions.push(q);
+                    continue;
+                }
+                Err(e) => {
+                    info!("TriviaQA: no question for this slot ({e:#}) — falling back to OpenTDB");
+                }
+            }
+        }
+
         let previous_group = questions
             .last()
             .map(|q| normalise(&category_group_label(&q.category)));
@@ -1019,6 +1056,17 @@ async fn cached_question_excluding(
 /// the next available question — this prevents an infinite loop when the entire
 /// OpenTDB pool has been exhausted.
 pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> {
+    // No within-round exclusion set here (unlike the main per-category loop
+    // in `fetch_round_questions`) — this path is called one question at a
+    // time with no visibility into the rest of the round, same as OpenTDB's
+    // own dedup here, which likewise relies only on cross-round DB history.
+    if triviaqa::should_offer(ctx) {
+        match triviaqa::next_question(ctx, &HashSet::new()).await {
+            Ok(q) => return Ok(q),
+            Err(e) => info!("TriviaQA: no question available ({e:#}) — falling back to OpenTDB"),
+        }
+    }
+
     const MAX_SKIP: usize = 30;
     // Best duplicate seen so far, used only if every candidate this call
     // pops turns out to be within the reuse cooldown — see `fetch_one`.
@@ -1215,6 +1263,25 @@ mod tests {
             category_group_for_category("Science & Nature"),
             Some("Science & Technology")
         );
+    }
+
+    #[test]
+    fn category_group_for_category_also_maps_bare_group_labels_to_themselves() {
+        // Needed for sources with no OpenTDB-style sub-categories of their
+        // own (TriviaQA) that classify straight into a group label.
+        assert_eq!(category_group_for_category("Entertainment"), Some("Entertainment"));
+        assert_eq!(
+            category_group_for_category("Science & Technology"),
+            Some("Science & Technology")
+        );
+        assert_eq!(category_group_for_category("History"), Some("History"));
+    }
+
+    #[test]
+    fn category_group_for_id_finds_the_owning_group() {
+        assert_eq!(category_group_for_id(9), Some("General Knowledge"));
+        assert_eq!(category_group_for_id(18), Some("Science & Technology"));
+        assert_eq!(category_group_for_id(9999), None);
     }
 
     #[test]

@@ -66,6 +66,27 @@ recent_category_window = 5
 # Data is stored in SQLite at $STORE_PATH/quiz.db — no separate database
 # process or configuration required.
 
+[trivia.triviaqa]
+# Optional secondary question source: real TriviaQA questions/answers with
+# LLM-generated wrong answers (via [explainer].api_key). Off by default.
+enabled = false
+
+# Where to download the TriviaQA dataset from on first use (downloaded once
+# and cached in the database — not re-downloaded on later restarts). Point
+# this straight at the official release's .tar.gz — the bot reads it
+# natively (picks the *-dev.json split out of the archive), no manual
+# extraction or re-hosting needed. Plain/gzipped JSON matching TriviaQA's
+# schema also works, e.g. to point at your own mirror or subset.
+# dataset_url = "https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz"
+
+# Cap on how many QA pairs to ingest from the dataset (default 20000).
+# max_pool_size = 20000
+
+# Fraction of quiz questions drawn from TriviaQA when enabled and the pool
+# has usable questions (0.0-1.0, default 0.3). The rest, and any slot
+# TriviaQA can't fill, falls back to OpenTDB.
+# mix_ratio = 0.3
+
 [security.verification]
 # Users allowed to complete first-time verification. If omitted or empty,
 # an explicit allowed_inviters list is used as the fallback.

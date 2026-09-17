@@ -5,7 +5,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rand::Rng;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::HashMap,
     path::Path,
@@ -158,6 +159,8 @@ impl Db {
                 .context("Migrating questions.normalized_text")?;
             conn.execute_batch(include_str!("../migrations/004_question_reuse_policy.sql"))
                 .context("Applying question reuse policy schema")?;
+            conn.execute_batch(include_str!("../migrations/005_triviaqa.sql"))
+                .context("Applying TriviaQA pool schema")?;
             Ok(())
         })
         .await?;
@@ -494,6 +497,199 @@ impl Db {
                  SET n_answers_received = ?1, n_correct = ?2, n_wrong = ?3
                  WHERE id = ?4",
                 params![n_answers, n_correct, n_wrong, question_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+// ── TriviaQA pool ─────────────────────────────────────────────────────────────
+//
+// A static local corpus (ingested once — see `crate::triviaqa`), distinct
+// from `questions` (the "what has actually been asked" history that both
+// OpenTDB and TriviaQA share for cross-source deduplication).
+
+/// One TriviaQA question/answer pair, plus any previously-generated and
+/// cached classification (`category_group`/`difficulty`, reusing the bot's
+/// existing OpenTDB-derived vocabulary — see `fetcher::CATEGORY_GROUPS`) and
+/// distractors. All three are `None`/empty until first classified, which
+/// happens together in one LLM call — see `crate::triviaqa`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriviaQaRow {
+    pub id: i64,
+    pub question_text: String,
+    pub correct_answer: String,
+    pub aliases: Vec<String>,
+    pub category_group: Option<String>,
+    pub difficulty: Option<String>,
+    pub distractors: Option<Vec<String>>,
+}
+
+/// One row to ingest from the downloaded dataset.
+#[derive(Debug)]
+pub struct TriviaQaImportRow {
+    pub question_text: String,
+    pub correct_answer: String,
+    pub aliases: Vec<String>,
+}
+
+impl Db {
+    pub async fn triviaqa_pool_count(&self) -> Result<i64> {
+        self.run(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM triviaqa_pool", [], |r| r.get(0))?)
+        })
+        .await
+    }
+
+    /// Batch-insert freshly downloaded entries, skipping any whose
+    /// `question_text` already exists (safe to call again on a re-ingest,
+    /// e.g. after `max_pool_size` was raised). Returns how many were
+    /// actually new.
+    pub async fn insert_triviaqa_entries(&self, entries: Vec<TriviaQaImportRow>) -> Result<usize> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO triviaqa_pool
+                        (question_text, normalized_text, correct_answer, aliases)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for entry in &entries {
+                    let normalized = normalize_question_text(&entry.question_text);
+                    let aliases_json = serde_json::to_string(&entry.aliases)?;
+                    inserted += stmt.execute(params![
+                        entry.question_text,
+                        normalized,
+                        entry.correct_answer,
+                        aliases_json
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+    }
+
+    /// A uniformly random row from the pool matching the given filters, or
+    /// `None` if nothing currently qualifies. Picks a random `id` and scans
+    /// forward, falling back to a backward scan if that finds nothing,
+    /// rather than `ORDER BY RANDOM()`, which would force a full-table scan
+    /// on a pool that can hold hundreds of thousands of rows.
+    ///
+    /// `allowed_category_groups` restricts to rows whose classified
+    /// `category_group` is in the list, or that haven't been classified yet
+    /// (`NULL`) — so unclassified rows keep getting sampled, classified,
+    /// and cached (see `crate::triviaqa::next_question`) until the matching
+    /// subset of the pool naturally grows to cover the filter. `difficulty`
+    /// (if set) filters the same way.
+    pub async fn sample_triviaqa_candidate(
+        &self,
+        allowed_category_groups: &[&str],
+        difficulty: Option<&str>,
+    ) -> Result<Option<TriviaQaRow>> {
+        let allowed_category_groups: Vec<String> =
+            allowed_category_groups.iter().map(|s| s.to_string()).collect();
+        let difficulty = difficulty.map(str::to_owned);
+
+        self.run(move |conn| {
+            let bounds: Option<(i64, i64)> = conn
+                .query_row("SELECT MIN(id), MAX(id) FROM triviaqa_pool", [], |r| {
+                    Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+                })
+                .optional()?
+                .and_then(|(a, b)| a.zip(b));
+            let Some((min_id, max_id)) = bounds else {
+                return Ok(None);
+            };
+            let target = if max_id > min_id {
+                rand::thread_rng().gen_range(min_id..=max_id)
+            } else {
+                min_id
+            };
+
+            let mut where_extra = String::new();
+            if !allowed_category_groups.is_empty() {
+                let placeholders = vec!["?"; allowed_category_groups.len()].join(",");
+                where_extra
+                    .push_str(&format!(" AND (category_group IS NULL OR category_group IN ({placeholders}))"));
+            }
+            if difficulty.is_some() {
+                where_extra.push_str(" AND (difficulty IS NULL OR difficulty = ?)");
+            }
+
+            let bind_values = |lead: i64| -> Vec<rusqlite::types::Value> {
+                let mut v = vec![rusqlite::types::Value::Integer(lead)];
+                v.extend(
+                    allowed_category_groups
+                        .iter()
+                        .map(|g| rusqlite::types::Value::Text(g.clone())),
+                );
+                if let Some(d) = &difficulty {
+                    v.push(rusqlite::types::Value::Text(d.clone()));
+                }
+                v
+            };
+            let row_mapper = |r: &rusqlite::Row| -> rusqlite::Result<TriviaQaRow> {
+                let aliases_json: String = r.get(3)?;
+                let distractors_json: Option<String> = r.get(4)?;
+                Ok(TriviaQaRow {
+                    id: r.get(0)?,
+                    question_text: r.get(1)?,
+                    correct_answer: r.get(2)?,
+                    aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+                    category_group: r.get(5)?,
+                    difficulty: r.get(6)?,
+                    distractors: distractors_json.and_then(|s| serde_json::from_str(&s).ok()),
+                })
+            };
+
+            const SELECT: &str = "SELECT id, question_text, correct_answer, aliases, distractors, \
+                 category_group, difficulty FROM triviaqa_pool";
+
+            let fwd_sql = format!("{SELECT} WHERE id >= ?{where_extra} ORDER BY id LIMIT 1");
+            let mut stmt = conn.prepare_cached(&fwd_sql)?;
+            let row = stmt
+                .query_row(rusqlite::params_from_iter(bind_values(target)), row_mapper)
+                .optional()?;
+            if row.is_some() {
+                return Ok(row);
+            }
+
+            let back_sql = format!("{SELECT} WHERE id < ?{where_extra} ORDER BY id DESC LIMIT 1");
+            let mut stmt = conn.prepare_cached(&back_sql)?;
+            let row = stmt
+                .query_row(rusqlite::params_from_iter(bind_values(target)), row_mapper)
+                .optional()?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Cache a freshly generated (and validated) classification +
+    /// distractors on a pool row, so re-serving this question later (once
+    /// its reuse cooldown expires) doesn't pay for another LLM call.
+    pub async fn save_triviaqa_generation(
+        &self,
+        id: i64,
+        category_group: &str,
+        difficulty: &str,
+        distractors: &[String],
+    ) -> Result<()> {
+        let json = serde_json::to_string(distractors)?;
+        let category_group = category_group.to_owned();
+        let difficulty = difficulty.to_owned();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE triviaqa_pool
+                 SET category_group = ?1,
+                     difficulty = ?2,
+                     distractors = ?3,
+                     distractors_generated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?4",
+                params![category_group, difficulty, json, id],
             )?;
             Ok(())
         })
@@ -1343,6 +1539,142 @@ mod tests {
             Some("Alice")
         );
         assert!(!names.contains_key("@ghost:example.org"));
+    }
+
+    fn triviaqa_row(question: &str, answer: &str) -> TriviaQaImportRow {
+        TriviaQaImportRow {
+            question_text: question.to_owned(),
+            correct_answer: answer.to_owned(),
+            aliases: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn triviaqa_ingest_skips_duplicate_question_text() {
+        let db = test_db().await;
+        let n = db
+            .insert_triviaqa_entries(vec![
+                triviaqa_row("Who painted the Mona Lisa?", "Leonardo da Vinci"),
+                triviaqa_row("Who painted the Mona Lisa?", "Leonardo da Vinci"), // dup
+                triviaqa_row("What is the capital of France?", "Paris"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(n, 2, "the duplicate question_text must be skipped");
+        assert_eq!(db.triviaqa_pool_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sample_triviaqa_candidate_returns_none_when_pool_is_empty() {
+        let db = test_db().await;
+        assert_eq!(db.sample_triviaqa_candidate(&[], None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sample_triviaqa_candidate_returns_a_row_with_no_classification_yet() {
+        let db = test_db().await;
+        db.insert_triviaqa_entries(vec![triviaqa_row(
+            "Who painted the Mona Lisa?",
+            "Leonardo da Vinci",
+        )])
+        .await
+        .unwrap();
+
+        let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+        assert_eq!(row.question_text, "Who painted the Mona Lisa?");
+        assert_eq!(row.correct_answer, "Leonardo da Vinci");
+        assert_eq!(row.category_group, None);
+        assert_eq!(row.difficulty, None);
+        assert_eq!(row.distractors, None);
+    }
+
+    #[tokio::test]
+    async fn triviaqa_generation_is_cached_and_returned_on_next_sample() {
+        let db = test_db().await;
+        db.insert_triviaqa_entries(vec![triviaqa_row(
+            "Who painted the Mona Lisa?",
+            "Leonardo da Vinci",
+        )])
+        .await
+        .unwrap();
+        let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+
+        let distractors = vec![
+            "Michelangelo".to_owned(),
+            "Raphael".to_owned(),
+            "Donatello".to_owned(),
+        ];
+        db.save_triviaqa_generation(row.id, "Art", "medium", &distractors)
+            .await
+            .unwrap();
+
+        // Sample repeatedly (pool has one row, so the random-id scan always
+        // lands on it) and confirm the cached classification + distractors
+        // come back instead of the fields staying NULL.
+        let reloaded = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+        assert_eq!(reloaded.category_group.as_deref(), Some("Art"));
+        assert_eq!(reloaded.difficulty.as_deref(), Some("medium"));
+        assert_eq!(reloaded.distractors, Some(distractors));
+    }
+
+    #[tokio::test]
+    async fn sample_triviaqa_candidate_filters_by_category_group_and_difficulty() {
+        let db = test_db().await;
+        db.insert_triviaqa_entries(vec![
+            triviaqa_row("Who painted the Mona Lisa?", "Leonardo da Vinci"),
+            triviaqa_row("What is the capital of France?", "Paris"),
+        ])
+        .await
+        .unwrap();
+
+        // Classify both rows (sampling with no filter can land on either —
+        // and possibly the same one twice — so loop, by question text,
+        // until both are done rather than assuming two calls hit both).
+        let mut classified: HashMap<String, ()> = HashMap::new();
+        for _ in 0..20 {
+            if classified.len() == 2 {
+                break;
+            }
+            let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+            if row.category_group.is_none() {
+                let (group, diff) = if row.question_text.contains("Mona Lisa") {
+                    ("Art", "medium")
+                } else {
+                    ("Geography", "easy")
+                };
+                db.save_triviaqa_generation(row.id, group, diff, &["a".into(), "b".into(), "c".into()])
+                    .await
+                    .unwrap();
+            }
+            classified.insert(row.question_text, ());
+        }
+        assert_eq!(classified.len(), 2, "both rows must end up classified");
+
+        // Both rows are now classified (no NULLs left), so the forward+
+        // backward scan deterministically covers the whole table: a
+        // "Geography" filter must return exactly the Geography row, never
+        // the Art one.
+        let candidate = db
+            .sample_triviaqa_candidate(&["Geography"], None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.question_text, "What is the capital of France?");
+
+        // Same for a difficulty-only filter: "easy" only matches Geography.
+        let candidate = db
+            .sample_triviaqa_candidate(&[], Some("easy"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.question_text, "What is the capital of France?");
+
+        // A filter matching neither row's classification finds nothing.
+        assert_eq!(
+            db.sample_triviaqa_candidate(&["Sports"], None).await.unwrap(),
+            None
+        );
     }
 }
 

@@ -8,8 +8,9 @@
 //!
 //! The LLM never guesses filenames — it only suggests a search term.
 
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use crate::groq;
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -29,7 +30,6 @@ Where <keyword> is a short Wikimedia Commons search term that would find a good 
 of the answer (e.g. \"Eiffel Tower Paris\" or \"Albert Einstein physicist\").
 Nothing may follow the IMAGE_SEARCH line.";
 
-const MAX_ATTEMPTS:    u32 = 3;
 const REQUEST_TIMEOUT: u64 = 30; // seconds for Groq API call
 const FETCH_TIMEOUT:   u64 = 15; // seconds for image download
 
@@ -40,36 +40,6 @@ const USER_AGENT: &str = "quiz-bot/1.0 (Matrix trivia quiz; https://matrix.org)"
 pub struct ExplainerResult {
     pub text:      String,
     pub image_url: Option<String>,  // direct upload.wikimedia.org URL
-}
-
-// ── Groq / OpenAI-compatible chat completions ─────────────────────────────────
-
-#[derive(Serialize)]
-struct ApiRequest<'a> {
-    model:      &'a str,
-    max_tokens: u32,
-    messages:   Vec<ApiMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct ApiMessage<'a> {
-    role:    &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    choices: Vec<ApiChoice>,
-}
-
-#[derive(Deserialize)]
-struct ApiChoice {
-    message: ApiChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ApiChoiceMessage {
-    content: String,
 }
 
 // ── Response parsing ──────────────────────────────────────────────────────────
@@ -268,79 +238,6 @@ pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
     }
 }
 
-// ── Groq call ─────────────────────────────────────────────────────────────────
-
-async fn call_groq(
-    client:       &reqwest::Client,
-    api_key:      &str,
-    model:        &str,
-    user_content: &str,
-) -> Option<String> {
-    for attempt in 1..=MAX_ATTEMPTS {
-        if attempt > 1 {
-            let delay = 2u64.pow(attempt - 2); // 1 s, 2 s
-            warn!("Explainer: retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
-            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-        }
-
-        let body = ApiRequest {
-            model,
-            max_tokens: 512,
-            messages: vec![
-                ApiMessage { role: "system", content: SYSTEM_PROMPT },
-                ApiMessage { role: "user",   content: user_content  },
-            ],
-        };
-
-        let resp = match client
-            .post("https://api.groq.com/openai/v1/chat/completions")
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r)  => r,
-            Err(e) => {
-                warn!("Explainer: request failed (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
-                continue;
-            }
-        };
-
-        let status = resp.status();
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            warn!("Explainer: auth error {status} — check explainer.api_key in config");
-            return None;
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            warn!("Explainer: API error {status} (attempt {attempt}/{MAX_ATTEMPTS}): {body}");
-            continue;
-        }
-
-        let data: ApiResponse = match resp.json().await {
-            Ok(d)  => d,
-            Err(e) => {
-                warn!("Explainer: response parse error (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
-                continue;
-            }
-        };
-
-        let content = data.choices.into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
-
-        if content.trim().is_empty() {
-            warn!("Explainer: empty content (attempt {attempt}/{MAX_ATTEMPTS})");
-            continue;
-        }
-
-        info!("Explainer: got response on attempt {attempt}/{MAX_ATTEMPTS}");
-        return Some(content);
-    }
-    None
-}
-
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Ask Groq for background info about the quiz `question` and `answer`.
@@ -360,7 +257,7 @@ pub async fn explain(
 
     let user_content = format!("Question: {question}\nAnswer: {answer}");
 
-    let raw = call_groq(&client, api_key, model, &user_content).await?;
+    let raw = groq::complete(&client, api_key, model, SYSTEM_PROMPT, &user_content).await?;
     let (text, search_term) = parse_response(raw);
 
     if text.trim().is_empty() {

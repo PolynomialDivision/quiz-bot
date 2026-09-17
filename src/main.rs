@@ -28,10 +28,12 @@ mod db;
 mod explainer;
 mod fetcher;
 mod format;
+mod groq;
 mod leaderboard;
 mod quiz;
 mod scheduler;
 mod state;
+mod triviaqa;
 
 use config::Config;
 use mxbot_common::verify::VerificationService;
@@ -364,6 +366,7 @@ async fn main() -> Result<()> {
         .context("Initial sync failed")?;
     info!("Initial sync complete");
 
+    tokio::spawn(triviaqa::ensure_ingested(ctx.clone()));
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
     loop {
