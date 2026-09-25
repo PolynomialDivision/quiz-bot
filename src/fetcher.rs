@@ -616,11 +616,10 @@ fn select_round_categories<R: Rng + ?Sized>(
             .copied()
             .filter(|(name, _)| counts.get(*name).copied().unwrap_or(0) == min_count)
             .collect();
-        let (name, ids) = least_used.choose(rng).expect("active category pool is non-empty");
-        let category_id = ids
+        let (name, ids) = least_used
             .choose(rng)
-            .copied()
-            .expect("category group has IDs");
+            .expect("active category pool is non-empty");
+        let category_id = ids.choose(rng).copied().expect("category group has IDs");
 
         choices.push(CategoryChoice {
             group: (*name).to_owned(),
@@ -896,8 +895,7 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
             {
                 info!(
                     "Round question ready: category {} (\"{}\")",
-                    choice.category_id,
-                    q.category
+                    choice.category_id, q.category
                 );
                 avoid_groups.insert(normalise(&choice.group));
                 questions.push(q);
@@ -964,7 +962,10 @@ async fn next_question_avoiding(
         return Ok(q);
     }
 
-    let strict_avoid: HashSet<String> = previous_group.iter().map(|group| normalise(group)).collect();
+    let strict_avoid: HashSet<String> = previous_group
+        .iter()
+        .map(|group| normalise(group))
+        .collect();
     if let Some(q) = cached_question_excluding(ctx, &strict_avoid).await {
         info!(
             category = %q.category,
@@ -1127,7 +1128,11 @@ pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> 
             return Ok(q);
         }
 
-        let last_asked_at = ctx.db.question_last_asked_at(&q.question).await.unwrap_or(None);
+        let last_asked_at = ctx
+            .db
+            .question_last_asked_at(&q.question)
+            .await
+            .unwrap_or(None);
         let is_better = match &best_duplicate {
             None => true,
             Some((_, best_at)) => last_asked_at < *best_at,
@@ -1167,9 +1172,15 @@ mod tests {
     fn remaining_wait_is_zero_once_the_interval_has_elapsed() {
         let t0 = Instant::now();
         let after_interval = t0 + MIN_REQUEST_INTERVAL;
-        assert_eq!(remaining_wait(t0, after_interval, MIN_REQUEST_INTERVAL), Duration::ZERO);
+        assert_eq!(
+            remaining_wait(t0, after_interval, MIN_REQUEST_INTERVAL),
+            Duration::ZERO
+        );
         let well_after = t0 + MIN_REQUEST_INTERVAL + Duration::from_secs(60);
-        assert_eq!(remaining_wait(t0, well_after, MIN_REQUEST_INTERVAL), Duration::ZERO);
+        assert_eq!(
+            remaining_wait(t0, well_after, MIN_REQUEST_INTERVAL),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -1185,16 +1196,15 @@ mod tests {
     #[test]
     fn remaining_wait_at_the_same_instant_is_the_full_interval() {
         let now = Instant::now();
-        assert_eq!(remaining_wait(now, now, MIN_REQUEST_INTERVAL), MIN_REQUEST_INTERVAL);
+        assert_eq!(
+            remaining_wait(now, now, MIN_REQUEST_INTERVAL),
+            MIN_REQUEST_INTERVAL
+        );
     }
 
     #[test]
     fn underused_group_is_not_selected_three_rounds_in_a_row() {
-        let groups: &[(&str, &[u32])] = &[
-            ("Politics", &[24]),
-            ("History", &[23]),
-            ("Art", &[25]),
-        ];
+        let groups: &[(&str, &[u32])] = &[("Politics", &[24]), ("History", &[23]), ("Art", &[25])];
         let mut counts = HashMap::from([
             ("Politics".to_owned(), 0),
             ("History".to_owned(), 50),
@@ -1241,7 +1251,9 @@ mod tests {
         let choices = select_round_categories(groups, &HashMap::new(), &recent, 5, &mut rng);
 
         assert_eq!(choices.len(), 5);
-        assert!(choices.windows(2).all(|pair| pair[0].group != pair[1].group));
+        assert!(choices
+            .windows(2)
+            .all(|pair| pair[0].group != pair[1].group));
     }
 
     #[test]
@@ -1258,7 +1270,10 @@ mod tests {
 
     #[test]
     fn category_aliases_are_normalized_consistently() {
-        assert_eq!(normalise("  Science  &  Technology "), "science and technology");
+        assert_eq!(
+            normalise("  Science  &  Technology "),
+            "science and technology"
+        );
         assert_eq!(
             category_group_for_category("Science & Nature"),
             Some("Science & Technology")
@@ -1269,7 +1284,10 @@ mod tests {
     fn category_group_for_category_also_maps_bare_group_labels_to_themselves() {
         // Needed for sources with no OpenTDB-style sub-categories of their
         // own (TriviaQA) that classify straight into a group label.
-        assert_eq!(category_group_for_category("Entertainment"), Some("Entertainment"));
+        assert_eq!(
+            category_group_for_category("Entertainment"),
+            Some("Entertainment")
+        );
         assert_eq!(
             category_group_for_category("Science & Technology"),
             Some("Science & Technology")
@@ -1394,7 +1412,9 @@ mod token_tests {
         Mock::given(method("GET"))
             .and(path("/api_token.php"))
             .and(query_param("command", "request"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(token_response_body("tok-persisted")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(token_response_body("tok-persisted")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1635,9 +1655,9 @@ mod token_tests {
         for _ in 0..8 {
             let ctx = Arc::clone(&ctx);
             let base = base.clone();
-            handles.push(tokio::spawn(
-                async move { ensure_token(&ctx, &base).await.unwrap() },
-            ));
+            handles.push(tokio::spawn(async move {
+                ensure_token(&ctx, &base).await.unwrap()
+            }));
         }
 
         let mut results = Vec::new();

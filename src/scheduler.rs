@@ -3,7 +3,7 @@ use chrono_tz::Tz;
 use matrix_sdk::{ruma::OwnedTransactionId, Client};
 use tracing::{error, info, warn};
 
-use crate::{BotContext, config::ScheduleConfig, state::ScheduledOnce};
+use crate::{config::ScheduleConfig, state::ScheduledOnce, BotContext};
 
 /// Background task: wake up every 60 seconds and check whether it's time to
 /// fire any configured quiz slot.
@@ -18,12 +18,24 @@ pub async fn run(ctx: BotContext, client: Client) {
 }
 
 async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
-    let tz: Tz  = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-    let local_now  = chrono::Utc::now().with_timezone(&tz);
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let local_now = chrono::Utc::now().with_timezone(&tz);
     let local_date = local_now.date_naive();
-    let now_hour   = local_now.hour();
+    let now_hour = local_now.hour();
     let now_minute = local_now.minute();
-    let offset = ctx.config.schedule.reminder_before_secs.iter().copied().max().unwrap_or(0) as i64;
+    let offset = ctx
+        .config
+        .schedule
+        .reminder_before_secs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0) as i64;
 
     for time_str in &ctx.config.schedule.quiz_times {
         let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_str) {
@@ -38,7 +50,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let quiz_secs = (qh * 3600 + qm * 60) as i64;
         let fire_secs = (quiz_secs - offset).rem_euclid(86400);
         let fire_hour = (fire_secs / 3600) as u32;
-        let fire_min  = ((fire_secs % 3600) / 60) as u32;
+        let fire_min = ((fire_secs % 3600) / 60) as u32;
 
         if now_hour != fire_hour || now_minute != fire_min {
             continue;
@@ -67,9 +79,9 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             "Scheduled quiz firing for slot {time_str} \
              (fire at {fire_hour}:{fire_min:02}, quiz at {qh}:{qm:02})",
         );
-        let ctx2    = ctx.clone();
+        let ctx2 = ctx.clone();
         let client2 = client.clone();
-        let slot    = time_str.clone();
+        let slot = time_str.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, Some(slot)).await {
                 error!("Quiz error: {e}");
@@ -81,12 +93,17 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let once_entries: Vec<ScheduledOnce> = ctx.state.lock().await.scheduled_once.clone();
 
     for entry in once_entries {
-        if entry.date != local_date { continue; }
+        if entry.date != local_date {
+            continue;
+        }
 
         let (qh, qm) = match ScheduleConfig::parse_quiz_time(&entry.quiz_time) {
             Some(t) => t,
-            None    => {
-                warn!("Invalid scheduled_once time {:?} — removing", entry.quiz_time);
+            None => {
+                warn!(
+                    "Invalid scheduled_once time {:?} — removing",
+                    entry.quiz_time
+                );
                 let mut state = ctx.state.lock().await;
                 state.scheduled_once.retain(|e| e != &entry);
                 state.save(&ctx.state_path).await.ok();
@@ -97,9 +114,11 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let quiz_secs = (qh * 3600 + qm * 60) as i64;
         let fire_secs = (quiz_secs - offset).rem_euclid(86400);
         let fire_hour = (fire_secs / 3600) as u32;
-        let fire_min  = ((fire_secs % 3600) / 60) as u32;
+        let fire_min = ((fire_secs % 3600) / 60) as u32;
 
-        if now_hour != fire_hour || now_minute != fire_min { continue; }
+        if now_hour != fire_hour || now_minute != fire_min {
+            continue;
+        }
 
         // Remove the entry before spawning to prevent double-fire on restart.
         {
@@ -118,8 +137,11 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         }
 
-        info!("One-time quiz firing for {} (fire at {fire_hour}:{fire_min:02})", entry.quiz_time);
-        let ctx2    = ctx.clone();
+        info!(
+            "One-time quiz firing for {} (fire at {fire_hour}:{fire_min:02})",
+            entry.quiz_time
+        );
+        let ctx2 = ctx.clone();
         let client2 = client.clone();
         tokio::spawn(async move {
             // skip_reminder = false → full reminder flow; slot_key = None → no last_quiz_dates entry.

@@ -536,10 +536,8 @@ pub struct TriviaQaImportRow {
 
 impl Db {
     pub async fn triviaqa_pool_count(&self) -> Result<i64> {
-        self.run(|conn| {
-            Ok(conn.query_row("SELECT COUNT(*) FROM triviaqa_pool", [], |r| r.get(0))?)
-        })
-        .await
+        self.run(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM triviaqa_pool", [], |r| r.get(0))?))
+            .await
     }
 
     /// Batch-insert freshly downloaded entries, skipping any whose
@@ -590,8 +588,10 @@ impl Db {
         allowed_category_groups: &[&str],
         difficulty: Option<&str>,
     ) -> Result<Option<TriviaQaRow>> {
-        let allowed_category_groups: Vec<String> =
-            allowed_category_groups.iter().map(|s| s.to_string()).collect();
+        let allowed_category_groups: Vec<String> = allowed_category_groups
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let difficulty = difficulty.map(str::to_owned);
 
         self.run(move |conn| {
@@ -613,8 +613,9 @@ impl Db {
             let mut where_extra = String::new();
             if !allowed_category_groups.is_empty() {
                 let placeholders = vec!["?"; allowed_category_groups.len()].join(",");
-                where_extra
-                    .push_str(&format!(" AND (category_group IS NULL OR category_group IN ({placeholders}))"));
+                where_extra.push_str(&format!(
+                    " AND (category_group IS NULL OR category_group IN ({placeholders}))"
+                ));
             }
             if difficulty.is_some() {
                 where_extra.push_str(" AND (difficulty IS NULL OR difficulty = ?)");
@@ -866,7 +867,10 @@ impl Db {
     /// last asked, if ever. Used to break ties among duplicate candidates
     /// in favour of whichever has gone longest without being repeated,
     /// rather than accepting whichever duplicate happened to be drawn last.
-    pub async fn question_last_asked_at(&self, question_text: &str) -> Result<Option<DateTime<Utc>>> {
+    pub async fn question_last_asked_at(
+        &self,
+        question_text: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
         let normalized = normalize_question_text(question_text);
         self.run(move |conn| {
             let raw: Option<String> = conn.query_row(
@@ -927,9 +931,10 @@ impl Db {
     ) -> Result<Vec<MonthlyLeaderboardEntry>> {
         let start = start_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
         let end = end_utc.to_rfc3339_opts(SecondsFormat::Millis, true);
-        let entries = self.run(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT rs.user_id,
+        let entries = self
+            .run(move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rs.user_id,
                         p.display_name,
                         SUM(rs.correct_count) AS total_correct,
                         SUM(rs.total_count) AS total_questions,
@@ -941,20 +946,20 @@ impl Db {
                    AND r.started_at >= ?1
                    AND r.started_at < ?2
                  GROUP BY rs.user_id, p.display_name",
-            )?;
-            let rows = stmt.query_map(params![start, end], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(anyhow::Error::from)
-        })
-        .await?;
+                )?;
+                let rows = stmt.query_map(params![start, end], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(anyhow::Error::from)
+            })
+            .await?;
         Ok(rank_entries(entries))
     }
 
@@ -980,11 +985,7 @@ impl Db {
 
     /// Atomically claim a month for posting. A stale claim can be reclaimed;
     /// Matrix's deterministic transaction ID makes that retry idempotent.
-    pub async fn try_claim_monthly_post(
-        &self,
-        period: &str,
-        transaction_id: &str,
-    ) -> Result<bool> {
+    pub async fn try_claim_monthly_post(&self, period: &str, transaction_id: &str) -> Result<bool> {
         let period = period.to_owned();
         let transaction_id = transaction_id.to_owned();
         self.run(move |conn| {
@@ -1045,9 +1046,7 @@ impl Db {
     }
 }
 
-fn rank_entries(
-    entries: Vec<(String, Option<String>, i64, i64, i64)>,
-) -> Vec<LeaderboardEntry> {
+fn rank_entries(entries: Vec<(String, Option<String>, i64, i64, i64)>) -> Vec<LeaderboardEntry> {
     let mut result: Vec<_> = entries
         .into_iter()
         .map(
@@ -1268,7 +1267,12 @@ mod tests {
             category_group: "General Knowledge",
             difficulty: "easy",
             question_text: text,
-            choices: &["a".to_owned(), "b".to_owned(), "c".to_owned(), "d".to_owned()],
+            choices: &[
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ],
             correct_index: 0,
             correct_answer_text: "a",
             answer_timeout_secs: 30,
@@ -1427,24 +1431,21 @@ mod tests {
     #[tokio::test]
     async fn monthly_post_claim_is_idempotent() {
         let db = test_db().await;
-        assert!(
-            db.try_claim_monthly_post("2026-07", "monthly-2026-07")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !db.try_claim_monthly_post("2026-07", "monthly-2026-07")
-                .await
-                .unwrap()
-        );
+        assert!(db
+            .try_claim_monthly_post("2026-07", "monthly-2026-07")
+            .await
+            .unwrap());
+        assert!(!db
+            .try_claim_monthly_post("2026-07", "monthly-2026-07")
+            .await
+            .unwrap());
 
         db.complete_monthly_post("2026-07", "$event").await.unwrap();
         db.release_monthly_post("2026-07").await.unwrap();
-        assert!(
-            !db.try_claim_monthly_post("2026-07", "monthly-2026-07")
-                .await
-                .unwrap()
-        );
+        assert!(!db
+            .try_claim_monthly_post("2026-07", "monthly-2026-07")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1581,7 +1582,11 @@ mod tests {
         .await
         .unwrap();
 
-        let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+        let row = db
+            .sample_triviaqa_candidate(&[], None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.question_text, "Who painted the Mona Lisa?");
         assert_eq!(row.correct_answer, "Leonardo da Vinci");
         assert_eq!(row.category_group, None);
@@ -1598,7 +1603,11 @@ mod tests {
         )])
         .await
         .unwrap();
-        let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+        let row = db
+            .sample_triviaqa_candidate(&[], None)
+            .await
+            .unwrap()
+            .unwrap();
 
         let distractors = vec![
             "Michelangelo".to_owned(),
@@ -1612,7 +1621,11 @@ mod tests {
         // Sample repeatedly (pool has one row, so the random-id scan always
         // lands on it) and confirm the cached classification + distractors
         // come back instead of the fields staying NULL.
-        let reloaded = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+        let reloaded = db
+            .sample_triviaqa_candidate(&[], None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.category_group.as_deref(), Some("Art"));
         assert_eq!(reloaded.difficulty.as_deref(), Some("medium"));
         assert_eq!(reloaded.distractors, Some(distractors));
@@ -1636,16 +1649,25 @@ mod tests {
             if classified.len() == 2 {
                 break;
             }
-            let row = db.sample_triviaqa_candidate(&[], None).await.unwrap().unwrap();
+            let row = db
+                .sample_triviaqa_candidate(&[], None)
+                .await
+                .unwrap()
+                .unwrap();
             if row.category_group.is_none() {
                 let (group, diff) = if row.question_text.contains("Mona Lisa") {
                     ("Art", "medium")
                 } else {
                     ("Geography", "easy")
                 };
-                db.save_triviaqa_generation(row.id, group, diff, &["a".into(), "b".into(), "c".into()])
-                    .await
-                    .unwrap();
+                db.save_triviaqa_generation(
+                    row.id,
+                    group,
+                    diff,
+                    &["a".into(), "b".into(), "c".into()],
+                )
+                .await
+                .unwrap();
             }
             classified.insert(row.question_text, ());
         }
@@ -1672,9 +1694,10 @@ mod tests {
 
         // A filter matching neither row's classification finds nothing.
         assert_eq!(
-            db.sample_triviaqa_candidate(&["Sports"], None).await.unwrap(),
+            db.sample_triviaqa_candidate(&["Sports"], None)
+                .await
+                .unwrap(),
             None
         );
     }
 }
-

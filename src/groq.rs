@@ -11,14 +11,14 @@ const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Serialize)]
 struct ApiRequest<'a> {
-    model:      &'a str,
+    model: &'a str,
     max_tokens: u32,
-    messages:   Vec<ApiMessage<'a>>,
+    messages: Vec<ApiMessage<'a>>,
 }
 
 #[derive(Serialize)]
 struct ApiMessage<'a> {
-    role:    &'a str,
+    role: &'a str,
     content: &'a str,
 }
 
@@ -43,11 +43,11 @@ struct ApiChoiceMessage {
 /// errors or once `MAX_ATTEMPTS` is exhausted; callers decide how to
 /// degrade (skip the explanation, fall back to another question source, …).
 pub async fn complete(
-    client:        &reqwest::Client,
-    api_key:       &str,
-    model:         &str,
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
     system_prompt: &str,
-    user_content:  &str,
+    user_content: &str,
 ) -> Option<String> {
     for attempt in 1..=MAX_ATTEMPTS {
         if attempt > 1 {
@@ -60,8 +60,14 @@ pub async fn complete(
             model,
             max_tokens: 512,
             messages: vec![
-                ApiMessage { role: "system", content: system_prompt },
-                ApiMessage { role: "user",   content: user_content  },
+                ApiMessage {
+                    role: "system",
+                    content: system_prompt,
+                },
+                ApiMessage {
+                    role: "user",
+                    content: user_content,
+                },
             ],
         };
 
@@ -72,7 +78,7 @@ pub async fn complete(
             .send()
             .await
         {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 warn!("Groq: request failed (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
                 continue;
@@ -91,14 +97,16 @@ pub async fn complete(
         }
 
         let data: ApiResponse = match resp.json().await {
-            Ok(d)  => d,
+            Ok(d) => d,
             Err(e) => {
                 warn!("Groq: response parse error (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
                 continue;
             }
         };
 
-        let content = data.choices.into_iter()
+        let content = data
+            .choices
+            .into_iter()
             .next()
             .map(|c| c.message.content)
             .unwrap_or_default();

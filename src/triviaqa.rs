@@ -69,7 +69,10 @@ const MAX_GENERATION_ATTEMPTS: u32 = 2;
 /// in sync with `fetcher::CATEGORY_GROUPS` (the bot's single source of
 /// truth for category names) instead of duplicating it here.
 fn generation_system_prompt() -> String {
-    let categories: Vec<&str> = fetcher::CATEGORY_GROUPS.iter().map(|(name, _)| *name).collect();
+    let categories: Vec<&str> = fetcher::CATEGORY_GROUPS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
     format!(
         "You classify trivia questions and generate multiple-choice distractors \
          for a trivia quiz bot.
@@ -173,7 +176,11 @@ fn extract_dataset_json(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
             .entries()
             .context("payload is neither recognizable JSON nor a tar.gz dataset")?
         {
-            let path = entry.context("reading tar entry")?.path()?.to_string_lossy().into_owned();
+            let path = entry
+                .context("reading tar entry")?
+                .path()?
+                .to_string_lossy()
+                .into_owned();
             if path.ends_with(".json") {
                 paths.push(path);
             }
@@ -194,7 +201,9 @@ fn extract_dataset_json(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut entry = entry.context("reading tar entry")?;
         if entry.path()?.to_string_lossy() == chosen {
             let mut content = Vec::new();
-            entry.read_to_end(&mut content).context("reading chosen tar entry")?;
+            entry
+                .read_to_end(&mut content)
+                .context("reading chosen tar entry")?;
             return Ok(content);
         }
     }
@@ -255,7 +264,9 @@ async fn download(url: &str) -> anyhow::Result<Vec<u8>> {
             Err(e) => last_err = e.into(),
         }
     }
-    Err(last_err.context(format!("TriviaQA dataset download failed after {MAX_ATTEMPTS} attempts")))
+    Err(last_err.context(format!(
+        "TriviaQA dataset download failed after {MAX_ATTEMPTS} attempts"
+    )))
 }
 
 // ── One-time ingestion ──────────────────────────────────────────────────────────
@@ -310,7 +321,10 @@ async fn ensure_ingested_inner(ctx: &BotContext) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!("TriviaQA: ingesting dataset from {dataset_url} (max {} entries)", cfg.max_pool_size);
+    info!(
+        "TriviaQA: ingesting dataset from {dataset_url} (max {} entries)",
+        cfg.max_pool_size
+    );
     let bytes = download(dataset_url).await?;
     let rows = parse_dataset(&bytes, cfg.max_pool_size)?;
     if rows.is_empty() {
@@ -381,7 +395,9 @@ fn parse_distractor_lines<'a>(
     for line in lines {
         let cleaned = line
             .trim()
-            .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | ' '))
+            .trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | ' ')
+            })
             .trim_matches(|c: char| c == '"' || c == '\'')
             .trim();
 
@@ -565,7 +581,12 @@ pub async fn next_question(
                     continue;
                 };
                 ctx.db
-                    .save_triviaqa_generation(candidate.id, g.category_group, g.difficulty, &g.distractors)
+                    .save_triviaqa_generation(
+                        candidate.id,
+                        g.category_group,
+                        g.difficulty,
+                        &g.distractors,
+                    )
                     .await?;
                 // Freshly classified but not what this slot needs (e.g. the
                 // fixed category/difficulty didn't match) — it's cached now
@@ -577,7 +598,11 @@ pub async fn next_question(
                 if !group_matches || !difficulty_matches {
                     continue;
                 }
-                (g.category_group.to_owned(), g.difficulty.to_owned(), g.distractors)
+                (
+                    g.category_group.to_owned(),
+                    g.difficulty.to_owned(),
+                    g.distractors,
+                )
             }
         };
 
@@ -709,9 +734,13 @@ mod triviaqa_tests {
 
     #[test]
     fn parse_dataset_falls_back_to_any_json_entry_that_is_not_without_answers() {
-        let without_answers = br#"{"Data": [{"Question": "no answer here", "Answer": {"Value": ""}}]}"#;
+        let without_answers =
+            br#"{"Data": [{"Question": "no answer here", "Answer": {"Value": ""}}]}"#;
         let tar_bytes = build_tar(&[
-            ("triviaqa/unfiltered-web-test-without-answers.json", without_answers.as_slice()),
+            (
+                "triviaqa/unfiltered-web-test-without-answers.json",
+                without_answers.as_slice(),
+            ),
             ("triviaqa/custom-dataset.json", SAMPLE_JSON.as_bytes()),
         ]);
         let rows = parse_dataset(&tar_bytes, 100).unwrap();
@@ -788,8 +817,14 @@ mod triviaqa_tests {
 
     #[test]
     fn extract_field_is_case_insensitive_and_trims() {
-        assert_eq!(extract_field("category:  History  ", "CATEGORY:"), Some("History"));
-        assert_eq!(extract_field("Category: History", "CATEGORY:"), Some("History"));
+        assert_eq!(
+            extract_field("category:  History  ", "CATEGORY:"),
+            Some("History")
+        );
+        assert_eq!(
+            extract_field("Category: History", "CATEGORY:"),
+            Some("History")
+        );
         assert_eq!(extract_field("Something else", "CATEGORY:"), None);
     }
 
@@ -829,7 +864,8 @@ Donatello";
 
     #[test]
     fn validate_generation_rejects_an_unrecognized_category() {
-        let raw = "CATEGORY: Renaissance Trivia\nDIFFICULTY: medium\nMichelangelo\nRaphael\nDonatello";
+        let raw =
+            "CATEGORY: Renaissance Trivia\nDIFFICULTY: medium\nMichelangelo\nRaphael\nDonatello";
         assert!(validate_generation(raw, "Leonardo da Vinci", &[]).is_none());
     }
 
@@ -855,7 +891,10 @@ Donatello";
         // two header lines are excluded from that pass.
         let g = validate_generation(GOOD_GENERATION_RESPONSE, "Leonardo da Vinci", &[]).unwrap();
         assert_eq!(g.distractors.len(), 3);
-        assert!(!g.distractors.iter().any(|d| d.to_lowercase().contains("category")));
+        assert!(!g
+            .distractors
+            .iter()
+            .any(|d| d.to_lowercase().contains("category")));
     }
 
     // ── ingest key ───────────────────────────────────────────────────────

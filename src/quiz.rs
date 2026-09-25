@@ -248,8 +248,9 @@ async fn send_question_with_retry(
         }
     }
 
-    Err(last_err.expect("loop runs MAX_ATTEMPTS >= 1 time"))
-        .context(format!("failed to post question after {MAX_ATTEMPTS} attempts"))
+    Err(last_err.expect("loop runs MAX_ATTEMPTS >= 1 time")).context(format!(
+        "failed to post question after {MAX_ATTEMPTS} attempts"
+    ))
 }
 
 // ── Reaction reconciliation ───────────────────────────────────────────────────
@@ -340,8 +341,10 @@ async fn reconcile_reactions(
                 undecryptable += 1;
                 continue;
             }
-            let Ok(AnyMessageLikeEvent::Reaction(ev)) =
-                event.kind.raw().deserialize_as_unchecked::<AnyMessageLikeEvent>()
+            let Ok(AnyMessageLikeEvent::Reaction(ev)) = event
+                .kind
+                .raw()
+                .deserialize_as_unchecked::<AnyMessageLikeEvent>()
             else {
                 continue;
             };
@@ -485,7 +488,11 @@ fn merge_reconciled_answers(
             });
     }
 
-    ReconciliationSummary { added, corrected, removed }
+    ReconciliationSummary {
+        added,
+        corrected,
+        removed,
+    }
 }
 
 // ── Quiz runner ───────────────────────────────────────────────────────────────
@@ -597,9 +604,7 @@ pub async fn start_quiz(
         return Ok(());
     };
     if round_len < n_questions {
-        warn!(
-            "Round prefetch supplied {round_len}/{n_questions} questions — shortening round"
-        );
+        warn!("Round prefetch supplied {round_len}/{n_questions} questions — shortening round");
     }
 
     // ── Create round in DB ────────────────────────────────────────────────────
@@ -1114,9 +1119,24 @@ mod tests {
         // Concurrent reactions are serialized through the same mutex the
         // real handler locks, so back-to-back calls model that correctly.
         let mut active = Some(active_quiz("$q1:example.org"));
-        apply_reaction(&mut active, &event_id("$q1:example.org"), "@a:x.org".to_owned(), 0);
-        apply_reaction(&mut active, &event_id("$q1:example.org"), "@b:x.org".to_owned(), 1);
-        apply_reaction(&mut active, &event_id("$q1:example.org"), "@c:x.org".to_owned(), 2);
+        apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@a:x.org".to_owned(),
+            0,
+        );
+        apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@b:x.org".to_owned(),
+            1,
+        );
+        apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@c:x.org".to_owned(),
+            2,
+        );
         let answers = active.unwrap().answers;
         assert_eq!(answers.len(), 3);
         assert_eq!(answers["@a:x.org"].choice, 0);

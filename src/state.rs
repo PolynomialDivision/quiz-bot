@@ -1,7 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, VecDeque}, path::Path};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+};
 
 /// A one-time quiz scheduled via `!schedulequiz`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -40,10 +43,10 @@ pub struct State {
 /// A question as returned by the OpenTDB API (decoded).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FetchedQuestion {
-    pub category:          String,
-    pub difficulty:        String,
-    pub question:          String,
-    pub correct_answer:    String,
+    pub category: String,
+    pub difficulty: String,
+    pub question: String,
+    pub correct_answer: String,
     pub incorrect_answers: Vec<String>,
 }
 

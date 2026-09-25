@@ -55,11 +55,11 @@ fn default_label(token: &str) -> &str {
 /// `**bold**` markers, replacing them for both the plain body and the HTML
 /// body.  `label_for(mxid) -> &str` controls the pill label text.
 fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessageEventContent {
-    let mut plain    = String::with_capacity(text.len());
-    let mut html     = String::with_capacity(text.len() * 2);
-    let mut pos      = 0;
-    let mut found    = false;   // true when HTML output differs from plain
-    let mut in_bold  = false;
+    let mut plain = String::with_capacity(text.len());
+    let mut html = String::with_capacity(text.len() * 2);
+    let mut pos = 0;
+    let mut found = false; // true when HTML output differs from plain
+    let mut in_bold = false;
 
     let mut in_strike = false;
     // Every MXID pill rendered below must also land in `m.mentions` on this
@@ -73,32 +73,28 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
 
     while pos < text.len() {
         // ── **bold** markers ──────────────────────────────────────────────────
-        if text.as_bytes().get(pos) == Some(&b'*')
-            && text.as_bytes().get(pos + 1) == Some(&b'*')
-        {
+        if text.as_bytes().get(pos) == Some(&b'*') && text.as_bytes().get(pos + 1) == Some(&b'*') {
             if in_bold {
                 html.push_str("</strong>");
             } else {
                 html.push_str("<strong>");
             }
             in_bold = !in_bold;
-            found   = true;
-            pos    += 2;
+            found = true;
+            pos += 2;
             continue;
         }
 
         // ── ~~strikethrough~~ markers ─────────────────────────────────────────
-        if text.as_bytes().get(pos) == Some(&b'~')
-            && text.as_bytes().get(pos + 1) == Some(&b'~')
-        {
+        if text.as_bytes().get(pos) == Some(&b'~') && text.as_bytes().get(pos + 1) == Some(&b'~') {
             if in_strike {
                 html.push_str("</del>");
             } else {
                 html.push_str("<del>");
             }
             in_strike = !in_strike;
-            found     = true;
-            pos      += 2;
+            found = true;
+            pos += 2;
             continue;
         }
 
@@ -106,8 +102,7 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         if text.as_bytes()[pos] == b'@' {
             let token_len = text[pos..]
                 .find(|c: char| {
-                    c.is_whitespace()
-                        || matches!(c, ',' | '!' | '?' | '*' | ')' | ']' | '"' | '\'')
+                    c.is_whitespace() || matches!(c, ',' | '!' | '?' | '*' | ')' | ']' | '"' | '\'')
                 })
                 .unwrap_or(text.len() - pos);
 
@@ -134,19 +129,23 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         let ch = text[pos..].chars().next().unwrap();
         plain.push(ch);
         match ch {
-            '&'  => html.push_str("&amp;"),
-            '<'  => html.push_str("&lt;"),
-            '>'  => html.push_str("&gt;"),
-            '"'  => html.push_str("&quot;"),
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '"' => html.push_str("&quot;"),
             '\n' => html.push_str("<br>"),
-            _    => html.push(ch),
+            _ => html.push(ch),
         }
         pos += ch.len_utf8();
     }
 
     // Close any unclosed tags (shouldn't happen with well-formed input).
-    if in_bold   { html.push_str("</strong>"); }
-    if in_strike { html.push_str("</del>"); }
+    if in_bold {
+        html.push_str("</strong>");
+    }
+    if in_strike {
+        html.push_str("</del>");
+    }
 
     let content = if found {
         RoomMessageEventContent::text_html(plain, html)
@@ -176,8 +175,8 @@ fn push_escaped(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk::ruma::events::room::message::MessageType;
     use super::*;
+    use matrix_sdk::ruma::events::room::message::MessageType;
 
     fn uid(s: &str) -> OwnedUserId {
         <&matrix_sdk::ruma::UserId>::try_from(s).unwrap().to_owned()
@@ -186,10 +185,7 @@ mod tests {
     /// Extract (plain_body, Option<html_body>) from a RoomMessageEventContent.
     fn bodies(c: &RoomMessageEventContent) -> (String, Option<String>) {
         match &c.msgtype {
-            MessageType::Text(t) => (
-                t.body.clone(),
-                t.formatted.as_ref().map(|f| f.body.clone()),
-            ),
+            MessageType::Text(t) => (t.body.clone(), t.formatted.as_ref().map(|f| f.body.clone())),
             _ => panic!("unexpected msgtype"),
         }
     }
@@ -253,7 +249,10 @@ mod tests {
         let (plain, html) = bodies(&c);
         let html = html.expect("should have HTML body");
         assert!(html.contains("<del>Sports</del>"), "html={html}");
-        assert!(!plain.contains('~'), "plain should not contain tildes, got: {plain}");
+        assert!(
+            !plain.contains('~'),
+            "plain should not contain tildes, got: {plain}"
+        );
         assert!(plain.contains("Sports"), "plain={plain}");
     }
 
@@ -284,10 +283,7 @@ mod tests {
     #[test]
     fn with_names_escapes_display_name_html() {
         let mut names = HashMap::new();
-        names.insert(
-            "@alice:example.org".to_owned(),
-            "<Alice & Co>".to_owned(),
-        );
+        names.insert("@alice:example.org".to_owned(), "<Alice & Co>".to_owned());
         let c = mentionify_with_names("@alice:example.org", &names);
         let (_, html) = bodies(&c);
         let html = html.expect("should have HTML body");
@@ -303,7 +299,10 @@ mod tests {
         // (or omitted) separately.
         let c = mentionify("Hello @alice:example.org!");
         let mentions = c.mentions.expect("m.mentions must be set");
-        assert_eq!(mentions.user_ids, [uid("@alice:example.org")].into_iter().collect());
+        assert_eq!(
+            mentions.user_ids,
+            [uid("@alice:example.org")].into_iter().collect()
+        );
         assert!(!mentions.room);
     }
 

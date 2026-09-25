@@ -31,22 +31,22 @@ of the answer (e.g. \"Eiffel Tower Paris\" or \"Albert Einstein physicist\").
 Nothing may follow the IMAGE_SEARCH line.";
 
 const REQUEST_TIMEOUT: u64 = 30; // seconds for Groq API call
-const FETCH_TIMEOUT:   u64 = 15; // seconds for image download
+const FETCH_TIMEOUT: u64 = 15; // seconds for image download
 
 const USER_AGENT: &str = "quiz-bot/1.0 (Matrix trivia quiz; https://matrix.org)";
 
 // ── Result type ───────────────────────────────────────────────────────────────
 
 pub struct ExplainerResult {
-    pub text:      String,
-    pub image_url: Option<String>,  // direct upload.wikimedia.org URL
+    pub text: String,
+    pub image_url: Option<String>, // direct upload.wikimedia.org URL
 }
 
 // ── Response parsing ──────────────────────────────────────────────────────────
 
 /// Split the LLM response into `(prose_text, optional_search_keyword)`.
 fn parse_response(raw: String) -> (String, Option<String>) {
-    let mut text_lines:  Vec<&str> = Vec::new();
+    let mut text_lines: Vec<&str> = Vec::new();
     let mut search_term: Option<String> = None;
 
     for line in raw.lines() {
@@ -60,7 +60,11 @@ fn parse_response(raw: String) -> (String, Option<String>) {
         }
     }
 
-    while text_lines.last().map(|l: &&str| l.trim().is_empty()).unwrap_or(false) {
+    while text_lines
+        .last()
+        .map(|l: &&str| l.trim().is_empty())
+        .unwrap_or(false)
+    {
         text_lines.pop();
     }
 
@@ -74,13 +78,14 @@ fn parse_response(raw: String) -> (String, Option<String>) {
 async fn search_commons_image(client: &reqwest::Client, keyword: &str) -> Option<String> {
     // Step 1: search the File namespace for matching titles.
     let mut search_url = reqwest::Url::parse("https://commons.wikimedia.org/w/api.php").unwrap();
-    search_url.query_pairs_mut()
-        .append_pair("action",      "query")
-        .append_pair("list",        "search")
-        .append_pair("srsearch",    keyword)
-        .append_pair("srnamespace", "6")       // File namespace
-        .append_pair("srlimit",     "5")
-        .append_pair("format",      "json");
+    search_url
+        .query_pairs_mut()
+        .append_pair("action", "query")
+        .append_pair("list", "search")
+        .append_pair("srsearch", keyword)
+        .append_pair("srnamespace", "6") // File namespace
+        .append_pair("srlimit", "5")
+        .append_pair("format", "json");
 
     let search_resp: serde_json::Value = match client
         .get(search_url)
@@ -103,24 +108,25 @@ async fn search_commons_image(client: &reqwest::Client, keyword: &str) -> Option
 
     // Pick the first result that looks like a photo (jpg/jpeg/png/webp).
     let hits = search_resp["query"]["search"].as_array()?;
-    let file_title = hits.iter()
-        .filter_map(|h| h["title"].as_str())
-        .find(|t| {
-            let lower = t.to_lowercase();
-            lower.ends_with(".jpg")  || lower.ends_with(".jpeg") ||
-            lower.ends_with(".png")  || lower.ends_with(".webp")
-        })?;
+    let file_title = hits.iter().filter_map(|h| h["title"].as_str()).find(|t| {
+        let lower = t.to_lowercase();
+        lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".png")
+            || lower.ends_with(".webp")
+    })?;
 
     info!("Explainer: Commons search {keyword:?} → {file_title}");
 
     // Step 2: resolve the file title to a direct upload URL via imageinfo.
     let mut info_url = reqwest::Url::parse("https://commons.wikimedia.org/w/api.php").unwrap();
-    info_url.query_pairs_mut()
-        .append_pair("action",  "query")
-        .append_pair("titles",  file_title)
-        .append_pair("prop",    "imageinfo")
-        .append_pair("iiprop",  "url")
-        .append_pair("format",  "json");
+    info_url
+        .query_pairs_mut()
+        .append_pair("action", "query")
+        .append_pair("titles", file_title)
+        .append_pair("prop", "imageinfo")
+        .append_pair("iiprop", "url")
+        .append_pair("format", "json");
 
     let info_resp: serde_json::Value = match client
         .get(info_url)
@@ -176,7 +182,9 @@ pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.starts_with(b"\xFF\xD8") {
         let mut i = 2usize;
         while i + 4 < bytes.len() {
-            if bytes[i] != 0xFF { break; }
+            if bytes[i] != 0xFF {
+                break;
+            }
             let marker = bytes[i + 1];
             let seg_len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
             // SOF0–SOF3 and SOF5–SOF7 etc. carry height/width at offsets +5/+7.
@@ -206,7 +214,7 @@ pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
         .ok()?;
 
     let resp = match client.get(url).send().await {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(e) => {
             warn!("Explainer: image download failed for {url}: {e}");
             return None;
@@ -214,7 +222,10 @@ pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
     };
 
     if !resp.status().is_success() {
-        warn!("Explainer: image download returned {} for {url}", resp.status());
+        warn!(
+            "Explainer: image download returned {} for {url}",
+            resp.status()
+        );
         return None;
     }
 
@@ -230,7 +241,7 @@ pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
         .to_owned();
 
     match resp.bytes().await {
-        Ok(b)  => Some((b.to_vec(), ct)),
+        Ok(b) => Some((b.to_vec(), ct)),
         Err(e) => {
             warn!("Explainer: failed to read image body for {url}: {e}");
             None
@@ -245,9 +256,9 @@ pub async fn fetch_image_bytes(url: &str) -> Option<(Vec<u8>, String)> {
 /// photo on Wikimedia Commons — no filename guessing.
 pub async fn explain(
     question: &str,
-    answer:   &str,
-    api_key:  &str,
-    model:    &str,
+    answer: &str,
+    api_key: &str,
+    model: &str,
 ) -> Option<ExplainerResult> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT))

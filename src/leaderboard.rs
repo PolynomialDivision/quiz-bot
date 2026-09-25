@@ -167,7 +167,11 @@ mod tests {
         }
     }
 
-    fn entry_without_display_name(localpart: &str, correct: i64, total: i64) -> MonthlyLeaderboardEntry {
+    fn entry_without_display_name(
+        localpart: &str,
+        correct: i64,
+        total: i64,
+    ) -> MonthlyLeaderboardEntry {
         MonthlyLeaderboardEntry {
             user_id: format!("@{localpart}:example.org"),
             display_name: None,
@@ -336,6 +340,9 @@ mod tests {
         assert!(plain.contains("<Alice & Co> Admin"));
         assert!(html.contains("&lt;Alice &amp; Co&gt; Admin"));
         assert!(!html.contains("><Alice"));
-        assert!(html.contains("https://matrix.to/#/@"), "still a mention pill");
+        assert!(
+            html.contains("https://matrix.to/#/@"),
+            "still a mention pill"
+        );
     }
 }
