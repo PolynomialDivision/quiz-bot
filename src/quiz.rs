@@ -182,11 +182,9 @@ fn format_countdown(secs: u64) -> String {
 
 fn time_bar(remaining: u64, total: u64) -> String {
     const W: usize = 10;
-    let filled = if total > 0 {
-        (remaining * W as u64 / total) as usize
-    } else {
-        0
-    };
+    let filled = (remaining * W as u64)
+        .checked_div(total)
+        .map_or(0, |filled| filled as usize);
     format!("{}{}", "█".repeat(filled), "░".repeat(W - filled))
 }
 

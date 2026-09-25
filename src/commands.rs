@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::Timelike as _;
 use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
@@ -28,11 +28,10 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
 }
 
 fn require_admin(ctx: &BotContext, sender: &OwnedUserId) -> Result<()> {
-    if ctx.admin_users.contains(sender) {
-        Ok(())
-    } else {
-        Err(anyhow!("__not_admin__"))
-    }
+    Ok(mxbot_common::admin::require_admin(
+        &ctx.admin_users,
+        sender,
+    )?)
 }
 
 // ── !startquiz ────────────────────────────────────────────────────────────────

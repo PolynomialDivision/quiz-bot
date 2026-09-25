@@ -64,7 +64,7 @@ async fn command_reply(
             let names = ctx.db.player_display_names().await.unwrap_or_default();
             Some(format::mentionify_with_names(&reply, &names))
         }
-        Err(e) if e.to_string() == "__not_admin__" => Some(format::mentionify(
+        Err(e) if e.is::<mxbot_common::admin::NotAdmin>() => Some(format::mentionify(
             "❌ This command requires admin privileges.",
         )),
         Ok(None) => None,
@@ -295,5 +295,5 @@ async fn main() -> Result<()> {
     tokio::spawn(triviaqa::ensure_ingested(ctx.clone()));
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
-    bot.sync_forever().await
+    bot.run().await
 }
