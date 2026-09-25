@@ -54,6 +54,9 @@ pub struct ActiveQuiz {
     /// Per-user answer records.  `record_answer` handles change-tracking.
     pub answers: HashMap<String, AnswerRecord>,
     pub correct_index: u8,
+    /// How many answers the question offers (2 for true/false) — anything
+    /// beyond, like 🇨 on a true/false question, is not an answer.
+    pub n_choices: u8,
 }
 
 /// Outcome of `ActiveQuiz::record_answer`, so callers (the reaction/text
@@ -70,6 +73,10 @@ pub enum AnswerOutcome {
 }
 
 impl ActiveQuiz {
+    pub fn is_choice(&self, choice: u8) -> bool {
+        choice < self.n_choices
+    }
+
     /// Record or update a user's answer.  Sets `changed_answer = true` when
     /// the user picks a different option than their previous one.
     pub fn record_answer(
@@ -114,6 +121,9 @@ pub enum ReactionResult {
     WrongQuestion,
     /// No quiz question is currently active at all.
     NoActiveQuestion,
+    /// It targeted the active question, but with a letter the question
+    /// doesn't offer (🇨/🇩 on a true/false question).
+    NotAChoice,
 }
 
 /// Apply an incoming answer reaction to whatever question is currently
@@ -129,6 +139,9 @@ pub fn apply_reaction(
 ) -> ReactionResult {
     match active_quiz {
         Some(quiz) if &quiz.event_id == reacted_to => {
+            if !quiz.is_choice(choice) {
+                return ReactionResult::NotAChoice;
+            }
             ReactionResult::Accepted(quiz.record_answer(sender, choice, "reaction"))
         }
         Some(_) => ReactionResult::WrongQuestion,
@@ -308,16 +321,18 @@ async fn fetch_relations_page(
 /// already delivered (and processed) a given reaction by the time the
 /// question closed, only whether the homeserver has it. Users found only on
 /// the server (missed on the stream) are added with source "reconciled" and
-/// submitted_at = now.
+/// submitted_at = when the server received the reaction, so speed stats stay
+/// right.
 async fn reconcile_reactions(
     client: &Client,
     room: &Room,
     q_event_id: &OwnedEventId,
+    n_choices: u8,
     answers: &mut HashMap<String, AnswerRecord>,
 ) {
     use matrix_sdk::ruma::events::AnyMessageLikeEvent;
 
-    let mut server_answers: HashMap<String, u8> = HashMap::new();
+    let mut server_answers: HashMap<String, ServerAnswer> = HashMap::new();
     let mut from: Option<String> = None;
     let mut fully_synced = false;
     let mut undecryptable = 0u32;
@@ -365,13 +380,19 @@ async fn reconcile_reactions(
                 "🇩" => 3,
                 _ => continue,
             };
+            if choice >= n_choices {
+                continue;
+            }
+            let sent_at =
+                chrono::DateTime::from_timestamp_millis(i64::from(orig.origin_server_ts.get()))
+                    .unwrap_or_else(chrono::Utc::now);
             // `Room::relations` defaults to backward (most-recent-first)
             // order, so the first entry seen per sender is their latest
             // reaction — relevant if a client doesn't auto-redact a
             // superseded reaction before sending the new one.
             server_answers
                 .entry(orig.sender.as_str().to_owned())
-                .or_insert(choice);
+                .or_insert(ServerAnswer { choice, sent_at });
         }
 
         match relations.next_batch_token {
@@ -399,7 +420,7 @@ async fn reconcile_reactions(
     }
 
     let before = answers.len();
-    let summary = merge_reconciled_answers(answers, &server_answers, chrono::Utc::now());
+    let summary = merge_reconciled_answers(answers, &server_answers);
 
     if !summary.is_empty() {
         info!(
@@ -412,6 +433,14 @@ async fn reconcile_reactions(
             "Reconciled reactions against server state"
         );
     }
+}
+
+/// A user's current answer reaction as the homeserver has it.
+#[derive(Clone, Copy, Debug)]
+struct ServerAnswer {
+    choice: u8,
+    /// When the server received the reaction.
+    sent_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What `merge_reconciled_answers` changed, for logging.
@@ -438,9 +467,9 @@ impl ReconciliationSummary {
 }
 
 /// Merge the server's authoritative reaction state (`server_answers`) into
-/// the live-stream-collected `answers`, in place. Pure aside from the
-/// caller-supplied `now` (used as `submitted_at` for answers added here),
-/// so the merge rules can be unit-tested without a network round trip.
+/// the live-stream-collected `answers`, in place. Pure, so the merge rules
+/// can be unit-tested without a network round trip. Answers added or
+/// corrected here take the reaction's server timestamp as `submitted_at`.
 ///
 /// The stream never sees `m.room.redaction` events, so it can hold a stale
 /// reaction answer after the user removed it — the server's current
@@ -452,8 +481,7 @@ impl ReconciliationSummary {
 ///  • User missing from stream entirely        → add from server
 fn merge_reconciled_answers(
     answers: &mut HashMap<String, AnswerRecord>,
-    server_answers: &HashMap<String, u8>,
-    now: chrono::DateTime<chrono::Utc>,
+    server_answers: &HashMap<String, ServerAnswer>,
 ) -> ReconciliationSummary {
     let removed: Vec<String> = answers
         .iter()
@@ -464,14 +492,15 @@ fn merge_reconciled_answers(
 
     let mut added = Vec::new();
     let mut corrected = Vec::new();
-    for (user_id, &server_choice) in server_answers {
+    for (user_id, server) in server_answers {
         answers
             .entry(user_id.clone())
             .and_modify(|r| {
                 // Don't touch text answers — they're always final.
-                if r.source != "text" && r.choice != server_choice {
-                    r.choice = server_choice;
+                if r.source != "text" && r.choice != server.choice {
+                    r.choice = server.choice;
                     r.source = "reconciled";
+                    r.submitted_at = server.sent_at;
                     r.changed_answer = true;
                     corrected.push(user_id.clone());
                 }
@@ -479,9 +508,9 @@ fn merge_reconciled_answers(
             .or_insert_with(|| {
                 added.push(user_id.clone());
                 AnswerRecord {
-                    choice: server_choice,
+                    choice: server.choice,
                     source: "reconciled",
-                    submitted_at: now,
+                    submitted_at: server.sent_at,
                     changed_answer: false,
                 }
             });
@@ -574,19 +603,6 @@ pub async fn start_quiz(
     let local_date = chrono::Utc::now().with_timezone(&tz).date_naive();
     let leaderboard_month = crate::leaderboard::YearMonth::containing(local_date);
 
-    // ── Mark today for this scheduler slot ────────────────────────────────────
-    // Marked regardless of prefetch outcome below: a slot only ever gets one
-    // fire attempt per day (the scheduler's fire window is a single minute),
-    // so there is nothing to gain by leaving it unmarked on failure, and
-    // doing so before we know the outcome keeps a restart from double-firing.
-    if let Some(ref key) = slot_key {
-        let mut state = ctx.state.lock().await;
-        state.last_quiz_dates.insert(key.clone(), local_date);
-        if let Err(e) = state.save(&ctx.state_path).await {
-            error!("Failed to persist last_quiz_dates: {e}");
-        }
-    }
-
     // ── Resolve the preloaded question set ────────────────────────────────────
     //
     // The round runs entirely off this set — no on-demand fetching happens
@@ -678,7 +694,9 @@ pub async fn start_quiz(
         info!("Q {q_num}/{round_len}: posted (event {q_event_id}, correct slot {correct_index})");
 
         // ── Insert question in DB ─────────────────────────────────────────────
-        let question_id = ctx
+        // The question is already in the room, so a DB error must not end
+        // the round — it is still evaluated, just not recorded.
+        let question_id = match ctx
             .db
             .insert_question(&db::QuestionParams {
                 round_id,
@@ -693,7 +711,17 @@ pub async fn start_quiz(
                 correct_answer_text: &fetched.correct_answer,
                 answer_timeout_secs: timeout as i32,
             })
-            .await?;
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                error!(
+                    round_id,
+                    q_num, "DB insert_question failed — question not recorded: {e:#}"
+                );
+                None
+            }
+        };
 
         // ── Bot reacts so users can just tap ──────────────────────────────────
         for emoji in &CHOICE_EMOJIS[..choices.len()] {
@@ -712,6 +740,7 @@ pub async fn start_quiz(
                 event_id: q_event_id.clone(),
                 answers: HashMap::new(),
                 correct_index,
+                n_choices: choices.len() as u8,
             });
         }
 
@@ -753,7 +782,14 @@ pub async fn start_quiz(
         );
 
         // ── Reconcile reactions from server ───────────────────────────────────
-        reconcile_reactions(&client, &room, &q_event_id, &mut answers).await;
+        reconcile_reactions(
+            &client,
+            &room,
+            &q_event_id,
+            choices.len() as u8,
+            &mut answers,
+        )
+        .await;
 
         // ── Build correct / wrong lists ───────────────────────────────────────
         let correct_emoji = CHOICE_EMOJIS[correct_index as usize];
@@ -783,24 +819,26 @@ pub async fn start_quiz(
         }
 
         // ── Persist to DB ─────────────────────────────────────────────────────
-        if let Err(e) = ctx
-            .db
-            .insert_answers(question_id, round_id, &answers, correct_index)
-            .await
-        {
-            error!("DB insert_answers failed: {e}");
-        }
-        if let Err(e) = ctx
-            .db
-            .update_question_stats(
-                question_id,
-                answers.len() as i32,
-                correct_users.len() as i32,
-                wrong_users.len() as i32,
-            )
-            .await
-        {
-            error!("DB update_question_stats failed: {e}");
+        if let Some(question_id) = question_id {
+            if let Err(e) = ctx
+                .db
+                .insert_answers(question_id, round_id, &answers, correct_index)
+                .await
+            {
+                error!("DB insert_answers failed: {e}");
+            }
+            if let Err(e) = ctx
+                .db
+                .update_question_stats(
+                    question_id,
+                    answers.len() as i32,
+                    correct_users.len() as i32,
+                    wrong_users.len() as i32,
+                )
+                .await
+            {
+                error!("DB update_question_stats failed: {e}");
+            }
         }
 
         questions_asked = q_num;
@@ -932,7 +970,7 @@ pub async fn start_quiz(
 
         if round_scores.is_empty() {
             summary_lines.push(String::new());
-            summary_lines.push("Nobody got it right.".to_owned());
+            summary_lines.push("No answers this round.".to_owned());
         } else {
             let mut podium: Vec<(&String, u32, u32)> =
                 round_scores.iter().map(|(u, &(c, t))| (u, c, t)).collect();
@@ -1042,11 +1080,19 @@ mod tests {
         }
     }
 
+    fn on_server(choice: u8) -> ServerAnswer {
+        ServerAnswer {
+            choice,
+            sent_at: chrono::Utc::now(),
+        }
+    }
+
     fn active_quiz(question: &str) -> ActiveQuiz {
         ActiveQuiz {
             event_id: event_id(question),
             answers: HashMap::new(),
             correct_index: 0,
+            n_choices: 4,
         }
     }
 
@@ -1145,6 +1191,21 @@ mod tests {
         assert_eq!(answers["@c:x.org"].choice, 2);
     }
 
+    #[test]
+    fn apply_reaction_ignores_a_letter_the_question_does_not_offer() {
+        let mut quiz = active_quiz("$q1:example.org");
+        quiz.n_choices = 2; // true/false
+        let mut active = Some(quiz);
+        let result = apply_reaction(
+            &mut active,
+            &event_id("$q1:example.org"),
+            "@alice:example.org".to_owned(),
+            2,
+        );
+        assert_eq!(result, ReactionResult::NotAChoice);
+        assert!(active.unwrap().answers.is_empty());
+    }
+
     // ── Reconciliation merge ─────────────────────────────────────────────────
 
     #[test]
@@ -1153,9 +1214,9 @@ mod tests {
         // to the homeserver, but not yet processed (or processed after
         // `active_quiz` was already drained) by the live stream.
         let mut answers = HashMap::new();
-        let server = HashMap::from([("@late:example.org".to_owned(), 2u8)]);
+        let server = HashMap::from([("@late:example.org".to_owned(), on_server(2))]);
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert_eq!(summary.added, vec!["@late:example.org".to_owned()]);
         assert_eq!(answers["@late:example.org"].choice, 2);
@@ -1170,9 +1231,9 @@ mod tests {
         // timestamp/source).
         let mut answers = HashMap::new();
         answers.insert("@alice:example.org".to_owned(), answer(1, "reaction"));
-        let server = HashMap::from([("@alice:example.org".to_owned(), 1u8)]);
+        let server = HashMap::from([("@alice:example.org".to_owned(), on_server(1))]);
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert!(summary.is_empty());
         assert_eq!(answers["@alice:example.org"].source, "reaction");
@@ -1183,9 +1244,9 @@ mod tests {
     fn merge_corrects_a_changed_answer_the_stream_missed() {
         let mut answers = HashMap::new();
         answers.insert("@alice:example.org".to_owned(), answer(0, "reaction"));
-        let server = HashMap::from([("@alice:example.org".to_owned(), 3u8)]);
+        let server = HashMap::from([("@alice:example.org".to_owned(), on_server(3))]);
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert_eq!(summary.corrected, vec!["@alice:example.org".to_owned()]);
         assert_eq!(answers["@alice:example.org"].choice, 3);
@@ -1198,7 +1259,7 @@ mod tests {
         answers.insert("@alice:example.org".to_owned(), answer(0, "reaction"));
         let server = HashMap::new(); // no reaction present anymore
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert_eq!(summary.removed, vec!["@alice:example.org".to_owned()]);
         assert!(answers.is_empty());
@@ -1210,7 +1271,7 @@ mod tests {
         answers.insert("@alice:example.org".to_owned(), answer(0, "text"));
         let server = HashMap::new(); // text answers have no server-side reaction
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert!(summary.is_empty());
         assert_eq!(answers["@alice:example.org"].source, "text");
@@ -1221,16 +1282,30 @@ mod tests {
         let mut answers = HashMap::new();
         answers.insert("@already:example.org".to_owned(), answer(0, "reaction"));
         let server = HashMap::from([
-            ("@already:example.org".to_owned(), 0u8),
-            ("@new1:example.org".to_owned(), 1u8),
-            ("@new2:example.org".to_owned(), 3u8),
+            ("@already:example.org".to_owned(), on_server(0)),
+            ("@new1:example.org".to_owned(), on_server(1)),
+            ("@new2:example.org".to_owned(), on_server(3)),
         ]);
 
-        let summary = merge_reconciled_answers(&mut answers, &server, chrono::Utc::now());
+        let summary = merge_reconciled_answers(&mut answers, &server);
 
         assert_eq!(answers.len(), 3);
         assert_eq!(summary.added.len(), 2);
         assert!(summary.added.contains(&"@new1:example.org".to_owned()));
         assert!(summary.added.contains(&"@new2:example.org".to_owned()));
+    }
+
+    #[test]
+    fn merge_uses_the_server_timestamp_for_a_missed_reaction() {
+        let sent_at = chrono::Utc::now() - chrono::Duration::seconds(20);
+        let mut answers = HashMap::new();
+        let server = HashMap::from([(
+            "@late:example.org".to_owned(),
+            ServerAnswer { choice: 1, sent_at },
+        )]);
+
+        merge_reconciled_answers(&mut answers, &server);
+
+        assert_eq!(answers["@late:example.org"].submitted_at, sent_at);
     }
 }

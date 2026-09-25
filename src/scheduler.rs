@@ -1,4 +1,4 @@
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use chrono_tz::Tz;
 use matrix_sdk::{ruma::OwnedTransactionId, Client};
 use mxbot_common::matrix_sdk;
@@ -6,16 +6,46 @@ use tracing::{error, info, warn};
 
 use crate::{config::ScheduleConfig, state::ScheduledOnce, BotContext};
 
-/// Background task: wake up every 60 seconds and check whether it's time to
-/// fire any configured quiz slot.
+/// How long after its fire moment a slot may still start. The scheduler
+/// fires once the moment has passed rather than only in its exact minute,
+/// so a late tick or a restart around that time doesn't lose the quiz.
+const FIRE_GRACE_SECS: i64 = 5 * 60;
+
+/// Background task: check every 20 seconds whether it's time to fire any
+/// configured quiz slot.
 pub async fn run(ctx: BotContext, client: Client) {
     info!("Quiz scheduler started");
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        interval.tick().await;
         if let Err(e) = tick(&ctx, &client).await {
             error!("Scheduler error: {e}");
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
+}
+
+/// Seconds after local midnight at which a quiz starting at `qh:qm` fires
+/// (its earliest reminder), wrapping to the previous day if needed.
+fn fire_secs(qh: u32, qm: u32, offset: i64) -> i64 {
+    ((qh * 3600 + qm * 60) as i64 - offset).rem_euclid(86400)
+}
+
+/// The fire moment on `date`.
+fn fire_moment(date: NaiveDate, fire_secs: i64) -> NaiveDateTime {
+    date.and_hms_opt(0, 0, 0).expect("midnight exists") + chrono::Duration::seconds(fire_secs)
+}
+
+/// The date whose fire moment `now` falls within the grace window of, if any
+/// — today's, or yesterday's for a window that crosses midnight.
+fn due_fire_date(now: NaiveDateTime, fire_secs: i64) -> Option<NaiveDate> {
+    let today = now.date();
+    [today, today - chrono::Duration::days(1)]
+        .into_iter()
+        .find(|&date| {
+            let since = (now - fire_moment(date, fire_secs)).num_seconds();
+            (0..FIRE_GRACE_SECS).contains(&since)
+        })
 }
 
 async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
@@ -27,8 +57,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         .unwrap_or(chrono_tz::UTC);
     let local_now = chrono::Utc::now().with_timezone(&tz);
     let local_date = local_now.date_naive();
-    let now_hour = local_now.hour();
-    let now_minute = local_now.minute();
+    let now = local_now.naive_local();
     let offset = ctx
         .config
         .schedule
@@ -47,38 +76,43 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         };
 
-        // Fire this many seconds before the quiz so the reminder lands on time.
-        let quiz_secs = (qh * 3600 + qm * 60) as i64;
-        let fire_secs = (quiz_secs - offset).rem_euclid(86400);
-        let fire_hour = (fire_secs / 3600) as u32;
-        let fire_min = ((fire_secs % 3600) / 60) as u32;
+        // Fire `offset` seconds before the quiz so the reminder lands on time.
+        let fire_secs = fire_secs(qh, qm, offset);
+        let Some(fire_date) = due_fire_date(now, fire_secs) else {
+            continue;
+        };
 
-        if now_hour != fire_hour || now_minute != fire_min {
+        // Already fired this slot?
+        if ctx
+            .state
+            .lock()
+            .await
+            .last_quiz_dates
+            .get(time_str.as_str())
+            == Some(&fire_date)
+        {
             continue;
         }
 
-        // Already fired this slot today?
-        {
-            let state = ctx.state.lock().await;
-            if state.last_quiz_dates.get(time_str.as_str()) == Some(&local_date) {
-                continue;
-            }
+        // Another quiz round already running? Retried on the next tick
+        // while the grace window lasts.
+        if ctx.quiz_run_lock.try_lock().is_err() {
+            warn!("Scheduler: slot {time_str} is due but a quiz is already in progress — waiting");
+            continue;
         }
 
-        // Another quiz round already running?
+        // Marked before starting so a restart can't fire it twice.
         {
-            if ctx.quiz_run_lock.try_lock().is_err() {
-                warn!(
-                    "Scheduler: fire time for slot {time_str} \
-                     but a quiz is already in progress — skipping"
-                );
-                continue;
+            let mut state = ctx.state.lock().await;
+            state.last_quiz_dates.insert(time_str.clone(), fire_date);
+            if let Err(e) = state.save(&ctx.state_path).await {
+                error!("Failed to persist last_quiz_dates: {e}");
             }
         }
 
         info!(
-            "Scheduled quiz firing for slot {time_str} \
-             (fire at {fire_hour}:{fire_min:02}, quiz at {qh}:{qm:02})",
+            "Scheduled quiz firing for slot {time_str} (fire at {}, quiz at {qh}:{qm:02})",
+            fire_moment(fire_date, fire_secs).format("%H:%M"),
         );
         let ctx2 = ctx.clone();
         let client2 = client.clone();
@@ -94,54 +128,42 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let once_entries: Vec<ScheduledOnce> = ctx.state.lock().await.scheduled_once.clone();
 
     for entry in once_entries {
-        if entry.date != local_date {
+        let Some((qh, qm)) = ScheduleConfig::parse_quiz_time(&entry.quiz_time) else {
+            warn!(
+                "Invalid scheduled_once time {:?} — removing",
+                entry.quiz_time
+            );
+            remove_once(ctx, &entry).await;
             continue;
-        }
-
-        let (qh, qm) = match ScheduleConfig::parse_quiz_time(&entry.quiz_time) {
-            Some(t) => t,
-            None => {
-                warn!(
-                    "Invalid scheduled_once time {:?} — removing",
-                    entry.quiz_time
-                );
-                let mut state = ctx.state.lock().await;
-                state.scheduled_once.retain(|e| e != &entry);
-                state.save(&ctx.state_path).await.ok();
-                continue;
-            }
         };
 
-        let quiz_secs = (qh * 3600 + qm * 60) as i64;
-        let fire_secs = (quiz_secs - offset).rem_euclid(86400);
-        let fire_hour = (fire_secs / 3600) as u32;
-        let fire_min = ((fire_secs % 3600) / 60) as u32;
-
-        if now_hour != fire_hour || now_minute != fire_min {
+        // `entry.date` is the day of the fire moment (see `!schedulequiz`).
+        let fire_secs = fire_secs(qh, qm, offset);
+        let since = (now - fire_moment(entry.date, fire_secs)).num_seconds();
+        if since < 0 {
+            continue;
+        }
+        // Removed before spawning to prevent double-fire on restart — and
+        // also once its time has passed while the bot was offline, so it
+        // doesn't linger in the list forever.
+        remove_once(ctx, &entry).await;
+        if since >= FIRE_GRACE_SECS {
+            warn!(
+                "One-time quiz at {} on {} was missed (bot offline?) — removed",
+                entry.quiz_time, entry.date
+            );
             continue;
         }
 
-        // Remove the entry before spawning to prevent double-fire on restart.
-        {
-            let mut state = ctx.state.lock().await;
-            state.scheduled_once.retain(|e| e != &entry);
-            state.save(&ctx.state_path).await.ok();
+        if ctx.quiz_run_lock.try_lock().is_err() {
+            warn!(
+                "One-time quiz at {} would fire now but a quiz is already running — dropped",
+                entry.quiz_time,
+            );
+            continue;
         }
 
-        {
-            if ctx.quiz_run_lock.try_lock().is_err() {
-                warn!(
-                    "One-time quiz at {} would fire now but a quiz is already running — dropped",
-                    entry.quiz_time,
-                );
-                continue;
-            }
-        }
-
-        info!(
-            "One-time quiz firing for {} (fire at {fire_hour}:{fire_min:02})",
-            entry.quiz_time
-        );
+        info!("One-time quiz firing for {}", entry.quiz_time);
         let ctx2 = ctx.clone();
         let client2 = client.clone();
         tokio::spawn(async move {
@@ -153,11 +175,19 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     }
 
     // Let quizzes crossing midnight finish before freezing the previous month.
-    if local_date.day() > 1 || now_hour >= 1 {
+    if local_date.day() > 1 || local_now.hour() >= 1 {
         post_previous_month(ctx, client, tz, local_date).await?;
     }
 
     Ok(())
+}
+
+async fn remove_once(ctx: &BotContext, entry: &ScheduledOnce) {
+    let mut state = ctx.state.lock().await;
+    state.scheduled_once.retain(|e| e != entry);
+    if let Err(e) = state.save(&ctx.state_path).await {
+        error!("Failed to persist scheduled_once: {e}");
+    }
 }
 
 async fn post_previous_month(
@@ -218,4 +248,45 @@ async fn post_previous_month(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(date: &str, time: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    fn day(date: &str) -> NaiveDate {
+        date.parse().unwrap()
+    }
+
+    #[test]
+    fn fires_within_the_grace_window_not_only_in_the_exact_minute() {
+        let fire = fire_secs(20, 0, 300); // quiz 20:00, reminder 19:55
+        assert_eq!(due_fire_date(at("2026-09-25", "19:54:59"), fire), None);
+        assert_eq!(
+            due_fire_date(at("2026-09-25", "19:55:00"), fire),
+            Some(day("2026-09-25"))
+        );
+        assert_eq!(
+            due_fire_date(at("2026-09-25", "19:59:30"), fire),
+            Some(day("2026-09-25"))
+        );
+        assert_eq!(due_fire_date(at("2026-09-25", "20:00:00"), fire), None);
+    }
+
+    #[test]
+    fn a_window_crossing_midnight_belongs_to_the_previous_day() {
+        let fire = fire_secs(0, 0, 120); // quiz 00:00, reminder 23:58
+        assert_eq!(
+            due_fire_date(at("2026-09-26", "00:01:00"), fire),
+            Some(day("2026-09-25"))
+        );
+        assert_eq!(
+            due_fire_date(at("2026-09-25", "23:58:10"), fire),
+            Some(day("2026-09-25"))
+        );
+    }
 }

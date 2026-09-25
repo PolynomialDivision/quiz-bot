@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
                 if let Some(choice_index) = answer_index {
                     let user = ev.sender.as_str().to_owned();
                     let mut aq = ctx.active_quiz.lock().await;
-                    if let Some(quiz) = aq.as_mut() {
+                    if let Some(quiz) = aq.as_mut().filter(|q| q.is_choice(choice_index)) {
                         quiz.record_answer(user, choice_index, "text");
                     }
                     return;
@@ -295,6 +295,13 @@ async fn main() -> Result<()> {
                         sender = %sender,
                         key,
                         "Reaction ignored — no quiz question is currently active"
+                    ),
+                    quiz::ReactionResult::NotAChoice => info!(
+                        reaction_event_id = %ev.event_id,
+                        reacted_to = %reacted_to,
+                        sender = %sender,
+                        key,
+                        "Reaction ignored — the question has no such answer"
                     ),
                 }
             }
