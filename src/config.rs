@@ -1,5 +1,5 @@
 pub use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -199,6 +199,74 @@ impl Default for TriviaQaConfig {
     }
 }
 
+// ── Runtime settings (`!admin set …`) ─────────────────────────────────────────
+
+/// Where quiz questions come from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionSource {
+    /// OpenTDB, with a share of TriviaQA (`triviaqa_share`).
+    Mixed,
+    /// Only OpenTDB.
+    Opentdb,
+    /// Only TriviaQA (falls back to OpenTDB for a slot it can't fill).
+    Triviaqa,
+}
+
+impl QuestionSource {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "mixed" | "mix" => Some(Self::Mixed),
+            "opentdb" => Some(Self::Opentdb),
+            "triviaqa" | "ai" => Some(Self::Triviaqa),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Opentdb => "opentdb",
+            Self::Triviaqa => "triviaqa",
+        }
+    }
+}
+
+/// Knobs admins can switch in chat (`!admin set question_source triviaqa`)
+/// to test the question sources in a targeted way. Defaults come from
+/// `[trivia.triviaqa]`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QuizSettings {
+    /// `mixed`, `opentdb` or `triviaqa`.
+    pub question_source: QuestionSource,
+    /// Share of TriviaQA questions in `mixed` mode, 0.0–1.0.
+    #[serde(deserialize_with = "share")]
+    pub triviaqa_share: f64,
+}
+
+fn share<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(serde::de::Error::custom("must be between 0.0 and 1.0"))
+    }
+}
+
+impl QuizSettings {
+    pub fn from_config(config: &Config) -> Self {
+        let tq = &config.trivia.triviaqa;
+        QuizSettings {
+            question_source: if tq.enabled {
+                QuestionSource::Mixed
+            } else {
+                QuestionSource::Opentdb
+            },
+            triviaqa_share: tq.mix_ratio.clamp(0.0, 1.0),
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct ExplainerConfig {
     /// Groq API key — leave empty to disable post-question explanations.
@@ -215,6 +283,24 @@ fn default_explainer_model() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiz_settings_validate_the_share_and_parse_sources() {
+        let ok: QuizSettings =
+            serde_json::from_str(r#"{"question_source": "triviaqa", "triviaqa_share": 0.5}"#)
+                .unwrap();
+        assert_eq!(ok.question_source, QuestionSource::Triviaqa);
+        assert!(serde_json::from_str::<QuizSettings>(
+            r#"{"question_source": "mixed", "triviaqa_share": 1.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<QuizSettings>(
+            r#"{"question_source": "wikipedia", "triviaqa_share": 0.5}"#
+        )
+        .is_err());
+        assert_eq!(QuestionSource::parse("AI"), Some(QuestionSource::Triviaqa));
+        assert_eq!(QuestionSource::parse("x"), None);
+    }
 
     #[test]
     fn trivia_defaults_enable_recent_category_history() {

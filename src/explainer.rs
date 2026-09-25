@@ -268,7 +268,14 @@ pub async fn explain(
 
     let user_content = format!("Question: {question}\nAnswer: {answer}");
 
-    let raw = groq::complete(&client, api_key, model, SYSTEM_PROMPT, &user_content).await?;
+    let raw = groq::complete(
+        api_key,
+        model,
+        SYSTEM_PROMPT,
+        &user_content,
+        groq::Options::default(),
+    )
+    .await?;
     let (text, search_term) = parse_response(raw);
 
     if text.trim().is_empty() {

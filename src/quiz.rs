@@ -501,6 +501,7 @@ pub async fn start_quiz(
     client: Client,
     skip_reminder: bool,
     slot_key: Option<String>,
+    source_override: Option<crate::config::QuestionSource>,
 ) -> anyhow::Result<()> {
     let _run_guard = Arc::clone(&ctx.quiz_run_lock)
         .try_lock_owned()
@@ -530,7 +531,8 @@ pub async fn start_quiz(
     let prefetch_handle = {
         let ctx2 = ctx.clone();
         let n = n_questions as usize;
-        tokio::spawn(async move { fetcher::fetch_round_questions(&ctx2, n).await })
+        let source = source_override.unwrap_or_else(|| ctx.settings.get().question_source);
+        tokio::spawn(async move { fetcher::fetch_round_questions(&ctx2, n, source).await })
     };
 
     // ── Reminders ─────────────────────────────────────────────────────────────
@@ -596,7 +598,7 @@ pub async fn start_quiz(
     let Some(round_len) = resolve_round_length(questions.len(), n_questions) else {
         error!("Round prefetch returned no usable questions — skipping this round");
         room.send(RoomMessageEventContent::text_plain(
-            "⚠️ Couldn't prepare any questions for this round (OpenTDB unavailable) — skipping.",
+            "⚠️ Couldn't prepare any questions for this round (no question source available) — skipping.",
         ))
         .await
         .ok();

@@ -84,7 +84,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let client2 = client.clone();
         let slot = time_str.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, Some(slot)).await {
+            if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, Some(slot), None).await {
                 error!("Quiz error: {e}");
             }
         });
@@ -146,7 +146,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let client2 = client.clone();
         tokio::spawn(async move {
             // skip_reminder = false → full reminder flow; slot_key = None → no last_quiz_dates entry.
-            if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, None).await {
+            if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, None, None).await {
                 error!("One-time quiz error: {e}");
             }
         });

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::{state::FetchedQuestion, triviaqa, BotContext};
+use crate::{config::QuestionSource, state::FetchedQuestion, triviaqa, BotContext};
 
 const TOKEN_URL: &str = "https://opentdb.com/api_token.php";
 const API_URL: &str = "https://opentdb.com/api.php";
@@ -811,13 +811,17 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
 /// the round starts, so there are no delays between questions.
 ///
 /// Falls back to the generic cache path for any category that fails.
-pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQuestion> {
+pub async fn fetch_round_questions(
+    ctx: &BotContext,
+    n: usize,
+    source: QuestionSource,
+) -> Vec<FetchedQuestion> {
     // If a category is locked in config, use that for every question and rely
     // on the old next_question path (no per-category pre-fetch needed).
     if ctx.config.trivia.category.is_some() {
         let mut questions = Vec::with_capacity(n);
         for _ in 0..n {
-            match next_question(ctx).await {
+            match next_question(ctx, source).await {
                 Ok(q) => questions.push(q),
                 Err(e) => {
                     warn!("next_question fallback failed: {e}");
@@ -863,14 +867,17 @@ pub async fn fetch_round_questions(ctx: &BotContext, n: usize) -> Vec<FetchedQue
             );
             break;
         }
-        if triviaqa::should_offer(ctx) {
+        if triviaqa::should_offer(ctx, source) {
             let exclude: HashSet<String> = questions
                 .iter()
                 .map(|q| crate::db::normalize_question_text(&q.question))
                 .collect();
-            match triviaqa::next_question(ctx, &exclude).await {
+            // The slot's planned group keeps the round varied, same as for
+            // OpenTDB.
+            match triviaqa::next_question(ctx, &exclude, Some(&choice.group)).await {
                 Ok(q) => {
-                    info!(question = %q.question, "Round question ready: TriviaQA");
+                    info!(question = %q.question, group = %choice.group, "Round question ready: TriviaQA");
+                    avoid_groups.insert(normalise(&choice.group));
                     questions.push(q);
                     continue;
                 }
@@ -1016,7 +1023,7 @@ async fn next_question_avoiding(
     }
 
     warn!("Only one active category group; consecutive category is unavoidable");
-    next_question(ctx).await
+    next_question(ctx, QuestionSource::Opentdb).await
 }
 
 async fn cached_question_excluding(
@@ -1056,13 +1063,16 @@ async fn cached_question_excluding(
 /// After MAX_SKIP consecutive duplicates we give up deduplication and return
 /// the next available question — this prevents an infinite loop when the entire
 /// OpenTDB pool has been exhausted.
-pub async fn next_question(ctx: &BotContext) -> anyhow::Result<FetchedQuestion> {
+pub async fn next_question(
+    ctx: &BotContext,
+    source: QuestionSource,
+) -> anyhow::Result<FetchedQuestion> {
     // No within-round exclusion set here (unlike the main per-category loop
     // in `fetch_round_questions`) — this path is called one question at a
     // time with no visibility into the rest of the round, same as OpenTDB's
     // own dedup here, which likewise relies only on cross-round DB history.
-    if triviaqa::should_offer(ctx) {
-        match triviaqa::next_question(ctx, &HashSet::new()).await {
+    if triviaqa::should_offer(ctx, source) {
+        match triviaqa::next_question(ctx, &HashSet::new(), None).await {
             Ok(q) => return Ok(q),
             Err(e) => info!("TriviaQA: no question available ({e:#}) — falling back to OpenTDB"),
         }
@@ -1353,6 +1363,12 @@ mod token_tests {
         let db = Arc::new(crate::db::Db::open(Path::new(":memory:")).await.unwrap());
         db.migrate().await.unwrap();
         let config: Config = toml::from_str(TEST_CONFIG_TOML).unwrap();
+        let settings = mxbot_common::settings::Settings::load(
+            std::env::temp_dir().join(format!("quiz-settings-{}.json", std::process::id())),
+            crate::config::QuizSettings::from_config(&config),
+        )
+        .await
+        .unwrap();
 
         BotContext {
             state: Arc::new(TokioMutex::new(State::default())),
@@ -1364,6 +1380,7 @@ mod token_tests {
             quiz_run_lock: Arc::new(TokioMutex::new(())),
             client,
             db,
+            settings,
         }
     }
 

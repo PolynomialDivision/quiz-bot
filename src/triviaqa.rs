@@ -1,43 +1,36 @@
 //! TriviaQA as a second question source, alongside OpenTDB (`fetcher.rs`).
 //!
 //! TriviaQA supplies the question and the single verified correct answer,
-//! but has no multiple-choice distractors, category, or difficulty of its
-//! own — so this module asks the same Groq/LLM integration `explainer.rs`
-//! already uses (see `crate::groq`) to generate 3 plausible wrong answers
-//! *and* classify the question into one of the bot's existing category
-//! groups (`fetcher::CATEGORY_GROUPS`) and difficulties (easy/medium/hard),
-//! reusing that vocabulary rather than inventing a TriviaQA-specific one.
-//! The LLM is never given the ability to change the question or correct
-//! answer — it only ever sees them as read-only context in the prompt, and
-//! its reply is parsed *exclusively* into a category/difficulty/distractors
-//! triple (see `validate_generation`). The `FetchedQuestion` returned to the
-//! rest of the bot always carries the question/answer exactly as read from
-//! the TriviaQA dataset.
+//! but no wrong answers, category or difficulty. The LLM (Groq, the same
+//! integration `explainer.rs` uses — see `crate::groq`) prepares those, in
+//! batches of `BATCH_SIZE` questions per call:
+//! - **suitable?** — time-bound, ambiguous, garbled or possibly outdated
+//!   questions are rejected and never asked;
+//! - **category** — one of the bot's own groups (`fetcher::CATEGORY_GROUPS`),
+//!   with a description of what each covers (`GROUP_DESCRIPTIONS`);
+//! - **difficulty** — easy/medium/hard by a fixed rubric;
+//! - **3 wrong answers** of the same kind and form as the correct one.
+//!
+//! The LLM never changes the question or correct answer; its reply is parsed
+//! exclusively into those four fields (`validate_item`). Display-only cleanup
+//! is deterministic: CSV-doubled quotes and all-caps answers
+//! (`clean_question`, `display_answer`).
 //!
 //! ## How it fits the existing architecture
-//! - Sourced questions become an ordinary `state::FetchedQuestion` — the
-//!   same type OpenTDB produces, with a real category group and a real
-//!   easy/medium/hard difficulty — so quiz.rs, format.rs, and the DB layer
-//!   need no source-specific handling downstream, and existing category
-//!   exclusion / diversity / difficulty-filter config applies unchanged
-//!   (see `allowed_category_groups`).
-//! - Dedup/history is the *shared* `questions` table (see
-//!   `db::Db::question_recently_asked`): a TriviaQA question that was
-//!   asked yesterday is exactly as "recently asked" as an OpenTDB one.
-//! - The downloaded dataset itself is ingested once into a dedicated
-//!   `triviaqa_pool` table (not re-parsed into memory on every startup);
-//!   `bot_kv` (already used for other one-shot state) records whether
-//!   ingestion for the current `dataset_url`/`max_pool_size` has run.
-//!   Classification + distractors are likewise generated once per row, on
-//!   first selection, and cached on that row (`Db::save_triviaqa_generation`)
-//!   rather than during ingestion — classifying the full pool up front would
-//!   mean an LLM call per row before the bot could offer anything.
-//! - `fetcher::fetch_round_questions`/`fetcher::next_question` decide,
-//!   per question slot, whether to try this module first — see
-//!   `should_offer`. Any failure (pool empty/exhausted for the active
-//!   filters, every candidate within its reuse cooldown, LLM
-//!   classification/distractor generation failed validation) simply falls
-//!   back to OpenTDB, so TriviaQA is additive, never a hard dependency.
+//! - Results are cached on the `triviaqa_pool` row together with the
+//!   `GENERATION_VERSION` that produced them; bumping it re-classifies older
+//!   rows. `keep_stocked` keeps `READY_TARGET` questions classified in the
+//!   background, so a round never waits for the LLM.
+//! - A prepared question is an ordinary `state::FetchedQuestion` with a real
+//!   category group and difficulty, so quiz.rs, format.rs and the DB need no
+//!   source-specific handling, and category exclusion / round diversity /
+//!   difficulty filters apply unchanged — a round slot asks for its planned
+//!   group (`next_question`'s `wanted_group`).
+//! - Dedup/history is the *shared* `questions` table.
+//! - Which source is used is an admin runtime setting
+//!   (`QuizSettings::question_source`: mixed / opentdb / triviaqa), or per
+//!   round via `!startquiz triviaqa`. Any slot TriviaQA can't fill falls back
+//!   to OpenTDB, so TriviaQA is additive, never a hard dependency.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -50,6 +43,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{
+    config::QuestionSource,
     db::{Db, TriviaQaImportRow, TriviaQaRow},
     fetcher::{self, normalise, QUESTION_REUSE_COOLDOWN_DAYS},
     groq,
@@ -57,44 +51,70 @@ use crate::{
     BotContext,
 };
 
-/// How many distinct pool candidates to try before giving up on TriviaQA
-/// for this question slot and letting the caller fall back to OpenTDB.
-const MAX_SAMPLE_ATTEMPTS: usize = 8;
-/// How many times to ask the LLM for classification + distractors
-/// (including re-prompts after a validation failure) before giving up on
-/// this specific question.
-const MAX_GENERATION_ATTEMPTS: u32 = 2;
+/// Bump whenever the prompt or its rules change: rows classified by an
+/// older version are re-classified (in the background) before being served.
+pub const GENERATION_VERSION: i64 = 2;
+/// Questions per classification call — one prompt handles a whole batch.
+pub const BATCH_SIZE: usize = 10;
+/// Ready (classified, suitable) questions the background task keeps in stock.
+const READY_TARGET: i64 = 300;
+/// Candidates fetched per lookup, to skip recently asked ones.
+const READY_CANDIDATES: usize = 20;
 
-/// Built once per call rather than as a `const` so the category list stays
-/// in sync with `fetcher::CATEGORY_GROUPS` (the bot's single source of
-/// truth for category names) instead of duplicating it here.
+/// What each category group covers — the LLM only sees the names otherwise
+/// and files e.g. a novel's setting under Geography. Must list every entry
+/// of `fetcher::CATEGORY_GROUPS` (checked by a test).
+const GROUP_DESCRIPTIONS: &[(&str, &str)] = &[
+    ("General Knowledge", "everyday facts, words and language, food and drink, customs, mixed trivia that fits no other group"),
+    ("Entertainment", "film, TV, music, books and literature (incl. authors, characters, settings), theatre, video and board games, comics, anime"),
+    ("Science & Technology", "physics, chemistry, biology, medicine, the human body, space, maths, computing, inventions, gadgets"),
+    ("Mythology", "myths, legends, gods and heroes, folklore, religious stories"),
+    ("Sports", "sports, athletes, teams, competitions, rules of games, the Olympics"),
+    ("Geography", "countries, capitals, cities, rivers, mountains, flags, where places or landmarks are"),
+    ("History", "past events, wars, rulers, historical figures, eras, discoveries"),
+    ("Politics", "governments, politicians, elections, political systems, international organisations"),
+    ("Art", "painting, sculpture, architecture, artists, art movements, design"),
+    ("Celebrities", "famous people's lives, nicknames, relationships and scandals (not their works)"),
+    ("Animals", "animals, pets, breeds, zoology"),
+    ("Vehicles", "cars, trains, ships, aircraft, their makers, models and logos"),
+];
+
+/// Built at call time so the category list stays in sync with
+/// `fetcher::CATEGORY_GROUPS` (the bot's single source of truth).
 fn generation_system_prompt() -> String {
-    let categories: Vec<&str> = fetcher::CATEGORY_GROUPS
+    let categories: Vec<String> = fetcher::CATEGORY_GROUPS
         .iter()
-        .map(|(name, _)| *name)
+        .map(|(name, _)| {
+            let description = GROUP_DESCRIPTIONS
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or("", |(_, d)| d);
+            format!("- \"{name}\": {description}")
+        })
         .collect();
     format!(
-        "You classify trivia questions and generate multiple-choice distractors \
-         for a trivia quiz bot.
+        "You prepare trivia questions for a multiple-choice quiz played by adults in a \
+         Matrix chat. For each ITEM (id, question, correct answer) decide:
 
-You will be given a QUESTION and its single CORRECT ANSWER. Reply with
-exactly 5 lines, and nothing else:
+1. suitable — false if the question should not be asked: its answer is time-bound \
+or may be outdated (\"currently\", \"this year\", future tense, records, holders), \
+the question is ambiguous, incomplete or garbled, the answer looks wrong, it needs an \
+image or audio, or the question gives the answer away. Give a short reason.
+2. category — exactly one of these names, by what the question is about:
+{}
+3. difficulty — for a quiz-interested adult who sees 4 options:
+   easy: most people know it; medium: needs some general knowledge; hard: specialist \
+   or obscure knowledge.
+4. wrong_answers — 3 answers that are clearly wrong but plausible to someone unsure: \
+same kind of thing as the correct answer (person/place/year/number/title), similar \
+length and formatting, clearly different from each other, never the correct answer, \
+a synonym or a partial form of it.
 
-CATEGORY: <exactly one of: {}>
-DIFFICULTY: <exactly one of: easy, medium, hard>
-<incorrect but plausible answer 1>
-<incorrect but plausible answer 2>
-<incorrect but plausible answer 3>
-
-Rules:
-- CATEGORY must be copied exactly from the list above — no other wording.
-- DIFFICULTY must be exactly one of: easy, medium, hard.
-- Each distractor line is a short answer in the same style as the correct \
-  answer, with no numbering, bullets, or explanations.
-- All 3 distractors must be wrong, and clearly different from each other.
-- Never output the correct answer or a rephrasing of it.
-- Never output or alter the question itself.",
-        categories.join(", ")
+Never change the question or the correct answer.
+Reply with one JSON object only:
+{{\"items\": [{{\"id\": <id>, \"suitable\": true, \"reason\": \"\", \"category\": \"<name>\", \
+\"difficulty\": \"easy|medium|hard\", \"wrong_answers\": [\"…\", \"…\", \"…\"]}}]}}",
+        categories.join("\n")
     )
 }
 
@@ -301,7 +321,7 @@ pub async fn ensure_ingested(ctx: BotContext) {
 
 async fn ensure_ingested_inner(ctx: &BotContext) -> anyhow::Result<()> {
     let cfg = &ctx.config.trivia.triviaqa;
-    if !cfg.enabled {
+    if ctx.settings.get().question_source == QuestionSource::Opentdb {
         return Ok(());
     }
     let Some(dataset_url) = cfg.dataset_url.as_deref() else {
@@ -343,22 +363,71 @@ async fn already_ingested(db: &Db, key: &str) -> anyhow::Result<bool> {
     Ok(db.kv_get(key).await?.is_some() && db.triviaqa_pool_count().await? > 0)
 }
 
-// ── Classification + distractor generation/validation ─────────────────────────
+// ── Text cleanup ──────────────────────────────────────────────────────────────
 
-/// Find the first line starting with `prefix` (case-insensitive) and return
-/// the trimmed text after it.
-fn extract_field<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
-    raw.lines().find_map(|line| {
-        let t = line.trim();
-        (t.len() >= prefix.len() && t[..prefix.len()].eq_ignore_ascii_case(prefix))
-            .then(|| t[prefix.len()..].trim())
-    })
+/// Tidy a dataset question for display: CSV-style doubled quotes, a pair of
+/// quotes around the whole question, and a missing question mark.
+pub fn clean_question(raw: &str) -> String {
+    let mut q = raw.trim().replace("\"\"", "\"");
+    if q.len() > 2 && q.starts_with('"') && q.ends_with('"') {
+        q = q[1..q.len() - 1].trim().to_owned();
+    }
+    const QUESTION_WORDS: &[&str] = &[
+        "what", "which", "who", "whose", "whom", "where", "when", "why", "how", "in", "on", "at",
+        "of", "for", "from", "by", "to", "is", "are", "was", "were", "did", "does", "do", "can",
+        "name",
+    ];
+    let first = q
+        .split_whitespace()
+        .next()
+        .map(|w| w.to_lowercase())
+        .unwrap_or_default();
+    let ends_bare = q.chars().last().is_some_and(|c| c.is_alphanumeric());
+    if ends_bare && QUESTION_WORDS.contains(&first.as_str()) && first != "name" {
+        q.push('?');
+    }
+    q
 }
 
+/// Answers the dataset stores in all caps (`SCOTTISH TERRIER`) stand out
+/// next to normally written wrong answers and give themselves away — write
+/// them in title case. Short all-caps words (≤ 4 letters: `USA`, `NATO`,
+/// `AC/DC`) are left alone as likely acronyms.
+pub fn display_answer(raw: &str) -> String {
+    let answer = raw.trim();
+    let letters: Vec<char> = answer.chars().filter(|c| c.is_alphabetic()).collect();
+    let all_caps = !letters.is_empty() && letters.iter().all(|c| c.is_uppercase());
+    if !all_caps || letters.len() <= 4 {
+        return answer.to_owned();
+    }
+    answer
+        .split(' ')
+        .enumerate()
+        .map(|(i, word)| {
+            let lower = word.to_lowercase();
+            if i > 0
+                && matches!(
+                    lower.as_str(),
+                    "of" | "the" | "and" | "in" | "on" | "de" | "la"
+                )
+            {
+                return lower;
+            }
+            let mut chars = lower.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ── Classification + distractor generation/validation ─────────────────────────
+
 /// Match free-form LLM output against the bot's actual category groups
-/// (`fetcher::CATEGORY_GROUPS`) — the single source of truth — rather than a
-/// separate TriviaQA-specific list, so a match is guaranteed to plug
-/// straight into the bot's existing category filtering/diversity logic.
+/// (`fetcher::CATEGORY_GROUPS`) — the single source of truth — so a match is
+/// guaranteed to plug straight into the bot's category filtering/diversity.
 fn canonicalize_category_group(raw: &str) -> Option<&'static str> {
     fetcher::CATEGORY_GROUPS
         .iter()
@@ -375,10 +444,9 @@ fn canonicalize_difficulty(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// Extract up to 3 usable distractor lines from an iterator of raw lines
-/// (already excluding any CATEGORY:/DIFFICULTY: header lines) — cleans
-/// numbering/quotes, and drops anything blank, too long, a duplicate, or
-/// matching the correct answer/an alias.
+/// Keep up to 3 usable distractors — cleans numbering/quotes, and drops
+/// anything blank, too long, a duplicate, or matching the correct
+/// answer/an alias.
 fn parse_distractor_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
     correct_answer: &str,
@@ -417,97 +485,239 @@ fn parse_distractor_lines<'a>(
     distractors
 }
 
-/// One successful classification + distractor generation.
-struct Generation {
-    category_group: &'static str,
-    difficulty: &'static str,
-    distractors: Vec<String>,
+#[derive(Deserialize)]
+struct BatchReply {
+    items: Vec<ItemReply>,
 }
 
-/// Parse and validate an LLM response into a category group (one of
-/// `fetcher::CATEGORY_GROUPS`), a difficulty (easy/medium/hard), and exactly
-/// 3 usable distractors — or `None` if any part is missing/invalid. Pure and
-/// network-free — see `triviaqa_tests::validate_generation_*`.
-fn validate_generation(raw: &str, correct_answer: &str, aliases: &[String]) -> Option<Generation> {
-    let category_group = extract_field(raw, "CATEGORY:").and_then(canonicalize_category_group)?;
-    let difficulty = extract_field(raw, "DIFFICULTY:").and_then(canonicalize_difficulty)?;
+#[derive(Deserialize)]
+struct ItemReply {
+    id: i64,
+    #[serde(default = "yes")]
+    suitable: bool,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    difficulty: String,
+    #[serde(default)]
+    wrong_answers: Vec<String>,
+}
 
-    let distractor_lines = raw.lines().filter(|line| {
-        let t = line.trim();
-        !t.to_uppercase().starts_with("CATEGORY:") && !t.to_uppercase().starts_with("DIFFICULTY:")
-    });
-    let distractors = parse_distractor_lines(distractor_lines, correct_answer, aliases);
+fn yes() -> bool {
+    true
+}
 
-    (distractors.len() == 3).then_some(Generation {
+/// What the LLM decided about one question.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Ready {
+        category_group: &'static str,
+        difficulty: &'static str,
+        distractors: Vec<String>,
+    },
+    Unsuitable(String),
+    /// Unusable reply for this item — try again in a later batch.
+    Invalid,
+}
+
+/// Validate one item of a batch reply against its pool row. Pure and
+/// network-free.
+fn validate_item(item: &ItemReply, row: &TriviaQaRow) -> Verdict {
+    if !item.suitable {
+        let reason = item.reason.trim();
+        return Verdict::Unsuitable(if reason.is_empty() {
+            "unsuitable".to_owned()
+        } else {
+            reason.chars().take(200).collect()
+        });
+    }
+    let (Some(category_group), Some(difficulty)) = (
+        canonicalize_category_group(&item.category),
+        canonicalize_difficulty(&item.difficulty),
+    ) else {
+        return Verdict::Invalid;
+    };
+    let answer = display_answer(&row.correct_answer);
+    let distractors = parse_distractor_lines(
+        item.wrong_answers.iter().map(String::as_str),
+        &answer,
+        &row.aliases,
+    );
+    if distractors.len() < 3 {
+        return Verdict::Invalid;
+    }
+    Verdict::Ready {
         category_group,
         difficulty,
         distractors,
-    })
+    }
 }
 
-/// Ask the LLM to classify `candidate` (category group + difficulty, reusing
-/// the bot's existing OpenTDB-derived vocabulary) and generate 3 wrong
-/// answers, retrying a couple of times if the response doesn't validate.
-/// Returns `None` (after logging) if the LLM is unavailable/misconfigured or
-/// never produces a usable response — callers must fall back to another
-/// question rather than serve an under-filled or unclassified one.
-async fn generate(ctx: &BotContext, candidate: &TriviaQaRow) -> Option<Generation> {
+/// Parse a batch reply (a JSON object, possibly wrapped in prose or a code
+/// fence) and validate every item that belongs to `rows`.
+fn parse_batch(raw: &str, rows: &[TriviaQaRow]) -> Vec<(i64, Verdict)> {
+    let json = match (raw.find('{'), raw.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &raw[start..=end],
+        _ => return Vec::new(),
+    };
+    let Ok(reply) = serde_json::from_str::<BatchReply>(json) else {
+        return Vec::new();
+    };
+    reply
+        .items
+        .iter()
+        .filter_map(|item| {
+            let row = rows.iter().find(|r| r.id == item.id)?;
+            Some((item.id, validate_item(item, row)))
+        })
+        .collect()
+}
+
+/// Outcome of one `classify_batch` call.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BatchOutcome {
+    pub ready: usize,
+    pub rejected: usize,
+    pub failed: usize,
+}
+
+/// Classify up to `BATCH_SIZE` pool rows that aren't ready under the current
+/// `GENERATION_VERSION` in a single LLM call, and store the results:
+/// category, difficulty and wrong answers — or a rejection for unsuitable
+/// questions. `None` if the LLM is unavailable (no key, bad model, …).
+pub async fn classify_batch(ctx: &BotContext) -> Option<BatchOutcome> {
     let api_key = ctx.config.explainer.api_key.as_deref()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| warn!("TriviaQA: failed to build Groq client: {e}"))
-        .ok()?;
-
-    let system_prompt = generation_system_prompt();
-    let user_content = format!(
-        "QUESTION: {}\nCORRECT ANSWER: {}",
-        candidate.question_text, candidate.correct_answer
-    );
-
-    for attempt in 1..=MAX_GENERATION_ATTEMPTS {
-        let raw = groq::complete(
-            &client,
-            api_key,
-            &ctx.config.explainer.model,
-            &system_prompt,
-            &user_content,
-        )
-        .await?;
-
-        if let Some(g) = validate_generation(&raw, &candidate.correct_answer, &candidate.aliases) {
-            return Some(g);
+    let rows = match ctx
+        .db
+        .triviaqa_unclassified(GENERATION_VERSION, BATCH_SIZE)
+        .await
+    {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => return Some(BatchOutcome::default()),
+        Err(e) => {
+            warn!("TriviaQA: reading unclassified rows failed: {e:#}");
+            return None;
         }
-        warn!(
-            "TriviaQA: LLM classification/distractors failed validation for {:?} \
-             (attempt {attempt}/{MAX_GENERATION_ATTEMPTS})",
-            candidate.question_text
-        );
+    };
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "question": clean_question(&r.question_text),
+                "correct_answer": display_answer(&r.correct_answer),
+            })
+        })
+        .collect();
+    let user_content = serde_json::json!({ "items": items }).to_string();
+
+    let raw = groq::complete(
+        api_key,
+        &ctx.config.explainer.model,
+        &generation_system_prompt(),
+        &user_content,
+        groq::Options {
+            max_tokens: 6000,
+            json: true,
+        },
+    )
+    .await?;
+
+    let mut outcome = BatchOutcome::default();
+    let verdicts = parse_batch(&raw, &rows);
+    for row in &rows {
+        match verdicts
+            .iter()
+            .find(|(id, _)| *id == row.id)
+            .map(|(_, v)| v)
+        {
+            Some(Verdict::Ready {
+                category_group,
+                difficulty,
+                distractors,
+            }) => {
+                if let Err(e) = ctx
+                    .db
+                    .save_triviaqa_generation(
+                        row.id,
+                        GENERATION_VERSION,
+                        category_group,
+                        difficulty,
+                        distractors,
+                    )
+                    .await
+                {
+                    warn!("TriviaQA: saving classification failed: {e:#}");
+                }
+                outcome.ready += 1;
+            }
+            Some(Verdict::Unsuitable(reason)) => {
+                info!(question = %row.question_text, %reason, "TriviaQA: rejected as unsuitable");
+                ctx.db
+                    .reject_triviaqa(row.id, GENERATION_VERSION, reason)
+                    .await
+                    .ok();
+                outcome.rejected += 1;
+            }
+            Some(Verdict::Invalid) | None => outcome.failed += 1,
+        }
     }
-    None
+    info!(?outcome, "TriviaQA: classified a batch");
+    Some(outcome)
+}
+
+/// Background task: keep `READY_TARGET` classified questions in stock, so a
+/// round never waits for the LLM. Idles while the source is `opentdb`.
+pub async fn keep_stocked(ctx: BotContext) {
+    loop {
+        let wait = match stock_step(&ctx).await {
+            Some(true) => 30,
+            _ => 600,
+        };
+        tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+    }
+}
+
+/// One step of `keep_stocked`: `Some(true)` if it classified a batch and
+/// more are needed.
+async fn stock_step(ctx: &BotContext) -> Option<bool> {
+    if ctx.settings.get().question_source == QuestionSource::Opentdb
+        || ctx.config.explainer.api_key.is_none()
+    {
+        return None;
+    }
+    ensure_ingested(ctx.clone()).await;
+    let stats = ctx.db.triviaqa_stats(GENERATION_VERSION).await.ok()?;
+    if stats.total == 0 || stats.ready >= READY_TARGET {
+        return Some(false);
+    }
+    let outcome = classify_batch(ctx).await?;
+    Some(outcome.ready + outcome.rejected + outcome.failed > 0)
 }
 
 // ── Public: offer a question for a round slot ────────────────────────────────
 
-/// Whether this question slot should be attempted from TriviaQA at all —
-/// enabled in config, a Groq key is configured (needed for classification
-/// and distractors), and a random roll against `mix_ratio`. Doesn't check
-/// the pool itself; `next_question` naturally falls through to an error
-/// (and the caller to OpenTDB) if the pool turns out to be empty or
-/// exhausted.
-pub fn should_offer(ctx: &BotContext) -> bool {
-    let cfg = &ctx.config.trivia.triviaqa;
-    cfg.enabled
-        && ctx.config.explainer.api_key.is_some()
-        && rand::thread_rng().gen_bool(cfg.mix_ratio.clamp(0.0, 1.0))
+/// Whether this question slot should be attempted from TriviaQA at all:
+/// the source setting allows it, a Groq key is configured, and — in `mixed`
+/// mode — a random roll against `triviaqa_share`.
+pub fn should_offer(ctx: &BotContext, source: QuestionSource) -> bool {
+    if ctx.config.explainer.api_key.is_none() {
+        return false;
+    }
+    match source {
+        QuestionSource::Opentdb => false,
+        QuestionSource::Triviaqa => true,
+        QuestionSource::Mixed => {
+            rand::thread_rng().gen_bool(ctx.settings.get().triviaqa_share.clamp(0.0, 1.0))
+        }
+    }
 }
 
-/// Which category groups a TriviaQA candidate is allowed to belong to,
-/// mirroring how OpenTDB itself is restricted by `trivia.category` /
-/// `trivia.excluded_categories` — a fixed category maps to that category's
-/// group (`None` if it's outside our known groups, meaning TriviaQA simply
-/// can't contribute in this config), otherwise every non-excluded group is
-/// allowed, same as OpenTDB's own balanced selection.
+/// Which category groups a TriviaQA question may belong to, mirroring how
+/// OpenTDB itself is restricted by `trivia.category` /
+/// `trivia.excluded_categories`.
 fn allowed_category_groups(ctx: &BotContext) -> Option<Vec<&'static str>> {
     let trivia = &ctx.config.trivia;
     match trivia.category {
@@ -521,108 +731,103 @@ fn allowed_category_groups(ctx: &BotContext) -> Option<Vec<&'static str>> {
     }
 }
 
-/// Produce one TriviaQA-sourced question, or an error the caller should
-/// treat as "fall back to OpenTDB for this slot".
+/// Turn a ready pool row into a quiz question (cleaned text, display-cased
+/// answer).
+fn to_question(row: TriviaQaRow) -> Option<FetchedQuestion> {
+    Some(FetchedQuestion {
+        category: row.category_group?,
+        difficulty: row.difficulty?,
+        question: clean_question(&row.question_text),
+        correct_answer: display_answer(&row.correct_answer),
+        incorrect_answers: row.distractors.filter(|d| d.len() == 3)?,
+    })
+}
+
+/// Produce one TriviaQA question, or an error the caller should treat as
+/// "fall back to OpenTDB for this slot". Only serves already classified
+/// questions (see `keep_stocked`) — the round never waits for the LLM,
+/// except when nothing is in stock yet at all.
 ///
-/// `exclude_normalized` is the set of normalized question texts already
-/// picked for the *current* round (from either source) — history in the DB
-/// only covers questions from *past* rounds (they're recorded once posted,
-/// which happens after the whole round is assembled), so this catches an
-/// in-progress round accidentally sampling the same TriviaQA row twice.
-///
-/// Respects the same `trivia.category` / `trivia.excluded_categories` /
-/// `trivia.difficulty` config OpenTDB honors, via `fetcher`'s own group
-/// vocabulary — see `allowed_category_groups`.
+/// `wanted_group` is the category group the round planned for this slot
+/// (keeps rounds varied); `exclude_normalized` the questions already picked
+/// for the current round.
 pub async fn next_question(
     ctx: &BotContext,
     exclude_normalized: &HashSet<String>,
+    wanted_group: Option<&str>,
 ) -> anyhow::Result<FetchedQuestion> {
-    let Some(allowed_groups) = allowed_category_groups(ctx) else {
+    let Some(allowed) = allowed_category_groups(ctx) else {
         anyhow::bail!(
             "fixed OpenTDB category {:?} has no TriviaQA-mapped group",
             ctx.config.trivia.category
         );
     };
-    let allowed_groups: Vec<&str> = allowed_groups;
-    let filter_difficulty = ctx.config.trivia.difficulty.as_deref();
-
-    for attempt in 1..=MAX_SAMPLE_ATTEMPTS {
-        let Some(candidate) = ctx
-            .db
-            .sample_triviaqa_candidate(&allowed_groups, filter_difficulty)
-            .await?
-        else {
-            anyhow::bail!("TriviaQA pool has no matching candidate");
-        };
-
-        let normalized = crate::db::normalize_question_text(&candidate.question_text);
-        if exclude_normalized.contains(&normalized) {
-            continue;
-        }
-        let recently_asked = ctx
-            .db
-            .question_recently_asked(&candidate.question_text, QUESTION_REUSE_COOLDOWN_DAYS)
-            .await
-            .unwrap_or(false);
-        if recently_asked {
-            continue;
-        }
-
-        let (category_group, difficulty, distractors) = match (
-            candidate.category_group.clone(),
-            candidate.difficulty.clone(),
-            candidate.distractors.clone(),
-        ) {
-            (Some(cg), Some(diff), Some(d)) if d.len() == 3 => (cg, diff, d),
-            _ => {
-                let Some(g) = generate(ctx, &candidate).await else {
-                    // This specific question didn't pan out — try another
-                    // candidate rather than giving up on TriviaQA entirely.
-                    continue;
-                };
-                ctx.db
-                    .save_triviaqa_generation(
-                        candidate.id,
-                        g.category_group,
-                        g.difficulty,
-                        &g.distractors,
-                    )
-                    .await?;
-                // Freshly classified but not what this slot needs (e.g. the
-                // fixed category/difficulty didn't match) — it's cached now
-                // for a future slot that does want it, but not this one.
-                let group_matches = allowed_groups
-                    .iter()
-                    .any(|allowed| normalise(allowed) == normalise(g.category_group));
-                let difficulty_matches = filter_difficulty.is_none_or(|d| d == g.difficulty);
-                if !group_matches || !difficulty_matches {
-                    continue;
-                }
-                (
-                    g.category_group.to_owned(),
-                    g.difficulty.to_owned(),
-                    g.distractors,
-                )
-            }
-        };
-
-        info!(
-            attempt,
-            question = %candidate.question_text,
-            category_group,
-            difficulty,
-            "TriviaQA: question ready"
-        );
-        return Ok(FetchedQuestion {
-            category: category_group,
-            difficulty,
-            question: candidate.question_text,
-            correct_answer: candidate.correct_answer,
-            incorrect_answers: distractors,
-        });
+    let groups: Vec<&str> = match wanted_group {
+        Some(wanted) => allowed
+            .into_iter()
+            .filter(|g| normalise(g) == normalise(wanted))
+            .collect(),
+        None => allowed,
+    };
+    if groups.is_empty() {
+        anyhow::bail!("group {wanted_group:?} is not active");
     }
+    let difficulty = ctx.config.trivia.difficulty.as_deref();
 
-    anyhow::bail!("no usable TriviaQA candidate found after {MAX_SAMPLE_ATTEMPTS} attempts")
+    for round in 0..2 {
+        let candidates = ctx
+            .db
+            .triviaqa_ready(GENERATION_VERSION, &groups, difficulty, READY_CANDIDATES)
+            .await?;
+        for row in candidates {
+            let text = clean_question(&row.question_text);
+            if exclude_normalized.contains(&crate::db::normalize_question_text(&text)) {
+                continue;
+            }
+            let recently_asked = ctx
+                .db
+                .question_recently_asked(&text, QUESTION_REUSE_COOLDOWN_DAYS)
+                .await
+                .unwrap_or(false);
+            if recently_asked {
+                continue;
+            }
+            let id = row.id;
+            if let Some(q) = to_question(row) {
+                info!(id, question = %q.question, category = %q.category, difficulty = %q.difficulty, "TriviaQA: question ready");
+                return Ok(q);
+            }
+        }
+        // Nothing in stock for this slot. Only a round without a specific
+        // group waits for one fresh batch; a planned group falls back to
+        // OpenTDB right away.
+        if round == 0 && wanted_group.is_none() {
+            ensure_ingested(ctx.clone()).await;
+            if classify_batch(ctx).await.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    anyhow::bail!("no classified TriviaQA question in stock for {groups:?}")
+}
+
+/// Admin preview: a ready question with its classification, without
+/// recording it as asked.
+pub async fn preview(
+    ctx: &BotContext,
+    group: Option<&str>,
+) -> anyhow::Result<Option<(i64, FetchedQuestion)>> {
+    let groups: Vec<&str> = group.into_iter().collect();
+    let rows = ctx
+        .db
+        .triviaqa_ready(GENERATION_VERSION, &groups, None, 1)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| Some((row.id, to_question(row)?))))
 }
 
 #[cfg(test)]
@@ -813,20 +1018,7 @@ mod triviaqa_tests {
         assert_eq!(d, vec!["Michelangelo", "Raphael", "Donatello"]);
     }
 
-    // ── extract_field / canonicalize_* ───────────────────────────────────
-
-    #[test]
-    fn extract_field_is_case_insensitive_and_trims() {
-        assert_eq!(
-            extract_field("category:  History  ", "CATEGORY:"),
-            Some("History")
-        );
-        assert_eq!(
-            extract_field("Category: History", "CATEGORY:"),
-            Some("History")
-        );
-        assert_eq!(extract_field("Something else", "CATEGORY:"), None);
-    }
+    // ── canonicalize_* ───────────────────────────────────────────────────
 
     #[test]
     fn canonicalize_category_group_matches_known_groups_case_and_amp_insensitively() {
@@ -845,56 +1037,115 @@ mod triviaqa_tests {
         assert_eq!(canonicalize_difficulty("impossible"), None);
     }
 
-    // ── validate_generation ───────────────────────────────────────────────
-
-    const GOOD_GENERATION_RESPONSE: &str = "\
-CATEGORY: Art
-DIFFICULTY: medium
-Michelangelo
-Raphael
-Donatello";
-
     #[test]
-    fn validate_generation_accepts_a_well_formed_response() {
-        let g = validate_generation(GOOD_GENERATION_RESPONSE, "Leonardo da Vinci", &[]).unwrap();
-        assert_eq!(g.category_group, "Art");
-        assert_eq!(g.difficulty, "medium");
-        assert_eq!(g.distractors, vec!["Michelangelo", "Raphael", "Donatello"]);
+    fn every_category_group_is_described_in_the_prompt() {
+        let prompt = generation_system_prompt();
+        for (name, _) in fetcher::CATEGORY_GROUPS {
+            let description = GROUP_DESCRIPTIONS.iter().find(|(n, _)| n == name);
+            assert!(description.is_some(), "{name} has no description");
+            assert!(
+                prompt.contains(&format!("\"{name}\": ")),
+                "{name} missing from prompt"
+            );
+        }
+    }
+
+    // ── batch replies ────────────────────────────────────────────────────
+
+    fn row(id: i64, question: &str, answer: &str) -> TriviaQaRow {
+        TriviaQaRow {
+            id,
+            question_text: question.to_owned(),
+            correct_answer: answer.to_owned(),
+            aliases: vec!["Leonardo".to_owned()],
+            category_group: None,
+            difficulty: None,
+            distractors: None,
+        }
     }
 
     #[test]
-    fn validate_generation_rejects_an_unrecognized_category() {
-        let raw =
-            "CATEGORY: Renaissance Trivia\nDIFFICULTY: medium\nMichelangelo\nRaphael\nDonatello";
-        assert!(validate_generation(raw, "Leonardo da Vinci", &[]).is_none());
+    fn a_batch_reply_is_validated_item_by_item() {
+        let rows = vec![
+            row(1, "Who painted the Mona Lisa?", "Leonardo da Vinci"),
+            row(
+                2,
+                "Which rugby team will play at Langtree Park in 2012?",
+                "St Helens",
+            ),
+            row(3, "What is the capital of France?", "Paris"),
+            row(4, "Who wrote Hamlet?", "Shakespeare"),
+        ];
+        let raw = r#"Sure! ```json
+{"items": [
+  {"id": 1, "suitable": true, "category": "art", "difficulty": "Easy",
+   "wrong_answers": ["Michelangelo", "Leonardo", "Raphael", "Titian"]},
+  {"id": 2, "suitable": false, "reason": "time-bound"},
+  {"id": 3, "suitable": true, "category": "Cooking", "difficulty": "easy",
+   "wrong_answers": ["Lyon", "Nice", "Lille"]},
+  {"id": 99, "suitable": true, "category": "Art", "difficulty": "easy",
+   "wrong_answers": ["a", "b", "c"]}
+]}
+```"#;
+        let verdicts = parse_batch(raw, &rows);
+        assert_eq!(
+            verdicts.len(),
+            3,
+            "unknown ids are ignored, missing ones absent"
+        );
+        assert_eq!(
+            verdicts[0],
+            (
+                1,
+                Verdict::Ready {
+                    category_group: "Art",
+                    difficulty: "easy",
+                    // The alias "Leonardo" is never a wrong answer.
+                    distractors: vec!["Michelangelo".into(), "Raphael".into(), "Titian".into()],
+                }
+            )
+        );
+        assert_eq!(verdicts[1], (2, Verdict::Unsuitable("time-bound".into())));
+        assert_eq!(verdicts[2], (3, Verdict::Invalid), "unknown category");
+        assert!(parse_batch("no json here", &rows).is_empty());
     }
 
     #[test]
-    fn validate_generation_rejects_an_unrecognized_difficulty() {
-        let raw = "CATEGORY: Art\nDIFFICULTY: extreme\nMichelangelo\nRaphael\nDonatello";
-        assert!(validate_generation(raw, "Leonardo da Vinci", &[]).is_none());
+    fn too_few_distinct_wrong_answers_are_invalid() {
+        let rows = vec![row(1, "Capital of France?", "PARIS")];
+        let raw = r#"{"items": [{"id": 1, "suitable": true, "category": "Geography",
+            "difficulty": "easy", "wrong_answers": ["Paris", "Lyon", "lyon"]}]}"#;
+        assert_eq!(parse_batch(raw, &rows), vec![(1, Verdict::Invalid)]);
+    }
+
+    // ── text cleanup ─────────────────────────────────────────────────────
+
+    #[test]
+    fn questions_lose_csv_quotes_and_gain_a_question_mark() {
+        assert_eq!(
+            clean_question(r#""In what city did James Joyce's ""Ulysses"" take place?""#),
+            r#"In what city did James Joyce's "Ulysses" take place?"#
+        );
+        assert_eq!(
+            clean_question("What was Ian Fleming’s first Bond book"),
+            "What was Ian Fleming’s first Bond book?"
+        );
+        assert_eq!(
+            clean_question("Name the largest ocean"),
+            "Name the largest ocean"
+        );
+        assert_eq!(clean_question("Who is it?"), "Who is it?");
     }
 
     #[test]
-    fn validate_generation_rejects_a_missing_header() {
-        assert!(validate_generation(
-            "DIFFICULTY: medium\nMichelangelo\nRaphael\nDonatello",
-            "Leonardo da Vinci",
-            &[]
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn validate_generation_does_not_mistake_a_header_line_for_a_distractor() {
-        // 5 lines total, but only 3 are real distractor candidates once the
-        // two header lines are excluded from that pass.
-        let g = validate_generation(GOOD_GENERATION_RESPONSE, "Leonardo da Vinci", &[]).unwrap();
-        assert_eq!(g.distractors.len(), 3);
-        assert!(!g
-            .distractors
-            .iter()
-            .any(|d| d.to_lowercase().contains("category")));
+    fn all_caps_answers_are_title_cased_but_acronyms_kept() {
+        assert_eq!(display_answer("SCOTTISH TERRIER"), "Scottish Terrier");
+        assert_eq!(display_answer("CHILE"), "Chile");
+        assert_eq!(display_answer("BAY OF BISCAY"), "Bay of Biscay");
+        assert_eq!(display_answer("USA"), "USA");
+        assert_eq!(display_answer("NATO"), "NATO");
+        assert_eq!(display_answer("Leonardo da Vinci"), "Leonardo da Vinci");
+        assert_eq!(display_answer("1066"), "1066");
     }
 
     // ── ingest key ───────────────────────────────────────────────────────

@@ -70,25 +70,35 @@ recent_category_window = 5
 # process or configuration required.
 
 [trivia.triviaqa]
-# Optional secondary question source: real TriviaQA questions/answers with
-# LLM-generated wrong answers (via [explainer].api_key). Off by default.
+# Optional secondary question source: real TriviaQA questions/answers. The
+# LLM ([explainer] api_key/model) checks each question is suitable (drops
+# time-bound or ambiguous ones), files it into one of the categories above,
+# rates its difficulty and writes 3 wrong answers — in the background, in
+# batches, so rounds never wait for it.
+# `enabled` is only the default: admins switch the source at runtime with
+#   !admin set question_source mixed|opentdb|triviaqa
+#   !admin set triviaqa_share 0.5
+# test one round with !startquiz triviaqa, and inspect/curate with !triviaqa.
 enabled = false
 
 # Where to download the TriviaQA dataset from on first use (downloaded once
 # and cached in the database — not re-downloaded on later restarts). Point
 # this straight at the official release's .tar.gz — the bot reads it
-# natively (picks the *-dev.json split out of the archive), no manual
-# extraction or re-hosting needed. Plain/gzipped JSON matching TriviaQA's
-# schema also works, e.g. to point at your own mirror or subset.
+# natively (picks the *-dev.json split out of the archive).
 # dataset_url = "https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz"
 
 # Cap on how many QA pairs to ingest from the dataset (default 20000).
 # max_pool_size = 20000
 
-# Fraction of quiz questions drawn from TriviaQA when enabled and the pool
-# has usable questions (0.0-1.0, default 0.3). The rest, and any slot
-# TriviaQA can't fill, falls back to OpenTDB.
+# Default share of TriviaQA questions in `mixed` mode (0.0-1.0, default 0.3).
 # mix_ratio = 0.3
+
+[explainer]
+# Groq API key: enables explanations after each question and TriviaQA.
+# api_key = "gsk_..."
+# Model id exactly as listed on https://console.groq.com/docs/models
+# (default llama-3.3-70b-versatile; e.g. "openai/gpt-oss-120b").
+# model = "llama-3.3-70b-versatile"
 
 [security.verification]
 # Users allowed to complete first-time verification. If omitted or empty,

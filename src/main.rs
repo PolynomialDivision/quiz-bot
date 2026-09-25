@@ -16,6 +16,7 @@ use mxbot_common::{
         Client, Room, RoomState,
     },
     send::{in_thread, thread_root},
+    settings::Settings,
     Bot,
 };
 use tokio::sync::Mutex;
@@ -48,6 +49,8 @@ pub struct BotContext {
     pub quiz_run_lock: Arc<Mutex<()>>,
     pub client: Client,
     pub db: Arc<db::Db>,
+    /// Admin-switchable knobs (`!admin set question_source triviaqa`).
+    pub settings: Settings<config::QuizSettings>,
 }
 
 /// Run one `!command` and build the reply, or `None` when there is nothing
@@ -108,10 +111,19 @@ async fn main() -> Result<()> {
     let room_id =
         mxbot_common::rooms::parse_room_id("[schedule] room_id", &config.schedule.room_id)?;
 
+    let settings = Settings::load(
+        store_path.join("settings.json"),
+        config::QuizSettings::from_config(&config),
+    )
+    .await?;
+
     let bot = Bot::builder("quiz-bot", env!("CARGO_PKG_VERSION"))
         .store_path(&store_path)
+        .settings(settings.store().clone())
         .admin_help(
-            "!startquiz · !schedulequiz · !cancelquiz · !prefetch · !resetstats · !catconfig",
+            "!startquiz [triviaqa|opentdb|mixed] · !triviaqa · !schedulequiz · !cancelquiz · \
+             !prefetch · !resetstats · !catconfig\n\
+             Settings: question_source (mixed|opentdb|triviaqa), triviaqa_share (0.0–1.0)",
         )
         .start(&config.matrix, &config.security)
         .await?;
@@ -128,6 +140,7 @@ async fn main() -> Result<()> {
         quiz_run_lock: Arc::new(Mutex::new(())),
         client: client.clone(),
         db,
+        settings,
     };
 
     // ── Message / command handler ─────────────────────────────────────────────
@@ -292,7 +305,7 @@ async fn main() -> Result<()> {
     bot.initial_sync().await;
     info!("Initial sync complete");
 
-    tokio::spawn(triviaqa::ensure_ingested(ctx.clone()));
+    tokio::spawn(triviaqa::keep_stocked(ctx.clone()));
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
     bot.run().await

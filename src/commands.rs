@@ -5,13 +5,19 @@ use matrix_sdk::ruma::OwnedUserId;
 use mxbot_common::matrix_sdk;
 use tracing::error;
 
-use crate::{config::ScheduleConfig, fetcher, state::ScheduledOnce, BotContext};
+use crate::{
+    config::{QuestionSource, ScheduleConfig},
+    fetcher,
+    state::ScheduledOnce,
+    triviaqa, BotContext,
+};
 
 pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     let cmd = body.split_whitespace().next().unwrap_or("").to_lowercase();
 
     match cmd.as_str() {
-        "!startquiz" => cmd_startquiz(ctx, sender).await,
+        "!startquiz" => cmd_startquiz(ctx, sender, body).await,
+        "!triviaqa" => cmd_triviaqa(ctx, sender, body).await,
         "!schedulequiz" => cmd_schedulequiz(ctx, sender, body).await,
         "!cancelquiz" => cmd_cancelquiz(ctx, sender, body).await,
         "!prefetch" => cmd_prefetch(ctx, sender).await,
@@ -36,8 +42,24 @@ fn require_admin(ctx: &BotContext, sender: &OwnedUserId) -> Result<()> {
 
 // ── !startquiz ────────────────────────────────────────────────────────────────
 
-async fn cmd_startquiz(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<String>> {
+async fn cmd_startquiz(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
+    // `!startquiz triviaqa` — one round from one source, to test it.
+    let source = match body.split_whitespace().nth(1) {
+        Some(arg) => match QuestionSource::parse(arg) {
+            Some(source) => Some(source),
+            None => {
+                return Ok(Some(
+                    "Usage: !startquiz [triviaqa|opentdb|mixed]".to_owned(),
+                ))
+            }
+        },
+        None => None,
+    };
 
     if ctx.quiz_run_lock.try_lock().is_err() {
         return Ok(Some("⚠️ A quiz is already in progress!".to_owned()));
@@ -46,15 +68,150 @@ async fn cmd_startquiz(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<
     let ctx2 = ctx.clone();
     let client = ctx.client.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::quiz::start_quiz(ctx2, client, true, None).await {
+        if let Err(e) = crate::quiz::start_quiz(ctx2, client, true, None, source).await {
             error!("Manual quiz error: {e}");
         }
     });
 
+    let source = source.unwrap_or_else(|| ctx.settings.get().question_source);
     Ok(Some(format!(
-        "🎯 Quiz starting · {} per question",
+        "🎯 Quiz starting · {} per question · questions: {}",
         format_duration(ctx.config.schedule.answer_timeout_secs),
+        source.label(),
     )))
+}
+
+// ── !triviaqa ─────────────────────────────────────────────────────────────────
+//
+// Admin tools for the AI-prepared TriviaQA questions: stock overview, a
+// preview of a ready question with its category/difficulty/answers, a manual
+// classification run, and rejecting a bad question.
+
+async fn cmd_triviaqa(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
+    require_admin(ctx, sender)?;
+    let args: Vec<&str> = body.split_whitespace().skip(1).collect();
+    let usage = "Usage: !triviaqa [status] | sample [group] | classify [n] | reject <id>";
+    match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+        None | Some("status") => {
+            let stats = ctx.db.triviaqa_stats(triviaqa::GENERATION_VERSION).await?;
+            let settings = ctx.settings.get();
+            let mut lines = vec![
+                "🤖 **TriviaQA**".to_owned(),
+                format!(
+                    "Source: {} · TriviaQA share in mixed: {:.0}%",
+                    settings.question_source.label(),
+                    settings.triviaqa_share * 100.0
+                ),
+                format!(
+                    "Pool: {} · ready: {} · rejected as unsuitable: {} · model: {}",
+                    stats.total, stats.ready, stats.rejected, ctx.config.explainer.model
+                ),
+            ];
+            if ctx.config.explainer.api_key.is_none() {
+                lines.push("⚠️ No [explainer] api_key — TriviaQA cannot be prepared.".to_owned());
+            }
+            let mut groups: Vec<(String, [i64; 3])> = Vec::new();
+            for (group, difficulty, n) in &stats.by_group {
+                let idx = match difficulty.as_str() {
+                    "easy" => 0,
+                    "medium" => 1,
+                    _ => 2,
+                };
+                match groups.iter_mut().find(|(g, _)| g == group) {
+                    Some((_, counts)) => counts[idx] += n,
+                    None => {
+                        let mut counts = [0; 3];
+                        counts[idx] = *n;
+                        groups.push((group.clone(), counts));
+                    }
+                }
+            }
+            if !groups.is_empty() {
+                lines.push(String::new());
+                lines.push("Ready per category (🟢 easy · 🟡 medium · 🔴 hard):".to_owned());
+                for (group, [e, m, h]) in groups {
+                    lines.push(format!("{group}: 🟢{e} 🟡{m} 🔴{h}"));
+                }
+            }
+            lines.push(String::new());
+            lines.push(
+                "Switch: !admin set question_source triviaqa|opentdb|mixed · test one round: !startquiz triviaqa"
+                    .to_owned(),
+            );
+            Ok(Some(lines.join("\n")))
+        }
+        Some("sample") => {
+            let group = (args.len() > 1).then(|| args[1..].join(" "));
+            let group = match group {
+                Some(name) => match fetcher::CATEGORY_GROUPS
+                    .iter()
+                    .find(|(g, _)| fetcher::normalise(g) == fetcher::normalise(&name))
+                {
+                    Some((g, _)) => Some(*g),
+                    None => return Ok(Some(format!("Unknown category «{name}»."))),
+                },
+                None => None,
+            };
+            match triviaqa::preview(ctx, group).await? {
+                None => Ok(Some(
+                    "No ready TriviaQA question yet — try !triviaqa classify.".to_owned(),
+                )),
+                Some((id, q)) => {
+                    let mut lines = vec![
+                        format!("🔎 TriviaQA #{id} · {} · {}", q.category, q.difficulty),
+                        q.question.clone(),
+                        format!("✅ {}", q.correct_answer),
+                    ];
+                    lines.extend(q.incorrect_answers.iter().map(|a| format!("❌ {a}")));
+                    lines.push(format!("Bad? !triviaqa reject {id}"));
+                    Ok(Some(lines.join("\n")))
+                }
+            }
+        }
+        Some("classify") => {
+            let n: usize = args
+                .get(1)
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(triviaqa::BATCH_SIZE)
+                .clamp(1, 100);
+            triviaqa::ensure_ingested(ctx.clone()).await;
+            let mut total = triviaqa::BatchOutcome::default();
+            for _ in 0..n.div_ceil(triviaqa::BATCH_SIZE) {
+                let Some(outcome) = triviaqa::classify_batch(ctx).await else {
+                    return Ok(Some(
+                        "❌ The LLM is not reachable — check [explainer] api_key/model and the logs."
+                            .to_owned(),
+                    ));
+                };
+                total.ready += outcome.ready;
+                total.rejected += outcome.rejected;
+                total.failed += outcome.failed;
+            }
+            Ok(Some(format!(
+                "✅ Classified: {} ready · {} rejected as unsuitable · {} to retry",
+                total.ready, total.rejected, total.failed
+            )))
+        }
+        Some("reject") => {
+            let Some(id) = args.get(1).and_then(|id| id.parse::<i64>().ok()) else {
+                return Ok(Some(usage.to_owned()));
+            };
+            if ctx
+                .db
+                .reject_triviaqa(id, triviaqa::GENERATION_VERSION, "rejected by admin")
+                .await?
+            {
+                Ok(Some(format!("🗑️ TriviaQA #{id} will not be asked.")))
+            } else {
+                Ok(Some(format!("TriviaQA #{id} not found.")))
+            }
+        }
+        Some(_) => Ok(Some(usage.to_owned())),
+    }
 }
 
 // ── !prefetch ─────────────────────────────────────────────────────────────────
@@ -328,6 +485,16 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
         format_duration(s.answer_timeout_secs),
     ));
 
+    let settings = ctx.settings.get();
+    lines.push(match settings.question_source {
+        QuestionSource::Opentdb => "📚 Questions: Open Trivia DB".to_owned(),
+        QuestionSource::Triviaqa => "📚 Questions: TriviaQA (AI-prepared answers)".to_owned(),
+        QuestionSource::Mixed => format!(
+            "📚 Questions: Open Trivia DB + {:.0}% TriviaQA (AI-prepared answers)",
+            settings.triviaqa_share * 100.0
+        ),
+    });
+
     match ctx.config.trivia.category {
         Some(id) => lines.push(format!("🗂️ Fixed category (OpenTDB id {id})")),
         None => {
@@ -596,7 +763,9 @@ fn help_text() -> String {
 !help · this message
 
 **Admin:**
-!startquiz · start now
+!startquiz [triviaqa|opentdb|mixed] · start now (optionally from one source)
+!triviaqa · AI-prepared questions: status · sample · classify · reject
+!admin set question_source triviaqa|opentdb|mixed · switch the source
 !schedulequiz HH:MM · schedule once
 !schedulequiz · list pending
 !cancelquiz HH:MM · cancel
