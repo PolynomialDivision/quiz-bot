@@ -54,19 +54,11 @@ pub struct FetchedQuestion {
 
 impl State {
     pub async fn load(path: &Path) -> Result<Self> {
-        if tokio::fs::metadata(path).await.is_ok() {
-            let s = tokio::fs::read_to_string(path).await?;
-            Ok(serde_json::from_str(&s)?)
-        } else {
-            Ok(Self::default())
-        }
+        mxbot_common::persist::load_json_or_default(path).await
     }
 
     pub async fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, serde_json::to_string_pretty(self)?).await?;
-        tokio::fs::rename(&tmp, path).await?;
-        Ok(())
+        mxbot_common::persist::save_json_atomic(path, self).await
     }
 }
 

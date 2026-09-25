@@ -2339,16 +2339,19 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mxbot-common"
-version = "0.1.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#f1196f44ea2ffa21c908df52e3cd8d1907f8f813"
+version = "0.2.0"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#89d0ed0b60e60ee7beeb4cf79f83197cc87943ce"
 dependencies = [
  "anyhow",
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
  "serde",
+ "serde_json",
  "tokio",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2770,7 +2773,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "flate2",
- "matrix-sdk",
  "mime",
  "mxbot-common",
  "rand 0.8.8",
@@ -2782,7 +2784,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
- "tracing-subscriber",
  "wiremock",
 ]
 
@@ -3917,10 +3918,12 @@ version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
+ "indexmap",
  "serde_core",
  "serde_spanned 1.1.1",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
@@ -3982,6 +3985,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tower"

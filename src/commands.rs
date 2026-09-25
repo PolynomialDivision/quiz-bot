@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use chrono::Timelike as _;
 use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
+use mxbot_common::matrix_sdk;
 use tracing::error;
 
 use crate::{config::ScheduleConfig, fetcher, state::ScheduledOnce, BotContext};

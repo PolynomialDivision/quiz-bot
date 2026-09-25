@@ -1,26 +1,25 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::{
-            reaction::OriginalSyncReactionEvent,
-            relation::Thread,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{
-                    MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
-                },
+use mxbot_common::{
+    admin::Dispatch,
+    matrix_sdk::{
+        self,
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::{
+                reaction::OriginalSyncReactionEvent,
+                room::message::{MessageType, OriginalSyncRoomMessageEvent},
             },
+            OwnedRoomId, OwnedUserId,
         },
-        OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        Client, Room, RoomState,
     },
-    Client, Room, RoomState,
+    send::{in_thread, thread_root},
+    Bot,
 };
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 mod commands;
 mod config;
@@ -36,22 +35,7 @@ mod state;
 mod triviaqa;
 
 use config::Config;
-use mxbot_common::verify::VerificationService;
 use state::State;
-
-/// Attach thread relation metadata to an already-built message content.
-/// `root`     — the thread root event (m.thread event_id).
-/// `reply_to` — the specific event being quoted (m.in_reply_to).
-///              Pass `ev.event_id` so the reply quotes the command message,
-///              not the thread root.
-fn threadify(
-    mut content: RoomMessageEventContent,
-    root: OwnedEventId,
-    reply_to: OwnedEventId,
-) -> RoomMessageEventContent {
-    content.relates_to = Some(Relation::Thread(Thread::reply(root, reply_to)));
-    content
-}
 
 #[derive(Clone)]
 pub struct BotContext {
@@ -66,23 +50,37 @@ pub struct BotContext {
     pub db: Arc<db::Db>,
 }
 
+/// Run one `!command` and build the reply, or `None` when there is nothing
+/// to say. Command replies (leaderboards, speed stats, …) embed raw mxids
+/// for any player they mention — resolve them to display names via the same
+/// mention pipeline the round score uses.
+async fn command_reply(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Option<matrix_sdk::ruma::events::room::message::RoomMessageEventContent> {
+    match commands::handle(ctx, sender, body).await {
+        Ok(Some(reply)) => {
+            let names = ctx.db.player_display_names().await.unwrap_or_default();
+            Some(format::mentionify_with_names(&reply, &names))
+        }
+        Err(e) if e.to_string() == "__not_admin__" => Some(format::mentionify(
+            "❌ This command requires admin privileges.",
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            error!("Command error: {e}");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "quiz_bot=info,matrix_sdk=warn".parse().unwrap()),
-        )
-        .init();
+    mxbot_common::logging::init("quiz_bot");
 
-    let config_path = std::env::args()
-        .find(|a| a.ends_with(".toml"))
-        .unwrap_or_else(|| "config.toml".to_owned());
-    let config: Config = toml::from_str(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Reading config {config_path}"))?,
-    )
-    .context("Parsing config")?;
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
     config
         .schedule
         .timezone
@@ -90,8 +88,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Invalid schedule timezone {:?}", config.schedule.timezone))?;
     let config = Arc::new(config);
 
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    let store_path = mxbot_common::config::store_path_from_env();
     tokio::fs::create_dir_all(&store_path).await?;
 
     // ── Database (SQLite, lives in store dir) ────────────────────────────────
@@ -108,41 +105,24 @@ async fn main() -> Result<()> {
     }
     let state = Arc::new(Mutex::new(st));
 
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let room_id =
+        mxbot_common::rooms::parse_room_id("[schedule] room_id", &config.schedule.room_id)?;
 
-    let allowed_inviters: HashSet<String> =
-        config.security.allowed_inviters.iter().cloned().collect();
-
-    let room_id: OwnedRoomId = config
-        .schedule
-        .room_id
-        .parse()
-        .context("Invalid room_id in [schedule]")?;
-
-    let (client, bot_user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.clone().into(),
-    )
-    .await?;
-
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &config.security.allowed_inviters,
-    );
-    verification.install_handlers();
+    let bot = Bot::builder("quiz-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .admin_help(
+            "!startquiz · !schedulequiz · !cancelquiz · !prefetch · !resetstats · !catconfig",
+        )
+        .start(&config.matrix, &config.security)
+        .await?;
+    let client = bot.client.clone();
+    let bot_user_id = bot.user_id.clone();
 
     let ctx = BotContext {
         state,
         state_path,
         config: Arc::clone(&config),
-        admin_users,
+        admin_users: bot.admins().clone(),
         room_id: room_id.clone(),
         active_quiz: Arc::new(Mutex::new(None)),
         quiz_run_lock: Arc::new(Mutex::new(())),
@@ -150,54 +130,34 @@ async fn main() -> Result<()> {
         db,
     };
 
-    // ── Invite handler ────────────────────────────────────────────────────────
-    client.add_event_handler({
-        let allowed_inviters = allowed_inviters.clone();
-        let bot_user_id = bot_user_id.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
-            let allowed_inviters = allowed_inviters.clone();
-            let bot_user_id = bot_user_id.clone();
-            async move {
-                if ev.state_key != bot_user_id {
-                    return;
-                }
-                if !allowed_inviters.is_empty() && !allowed_inviters.contains(ev.sender.as_str()) {
-                    warn!("Rejecting invite from {}", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                if let Ok(roa) = RoomOrAliasId::parse(room_id.as_str()) {
-                    if let Err(e) = client.join_room_by_id_or_alias(&roa, &via).await {
-                        warn!("Join failed: {e}");
-                    }
-                }
-            }
-        }
-    });
-
     // ── Message / command handler ─────────────────────────────────────────────
     client.add_event_handler({
         let ctx = ctx.clone();
-        let bot_user_id = bot_user_id.clone();
-        let verification = verification.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+        let bot = bot.clone();
+        move |ev: OriginalSyncRoomMessageEvent,
+              room: Room,
+              client: Client,
+              encryption: Option<EncryptionInfo>| {
             let ctx = ctx.clone();
-            let bot_user_id = bot_user_id.clone();
-            let verification = verification.clone();
+            let bot = bot.clone();
             async move {
-                if ev.sender == bot_user_id {
+                if ev.sender == bot.user_id || room.state() != RoomState::Joined {
                     return;
                 }
-                if room.state() != RoomState::Joined {
-                    return;
+                match bot.admin.handle(&room, &ev, encryption.as_ref()).await {
+                    Dispatch::Handled => return,
+                    Dispatch::AdminDm => {
+                        // Admin commands sent privately are answered privately.
+                        let MessageType::Text(text) = &ev.content.msgtype else {
+                            return;
+                        };
+                        if let Some(reply) = command_reply(&ctx, &ev.sender, text.body.trim()).await
+                        {
+                            room.send(reply).await.ok();
+                        }
+                        return;
+                    }
+                    Dispatch::Continue => {}
                 }
                 if room.room_id() != ctx.room_id {
                     return;
@@ -207,20 +167,9 @@ async fn main() -> Result<()> {
                     return;
                 };
                 let body = text.body.trim();
-                if verification
-                    .handle_admin_command(&ev.sender, &ctx.admin_users, body)
-                    .await
-                {
-                    return;
-                }
                 if !body.starts_with('!') {
                     return;
                 }
-
-                let thread_root = match &ev.content.relates_to {
-                    Some(Relation::Thread(t)) => t.event_id.clone(),
-                    _ => ev.event_id.clone(),
-                };
 
                 // Quiz answer shorthand: !a / !b / !c / !d
                 let answer_index: Option<u8> = match body.to_lowercase().as_str() {
@@ -240,31 +189,12 @@ async fn main() -> Result<()> {
                 }
 
                 // Regular commands.
-                match commands::handle(&ctx, &ev.sender, body).await {
-                    Ok(Some(reply)) => {
-                        if let Some(r) = client.get_room(&ctx.room_id) {
-                            // Command replies (leaderboards, speed stats, …)
-                            // embed raw mxids for any player they mention —
-                            // resolve them to display names via the same
-                            // mention pipeline the round score uses.
-                            let names = ctx.db.player_display_names().await.unwrap_or_default();
-                            let content = format::mentionify_with_names(&reply, &names);
-                            r.send(threadify(content, thread_root, ev.event_id.clone()))
-                                .await
-                                .ok();
-                        }
+                if let Some(reply) = command_reply(&ctx, &ev.sender, body).await {
+                    if let Some(r) = client.get_room(&ctx.room_id) {
+                        r.send(in_thread(reply, thread_root(&ev), ev.event_id.clone()))
+                            .await
+                            .ok();
                     }
-                    Err(e) if e.to_string() == "__not_admin__" => {
-                        if let Some(r) = client.get_room(&ctx.room_id) {
-                            let content =
-                                format::mentionify("❌ This command requires admin privileges.");
-                            r.send(threadify(content, thread_root, ev.event_id.clone()))
-                                .await
-                                .ok();
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => error!("Command error: {e}"),
                 }
             }
         }
@@ -359,23 +289,11 @@ async fn main() -> Result<()> {
     });
 
     // ── Initial sync ──────────────────────────────────────────────────────────
-    let filter = FilterDefinition::with_lazy_loading();
-    client
-        .sync_once(SyncSettings::default().filter(filter.into()))
-        .await
-        .context("Initial sync failed")?;
+    bot.initial_sync().await;
     info!("Initial sync complete");
 
     tokio::spawn(triviaqa::ensure_ingested(ctx.clone()));
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
-    loop {
-        match client.sync(SyncSettings::default()).await {
-            Ok(()) => warn!("Sync loop exited — reconnecting"),
-            Err(e) => {
-                warn!("Sync error: {e} — reconnecting in 5s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
+    bot.sync_forever().await
 }

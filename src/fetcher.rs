@@ -1320,7 +1320,7 @@ mod token_tests {
 
     use std::{collections::HashSet, path::Path, sync::Arc};
 
-    use matrix_sdk::ruma::RoomId;
+    use mxbot_common::matrix_sdk::{self, ruma::RoomId};
     use tokio::sync::Mutex as TokioMutex;
     use wiremock::{
         matchers::{method, path, query_param},

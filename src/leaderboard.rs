@@ -1,3 +1,4 @@
+use mxbot_common::matrix_sdk;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};

@@ -14,7 +14,6 @@ chrono             = { version = "0.4", features = ["serde"] }
 chrono-tz          = "0.9"
 flate2             = "1"
 mxbot-common       = { git = "https://github.com/PolynomialDivision/mxbot-common" }
-matrix-sdk = { version = "0.19.1", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
 rand               = "0.8"
 mime               = "0.3"
 reqwest            = { version = "0.13", features = ["json"] }
@@ -23,18 +22,10 @@ serde_json         = "1"
 rusqlite           = { version = "0.40", features = ["chrono", "serde_json"] }
 tar                = "0.4"
 tokio              = { version = "1", features = ["full"] }
-toml               = "0.8"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+toml        = "0.8"
 wiremock    = "0.6"
-matrix-sdk  = { version = "0.19.1", features = ["testing"] }
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["testing"] }
 tokio       = { version = "1", features = ["test-util"] }
-
-[patch.crates-io]
-matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
-matrix-sdk-base   = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
-matrix-sdk-common = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
-matrix-sdk-crypto = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
-matrix-sdk-sqlite = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }

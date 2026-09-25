@@ -1,4 +1,4 @@
-pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig, VerificationConfig};
+pub use mxbot_common::config::{MatrixConfig, SecurityConfig};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -11,18 +11,6 @@ pub struct Config {
     pub trivia: TriviaConfig,
     #[serde(default)]
     pub explainer: ExplainerConfig,
-}
-
-#[derive(Deserialize, Default)]
-pub struct SecurityConfig {
-    #[serde(default)]
-    pub allowed_inviters: Vec<String>,
-    #[serde(default)]
-    pub admin_users: Vec<String>,
-    #[serde(default)]
-    pub encryption_strategy: EncryptionStrategy,
-    #[serde(default)]
-    pub verification: VerificationConfig,
 }
 
 #[derive(Deserialize)]
