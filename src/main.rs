@@ -65,7 +65,11 @@ async fn command_reply(
     match commands::handle(ctx, sender, body).await {
         Ok(Some(reply)) => {
             let names = ctx.db.player_display_names().await.unwrap_or_default();
-            Some(format::mentionify_with_names(&reply, &names))
+            let mut content = format::mentionify_with_names(&reply, &names);
+            // Name pills, but no notifications: someone asking for `!scores`
+            // should not ping everyone on the board.
+            content.mentions = Some(matrix_sdk::ruma::events::Mentions::new());
+            Some(content)
         }
         Err(e) if e.is::<mxbot_common::admin::NotAdmin>() => Some(format::mentionify(
             "❌ This command requires admin privileges.",

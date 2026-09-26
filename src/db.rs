@@ -1167,7 +1167,10 @@ fn rank_entries(entries: Vec<(String, Option<String>, i64, i64, i64)>) -> Vec<Le
         b.wilson_score
             .partial_cmp(&a.wilson_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Same lower bound, more evidence behind it.
             .then(b.total_questions.cmp(&a.total_questions))
+            // Only a stable order within a tie — ties share a rank when shown
+            // (see `leaderboard::shared_ranks`).
             .then(a.user_id.cmp(&b.user_id))
     });
     result

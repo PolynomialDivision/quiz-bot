@@ -44,6 +44,11 @@ async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> 
     map
 }
 
+/// The round summary lists everyone ranked this high…
+const ROUND_PODIUM_RANKS: usize = 5;
+/// …but at most this many lines, however many share those ranks.
+const ROUND_PODIUM_MAX_LINES: usize = 8;
+
 pub const CHOICE_EMOJIS: [&str; 4] = ["🇦", "🇧", "🇨", "🇩"];
 
 // ── Active quiz state (in-memory only) ───────────────────────────────────────
@@ -972,20 +977,9 @@ pub async fn start_quiz(
             summary_lines.push(String::new());
             summary_lines.push("No answers this round.".to_owned());
         } else {
-            let mut podium: Vec<(&String, u32, u32)> =
-                round_scores.iter().map(|(u, &(c, t))| (u, c, t)).collect();
-            podium.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
             summary_lines.push(String::new());
             summary_lines.push("🎯 This round:".to_owned());
-            for (i, (user, correct, _)) in podium.iter().take(5).enumerate() {
-                let medal = match i {
-                    0 => "🥇",
-                    1 => "🥈",
-                    2 => "🥉",
-                    _ => "▪️",
-                };
-                summary_lines.push(format!("{medal} {} · {correct}/{questions_asked}", user));
-            }
+            summary_lines.extend(round_podium_lines(&round_scores, questions_asked));
         }
 
         // Kept so its player names can be added to the mention map below —
@@ -1029,16 +1023,59 @@ pub async fn start_quiz(
             .map(crate::leaderboard::mention_names)
             .unwrap_or_default();
         names.extend(fetch_names(&room, &user_ids).await);
-        room.send(crate::format::mentionify_with_names(
-            &summary_lines.join("\n"),
-            &names,
-        ))
-        .await
-        .ok();
+        let mut content = crate::format::mentionify_with_names(&summary_lines.join("\n"), &names);
+        // Notify this round's players only — the appended monthly board lists
+        // everyone who played this month, and they shouldn't be pinged by a
+        // round they sat out.
+        content.mentions = Some(round_mentions(round_scores.keys()));
+        room.send(content).await.ok();
     }
 
     info!("Quiz round finished ({questions_asked} questions)");
     Ok(())
+}
+
+/// Mentions for the players of a round (unparseable IDs are skipped).
+fn round_mentions<'a>(users: impl Iterator<Item = &'a String>) -> Mentions {
+    Mentions::with_user_ids(
+        users.filter_map(|u| matrix_sdk::ruma::OwnedUserId::try_from(u.as_str()).ok()),
+    )
+}
+
+/// The round's ranking lines. Equal scores share a rank (the name order
+/// within a tie only keeps output stable); everyone placed in the top five
+/// is listed — a tie for fifth is not cut off halfway — within a sane length
+/// for a busy room.
+fn round_podium_lines(
+    round_scores: &HashMap<String, (u32, u32)>,
+    questions_asked: u32,
+) -> Vec<String> {
+    let mut podium: Vec<(&String, u32)> = round_scores
+        .iter()
+        .map(|(user, &(correct, _))| (user, correct))
+        .collect();
+    podium.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let ranks = crate::leaderboard::shared_ranks(&podium, |a, b| a.1 == b.1);
+    let mut lines: Vec<String> = podium
+        .iter()
+        .zip(&ranks)
+        .filter(|(_, &rank)| rank <= ROUND_PODIUM_RANKS)
+        .take(ROUND_PODIUM_MAX_LINES)
+        .map(|((user, correct), &rank)| {
+            format!(
+                "{} {user} · {correct}/{questions_asked}",
+                crate::leaderboard::rank_marker(rank)
+            )
+        })
+        .collect();
+    let hidden = podium.len() - lines.len();
+    if hidden > 0 {
+        lines.push(format!(
+            "… and {hidden} more player{}",
+            if hidden == 1 { "" } else { "s" }
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1307,5 +1344,71 @@ mod tests {
         merge_reconciled_answers(&mut answers, &server);
 
         assert_eq!(answers["@late:example.org"].submitted_at, sent_at);
+    }
+
+    fn scores(entries: &[(&str, u32)]) -> HashMap<String, (u32, u32)> {
+        entries
+            .iter()
+            .map(|&(user, correct)| (format!("@{user}:x"), (correct, 5)))
+            .collect()
+    }
+
+    #[test]
+    fn round_podium_shares_ranks_for_equal_scores() {
+        let lines = round_podium_lines(
+            &scores(&[("alice", 5), ("charlie", 4), ("bob", 4), ("david", 2)]),
+            5,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "🥇 @alice:x · 5/5",
+                "🥈 @bob:x · 4/5",
+                "🥈 @charlie:x · 4/5",
+                "4. @david:x · 2/5",
+            ]
+        );
+    }
+
+    #[test]
+    fn round_podium_keeps_a_tie_for_fifth_together() {
+        let lines = round_podium_lines(
+            &scores(&[
+                ("a", 5),
+                ("b", 4),
+                ("c", 3),
+                ("d", 2),
+                ("e", 1),
+                ("f", 1),
+                ("g", 0),
+            ]),
+            5,
+        );
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[4], "5. @e:x · 1/5");
+        assert_eq!(lines[5], "5. @f:x · 1/5");
+        assert_eq!(lines[6], "… and 1 more player");
+    }
+
+    #[test]
+    fn round_podium_caps_a_large_tie() {
+        let many: Vec<(String, u32)> = (0..12).map(|i| (format!("p{i:02}"), 3)).collect();
+        let refs: Vec<(&str, u32)> = many.iter().map(|(u, c)| (u.as_str(), *c)).collect();
+        let lines = round_podium_lines(&scores(&refs), 5);
+
+        assert_eq!(lines.len(), ROUND_PODIUM_MAX_LINES + 1);
+        assert!(lines[..ROUND_PODIUM_MAX_LINES]
+            .iter()
+            .all(|l| l.starts_with("🥇")));
+        assert_eq!(lines.last().unwrap(), "… and 4 more players");
+    }
+
+    #[test]
+    fn round_summary_notifies_only_the_rounds_players() {
+        let players = scores(&[("alice", 3), ("bob", 1)]);
+        let mentions = round_mentions(players.keys());
+
+        assert_eq!(mentions.user_ids.len(), 2);
+        assert!(!mentions.room);
     }
 }

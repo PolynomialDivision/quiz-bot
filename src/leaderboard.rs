@@ -89,6 +89,40 @@ fn local_day_start(tz: Tz, date: NaiveDate) -> Result<DateTime<Utc>> {
     ))
 }
 
+/// Standard competition ranks ("1, 2, 2, 4") for items already sorted best
+/// first: an item shares its predecessor's rank when `tied` says the two are
+/// equal, so the order within a tie (only there to keep output stable)
+/// never reads as one player beating another.
+pub fn shared_ranks<T>(items: &[T], tied: impl Fn(&T, &T) -> bool) -> Vec<usize> {
+    let mut ranks: Vec<usize> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let rank = match ranks.last() {
+            Some(&prev) if tied(&items[i - 1], item) => prev,
+            _ => i + 1,
+        };
+        ranks.push(rank);
+    }
+    ranks
+}
+
+/// 🥇/🥈/🥉 for the top three ranks, "4." etc. below — tied players get the
+/// same marker.
+pub fn rank_marker(rank: usize) -> String {
+    match rank {
+        1 => "🥇".to_owned(),
+        2 => "🥈".to_owned(),
+        3 => "🥉".to_owned(),
+        n => format!("{n}."),
+    }
+}
+
+/// Leaderboard entries rank equal when their record is identical: the same
+/// correct answers out of the same number of questions (hence the same
+/// Wilson score, the leaderboard's sort key).
+pub fn entries_tied(a: &MonthlyLeaderboardEntry, b: &MonthlyLeaderboardEntry) -> bool {
+    a.total_correct == b.total_correct && a.total_questions == b.total_questions
+}
+
 /// Build the mention-name map for a set of leaderboard entries: user ID →
 /// sanitized display name, ready for `format::mentionify_with_names`. Entries
 /// with no (or blank) display name are omitted so the caller's mention
@@ -117,13 +151,9 @@ pub fn leaderboard_text(
     entries: &[MonthlyLeaderboardEntry],
 ) -> String {
     let mut lines = vec![format!("**🏆 {title} · {question_count} Qs:**")];
-    for (index, entry) in entries.iter().enumerate() {
-        let marker = match index {
-            0 => "🥇",
-            1 => "🥈",
-            2 => "🥉",
-            _ => "▪️",
-        };
+    let ranks = shared_ranks(entries, entries_tied);
+    for (entry, rank) in entries.iter().zip(ranks) {
+        let marker = rank_marker(rank);
         let accuracy = if entry.total_questions > 0 {
             entry.total_correct * 100 / entry.total_questions
         } else {
@@ -345,5 +375,45 @@ mod tests {
             html.contains("https://matrix.to/#/@"),
             "still a mention pill"
         );
+    }
+
+    #[test]
+    fn equal_scores_share_a_rank_and_the_next_rank_skips() {
+        // Alice 10, Bob 8, Charlie 8, David 6 → 1, 2, 2, 4.
+        let scores = [10, 8, 8, 6];
+        assert_eq!(shared_ranks(&scores, |a, b| a == b), vec![1, 2, 2, 4]);
+        assert_eq!(shared_ranks(&[5, 5, 5], |a, b| a == b), vec![1, 1, 1]);
+        assert!(shared_ranks(&[] as &[i32], |a, b| a == b).is_empty());
+    }
+
+    #[test]
+    fn tied_leaderboard_entries_get_the_same_marker() {
+        let text = leaderboard_text(
+            "July",
+            40,
+            &[
+                entry("Alice", 30, 40),
+                entry("Bob", 20, 40),
+                entry("Charlie", 20, 40),
+                entry("David", 10, 40),
+            ],
+        );
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+
+        assert!(lines[0].starts_with("🥇 @alice"));
+        assert!(lines[1].starts_with("🥈 @bob"));
+        assert!(lines[2].starts_with("🥈 @charlie"));
+        assert!(lines[3].starts_with("4. @david"));
+    }
+
+    #[test]
+    fn same_percentage_with_more_questions_is_not_a_tie() {
+        // 3/4 and 30/40 are both 75 %, but the Wilson bound — the ranking
+        // key — trusts the larger sample more. That is a real difference.
+        let big = entry("Big", 30, 40);
+        let small = entry("Small", 3, 4);
+        assert!(big.wilson_score > small.wilson_score);
+        assert!(!entries_tied(&big, &small));
+        assert_eq!(rank_marker(4), "4.");
     }
 }

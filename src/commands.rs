@@ -311,11 +311,19 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     let board = ctx.db.leaderboard().await.unwrap_or_default();
     let me = board.iter().find(|e| e.user_id == user);
     let wilson = me.map(|e| e.wilson_score).unwrap_or(0.0);
-    let rank = me
-        .and_then(|e| board.iter().position(|x| x.user_id == e.user_id))
-        .map(|i| i + 1);
-    let rank_str = rank
-        .map(|r| format!(" · rank #{r} of {}", board.len()))
+    let ranks = crate::leaderboard::shared_ranks(&board, crate::leaderboard::entries_tied);
+    let rank_str = board
+        .iter()
+        .position(|x| x.user_id == user)
+        .map(|i| {
+            let rank = ranks[i];
+            let tied = ranks.iter().filter(|&&r| r == rank).count() > 1;
+            format!(
+                " · rank #{rank}{} of {}",
+                if tied { " (tied)" } else { "" },
+                board.len()
+            )
+        })
         .unwrap_or_default();
 
     // Header line.
