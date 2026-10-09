@@ -36,8 +36,8 @@ fn fire_moment(date: NaiveDate, fire_secs: i64) -> NaiveDateTime {
     date.and_hms_opt(0, 0, 0).expect("midnight exists") + chrono::Duration::seconds(fire_secs)
 }
 
-/// The date whose fire moment `now` falls within the grace window of, if any
-/// — today's, or yesterday's for a window that crosses midnight.
+/// The date whose fire moment `now` falls within the grace window of, if any:
+/// today's, or yesterday's for a window that crosses midnight.
 fn due_fire_date(now: NaiveDateTime, fire_secs: i64) -> Option<NaiveDate> {
     let today = now.date();
     [today, today - chrono::Duration::days(1)]
@@ -71,7 +71,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_str) {
             Some(t) => t,
             None => {
-                warn!("Invalid quiz_times entry {:?} — skipping", time_str);
+                warn!("Invalid quiz_times entry {:?}, skipping", time_str);
                 continue;
             }
         };
@@ -97,7 +97,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         // Another quiz round already running? Retried on the next tick
         // while the grace window lasts.
         if ctx.quiz_run_lock.try_lock().is_err() {
-            warn!("Scheduler: slot {time_str} is due but a quiz is already in progress — waiting");
+            warn!("Scheduler: slot {time_str} is due but a quiz is already in progress, waiting");
             continue;
         }
 
@@ -130,7 +130,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     for entry in once_entries {
         let Some((qh, qm)) = ScheduleConfig::parse_quiz_time(&entry.quiz_time) else {
             warn!(
-                "Invalid scheduled_once time {:?} — removing",
+                "Invalid scheduled_once time {:?}, removing",
                 entry.quiz_time
             );
             remove_once(ctx, &entry).await;
@@ -143,13 +143,13 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         if since < 0 {
             continue;
         }
-        // Removed before spawning to prevent double-fire on restart — and
+        // Removed before spawning to prevent double-fire on restart, and
         // also once its time has passed while the bot was offline, so it
         // doesn't linger in the list forever.
         remove_once(ctx, &entry).await;
         if since >= FIRE_GRACE_SECS {
             warn!(
-                "One-time quiz at {} on {} was missed (bot offline?) — removed",
+                "One-time quiz at {} on {} was missed (bot offline?): removed",
                 entry.quiz_time, entry.date
             );
             continue;
@@ -157,7 +157,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
 
         if ctx.quiz_run_lock.try_lock().is_err() {
             warn!(
-                "One-time quiz at {} would fire now but a quiz is already running — dropped",
+                "One-time quiz at {} would fire now but a quiz is already running: dropped",
                 entry.quiz_time,
             );
             continue;

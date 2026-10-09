@@ -2,13 +2,13 @@
 //!
 //! TriviaQA supplies the question and the single verified correct answer,
 //! but no wrong answers, category or difficulty. The LLM (Groq, the same
-//! integration `explainer.rs` uses — see `crate::groq`) prepares those, in
+//! integration `explainer.rs` uses, see `crate::groq`) prepares those, in
 //! batches of `BATCH_SIZE` questions per call:
-//! - **suitable?** — time-bound, ambiguous, garbled or possibly outdated
+//! - **suitable?**: time-bound, ambiguous, garbled or possibly outdated
 //!   questions are rejected and never asked;
-//! - **category** — one of the bot's own groups (`fetcher::CATEGORY_GROUPS`),
+//! - **category**: one of the bot's own groups (`fetcher::CATEGORY_GROUPS`),
 //!   with a description of what each covers (`GROUP_DESCRIPTIONS`);
-//! - **difficulty** — easy/medium/hard by a fixed rubric;
+//! - **difficulty**: easy/medium/hard by a fixed rubric;
 //! - **3 wrong answers** of the same kind and form as the correct one.
 //!
 //! The LLM never changes the question or correct answer; its reply is parsed
@@ -24,7 +24,7 @@
 //! - A prepared question is an ordinary `state::FetchedQuestion` with a real
 //!   category group and difficulty, so quiz.rs, format.rs and the DB need no
 //!   source-specific handling, and category exclusion / round diversity /
-//!   difficulty filters apply unchanged — a round slot asks for its planned
+//!   difficulty filters apply unchanged. A round slot asks for its planned
 //!   group (`next_question`'s `wanted_group`).
 //! - Dedup/history is the *shared* `questions` table.
 //! - Which source is used is an admin runtime setting
@@ -54,14 +54,14 @@ use crate::{
 /// Bump whenever the prompt or its rules change: rows classified by an
 /// older version are re-classified (in the background) before being served.
 pub const GENERATION_VERSION: i64 = 2;
-/// Questions per classification call — one prompt handles a whole batch.
+/// Questions per classification call. One prompt handles a whole batch.
 pub const BATCH_SIZE: usize = 10;
 /// Ready (classified, suitable) questions the background task keeps in stock.
 const READY_TARGET: i64 = 300;
 /// Candidates fetched per lookup, to skip recently asked ones.
 const READY_CANDIDATES: usize = 20;
 
-/// What each category group covers — the LLM only sees the names otherwise
+/// What each category group covers. The LLM only sees the names otherwise
 /// and files e.g. a novel's setting under Geography. Must list every entry
 /// of `fetcher::CATEGORY_GROUPS` (checked by a test).
 const GROUP_DESCRIPTIONS: &[(&str, &str)] = &[
@@ -96,16 +96,16 @@ fn generation_system_prompt() -> String {
         "You prepare trivia questions for a multiple-choice quiz played by adults in a \
          Matrix chat. For each ITEM (id, question, correct answer) decide:
 
-1. suitable — false if the question should not be asked: its answer is time-bound \
+1. suitable: false if the question should not be asked: its answer is time-bound \
 or may be outdated (\"currently\", \"this year\", future tense, records, holders), \
 the question is ambiguous, incomplete or garbled, the answer looks wrong, it needs an \
 image or audio, or the question gives the answer away. Give a short reason.
-2. category — exactly one of these names, by what the question is about:
+2. category: exactly one of these names, by what the question is about:
 {}
-3. difficulty — for a quiz-interested adult who sees 4 options:
+3. difficulty, for a quiz-interested adult who sees 4 options:
    easy: most people know it; medium: needs some general knowledge; hard: specialist \
    or obscure knowledge.
-4. wrong_answers — 3 answers that are clearly wrong but plausible to someone unsure: \
+4. wrong_answers: 3 answers that are clearly wrong but plausible to someone unsure: \
 same kind of thing as the correct answer (person/place/year/number/title), similar \
 length and formatting, clearly different from each other, never the correct answer, \
 a synonym or a partial form of it.
@@ -146,7 +146,7 @@ struct Answer {
 
 /// Filenames the official TriviaQA release uses, in preference order, when
 /// `dataset_url` points straight at a `.tar.gz` archive (the actual shape
-/// the official distribution ships in — see
+/// the official distribution ships in. See
 /// https://nlp.cs.washington.edu/triviaqa/). "*-dev.json" splits comfortably
 /// exceed any reasonable `max_pool_size` while staying far smaller than the
 /// multi-GB "*-train.json" splits; "*-without-answers*" files have no
@@ -175,8 +175,8 @@ fn gunzip_if_needed(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// which may be:
 /// - Plain JSON, as-is.
 /// - Gzip-compressed JSON (magic `1f 8b`), transparently decompressed.
-/// - A (gzipped) tar archive bundling several TriviaQA JSON files — the
-///   official distribution's actual format — in which case the first
+/// - A (gzipped) tar archive bundling several TriviaQA JSON files (the
+///   official distribution's actual format) in which case the first
 ///   `PREFERRED_ARCHIVE_ENTRIES` match present is used, falling back to the
 ///   first `*.json` entry that isn't a "-without-answers" file. Reads the
 ///   archive twice (list entry names cheaply, then fetch only the chosen
@@ -231,9 +231,9 @@ fn extract_dataset_json(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Parse a TriviaQA dataset payload (plain JSON, gzipped JSON, or a
-/// `.tar.gz` bundling several JSON files — see `extract_dataset_json`).
+/// `.tar.gz` bundling several JSON files, see `extract_dataset_json`).
 /// Filters out entries with an empty question or answer, and caps the
-/// result at `max_entries` — the full unfiltered dataset has hundreds of
+/// result at `max_entries`. The full unfiltered dataset has hundreds of
 /// thousands of rows, far more than any single bot needs.
 fn parse_dataset(bytes: &[u8], max_entries: usize) -> anyhow::Result<Vec<TriviaQaImportRow>> {
     let json_bytes = extract_dataset_json(bytes)?;
@@ -262,7 +262,7 @@ fn parse_dataset(bytes: &[u8], max_entries: usize) -> anyhow::Result<Vec<TriviaQ
     Ok(rows)
 }
 
-/// Download `url` with a small bounded retry — this only ever runs once
+/// Download `url` with a small bounded retry. This only ever runs once
 /// (see `ensure_ingested`), so it's not worth the full throttled-retry
 /// machinery `fetcher.rs` uses for the live, rate-limited OpenTDB API.
 async fn download(url: &str) -> anyhow::Result<Vec<u8>> {
@@ -302,14 +302,14 @@ fn ingest_kv_key(dataset_url: &str, max_pool_size: usize) -> String {
 
 /// Download and ingest the TriviaQA dataset into `triviaqa_pool`, but only
 /// if it hasn't already been done for the current `dataset_url` /
-/// `max_pool_size` — this is what keeps the (potentially large) dataset
+/// `max_pool_size`: this is what keeps the (potentially large) dataset
 /// from being re-downloaded on every startup. Safe to call repeatedly
 /// (e.g. once at startup and again lazily before a round) and safe to call
-/// concurrently — `INGEST_LOCK` plus a post-lock re-check ensures at most
+/// concurrently: `INGEST_LOCK` plus a post-lock re-check ensures at most
 /// one download/ingest ever runs.
 ///
 /// Logs and returns `Ok(())` on any failure (disabled, misconfigured,
-/// download/parse error) rather than propagating — TriviaQA is optional,
+/// download/parse error) rather than propagating: TriviaQA is optional,
 /// so an ingestion problem must not affect bot startup or quiz rounds;
 /// `should_offer`/`next_question` simply see an empty pool and the caller
 /// falls back to OpenTDB.
@@ -325,7 +325,7 @@ async fn ensure_ingested_inner(ctx: &BotContext) -> anyhow::Result<()> {
         return Ok(());
     }
     let Some(dataset_url) = cfg.dataset_url.as_deref() else {
-        warn!("TriviaQA: enabled but trivia.triviaqa.dataset_url is not set — staying disabled");
+        warn!("TriviaQA: enabled but trivia.triviaqa.dataset_url is not set, staying disabled");
         return Ok(());
     };
 
@@ -335,7 +335,7 @@ async fn ensure_ingested_inner(ctx: &BotContext) -> anyhow::Result<()> {
     }
 
     let _guard = INGEST_LOCK.lock().await;
-    // Re-check now that we hold the lock — a concurrent caller (e.g. the
+    // Re-check now that we hold the lock. A concurrent caller (e.g. the
     // startup task and a lazily-triggered one) may have just finished.
     if already_ingested(&ctx.db, &key).await? {
         return Ok(());
@@ -390,7 +390,7 @@ pub fn clean_question(raw: &str) -> String {
 }
 
 /// Answers the dataset stores in all caps (`SCOTTISH TERRIER`) stand out
-/// next to normally written wrong answers and give themselves away — write
+/// next to normally written wrong answers and give themselves away: write
 /// them in title case. Short all-caps words (≤ 4 letters: `USA`, `NATO`,
 /// `AC/DC`) are left alone as likely acronyms.
 pub fn display_answer(raw: &str) -> String {
@@ -426,7 +426,7 @@ pub fn display_answer(raw: &str) -> String {
 // ── Classification + distractor generation/validation ─────────────────────────
 
 /// Match free-form LLM output against the bot's actual category groups
-/// (`fetcher::CATEGORY_GROUPS`) — the single source of truth — so a match is
+/// (`fetcher::CATEGORY_GROUPS`, the single source of truth) so a match is
 /// guaranteed to plug straight into the bot's category filtering/diversity.
 fn canonicalize_category_group(raw: &str) -> Option<&'static str> {
     fetcher::CATEGORY_GROUPS
@@ -444,7 +444,7 @@ fn canonicalize_difficulty(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// Keep up to 3 usable distractors — cleans numbering/quotes, and drops
+/// Keep up to 3 usable distractors: cleans numbering/quotes, and drops
 /// anything blank, too long, a duplicate, or matching the correct
 /// answer/an alias.
 fn parse_distractor_lines<'a>(
@@ -518,7 +518,7 @@ enum Verdict {
         distractors: Vec<String>,
     },
     Unsuitable(String),
-    /// Unusable reply for this item — try again in a later batch.
+    /// Unusable reply for this item: try again in a later batch.
     Invalid,
 }
 
@@ -585,7 +585,7 @@ pub struct BatchOutcome {
 
 /// Classify up to `BATCH_SIZE` pool rows that aren't ready under the current
 /// `GENERATION_VERSION` in a single LLM call, and store the results:
-/// category, difficulty and wrong answers — or a rejection for unsuitable
+/// category, difficulty and wrong answers, or a rejection for unsuitable
 /// questions. `None` if the LLM is unavailable (no key, bad model, …).
 pub async fn classify_batch(ctx: &BotContext) -> Option<BatchOutcome> {
     let api_key = ctx.config.explainer.api_key.as_deref()?;
@@ -700,8 +700,8 @@ async fn stock_step(ctx: &BotContext) -> Option<bool> {
 // ── Public: offer a question for a round slot ────────────────────────────────
 
 /// Whether this question slot should be attempted from TriviaQA at all:
-/// the source setting allows it, a Groq key is configured, and — in `mixed`
-/// mode — a random roll against `triviaqa_share`.
+/// the source setting allows it, a Groq key is configured, and (in `mixed`
+/// mode) a random roll against `triviaqa_share`.
 pub fn should_offer(ctx: &BotContext, source: QuestionSource) -> bool {
     if ctx.config.explainer.api_key.is_none() {
         return false;
@@ -745,7 +745,7 @@ fn to_question(row: TriviaQaRow) -> Option<FetchedQuestion> {
 
 /// Produce one TriviaQA question, or an error the caller should treat as
 /// "fall back to OpenTDB for this slot". Only serves already classified
-/// questions (see `keep_stocked`) — the round never waits for the LLM,
+/// questions (see `keep_stocked`). The round never waits for the LLM,
 /// except when nothing is in stock yet at all.
 ///
 /// `wanted_group` is the category group the round planned for this slot
@@ -931,7 +931,7 @@ mod triviaqa_tests {
             ("triviaqa/unfiltered-web-dev.json", SAMPLE_JSON.as_bytes()),
         ]);
         let rows = parse_dataset(&tar_bytes, 100).unwrap();
-        // The dev split (SAMPLE_JSON), not the train split, must win —
+        // The dev split (SAMPLE_JSON), not the train split, must win:
         // regardless of archive order.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].question_text, "Who painted the Mona Lisa?");

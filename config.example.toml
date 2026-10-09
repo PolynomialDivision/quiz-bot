@@ -44,7 +44,7 @@ reminder_before_secs = [300, 60]
 timezone = "Europe/Berlin"
 
 [trivia]
-# Questions are fetched automatically from https://opentdb.com/ — no manual
+# Questions are fetched automatically from https://opentdb.com/. No manual
 # setup needed.  The bot pre-caches batches of questions and uses a session
 # token to avoid repeats until the full pool is exhausted.
 
@@ -66,14 +66,14 @@ batch_size = 10
 # so configurations with only a few active categories still work.
 recent_category_window = 5
 
-# Data is stored in SQLite at $STORE_PATH/quiz.db — no separate database
+# Data is stored in SQLite at $STORE_PATH/quiz.db. No separate database
 # process or configuration required.
 
 [trivia.triviaqa]
 # Optional secondary question source: real TriviaQA questions/answers. The
 # LLM ([explainer] api_key/model) checks each question is suitable (drops
 # time-bound or ambiguous ones), files it into one of the categories above,
-# rates its difficulty and writes 3 wrong answers — in the background, in
+# rates its difficulty and writes 3 wrong answers, in the background, in
 # batches, so rounds never wait for it.
 # `enabled` is only the default: admins switch the source at runtime with
 #   !admin set question_source mixed|opentdb|triviaqa
@@ -82,8 +82,8 @@ recent_category_window = 5
 enabled = false
 
 # Where to download the TriviaQA dataset from on first use (downloaded once
-# and cached in the database — not re-downloaded on later restarts). Point
-# this straight at the official release's .tar.gz — the bot reads it
+# and cached in the database, not re-downloaded on later restarts). Point
+# this straight at the official release's .tar.gz. The bot reads it
 # natively (picks the *-dev.json split out of the archive).
 # dataset_url = "https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz"
 

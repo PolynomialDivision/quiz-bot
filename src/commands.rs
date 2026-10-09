@@ -48,13 +48,13 @@ async fn cmd_startquiz(
     body: &str,
 ) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
-    // `!startquiz triviaqa` — one round from one source, to test it.
+    // `!startquiz triviaqa`: one round from one source, to test it.
     let source = match body.split_whitespace().nth(1) {
         Some(arg) => match QuestionSource::parse(arg) {
             Some(source) => Some(source),
             None => {
                 return Ok(Some(
-                    "Usage: !startquiz [triviaqa|opentdb|mixed]".to_owned(),
+                    "💡 Usage: !startquiz [triviaqa|opentdb|mixed]".to_owned(),
                 ))
             }
         },
@@ -94,7 +94,7 @@ async fn cmd_triviaqa(
 ) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
     let args: Vec<&str> = body.split_whitespace().skip(1).collect();
-    let usage = "Usage: !triviaqa [status] | sample [group] | classify [n] | reject <id>";
+    let usage = "💡 Usage: !triviaqa [status] | sample [group] | classify [n] | reject <id>";
     match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
         None | Some("status") => {
             let stats = ctx.db.triviaqa_stats(triviaqa::GENERATION_VERSION).await?;
@@ -102,17 +102,17 @@ async fn cmd_triviaqa(
             let mut lines = vec![
                 "🤖 **TriviaQA**".to_owned(),
                 format!(
-                    "Source: {} · TriviaQA share in mixed: {:.0}%",
+                    "📚 Source: {}\n🔀 TriviaQA share in mixed: {:.0}%",
                     settings.question_source.label(),
                     settings.triviaqa_share * 100.0
                 ),
                 format!(
-                    "Pool: {} · ready: {} · rejected as unsuitable: {} · model: {}",
+                    "🗃️ Pool: {} · ✅ ready: {} · 🗑️ unsuitable: {}\n🤖 Model: {}",
                     stats.total, stats.ready, stats.rejected, ctx.config.explainer.model
                 ),
             ];
             if ctx.config.explainer.api_key.is_none() {
-                lines.push("⚠️ No [explainer] api_key — TriviaQA cannot be prepared.".to_owned());
+                lines.push("⚠️ No [explainer] api_key, so TriviaQA cannot be prepared.".to_owned());
             }
             let mut groups: Vec<(String, [i64; 3])> = Vec::new();
             for (group, difficulty, n) in &stats.by_group {
@@ -132,14 +132,14 @@ async fn cmd_triviaqa(
             }
             if !groups.is_empty() {
                 lines.push(String::new());
-                lines.push("Ready per category (🟢 easy · 🟡 medium · 🔴 hard):".to_owned());
+                lines.push("📂 Ready per category (🟢 easy · 🟡 medium · 🔴 hard):".to_owned());
                 for (group, [e, m, h]) in groups {
                     lines.push(format!("{group}: 🟢{e} 🟡{m} 🔴{h}"));
                 }
             }
             lines.push(String::new());
             lines.push(
-                "Switch: !admin set question_source triviaqa|opentdb|mixed · test one round: !startquiz triviaqa"
+                "🔀 Switch: !admin set question_source triviaqa|opentdb|mixed\n🧪 Test one round: !startquiz triviaqa"
                     .to_owned(),
             );
             Ok(Some(lines.join("\n")))
@@ -152,13 +152,13 @@ async fn cmd_triviaqa(
                     .find(|(g, _)| fetcher::normalise(g) == fetcher::normalise(&name))
                 {
                     Some((g, _)) => Some(*g),
-                    None => return Ok(Some(format!("Unknown category «{name}»."))),
+                    None => return Ok(Some(format!("🤔 Unknown category «{name}»."))),
                 },
                 None => None,
             };
             match triviaqa::preview(ctx, group).await? {
                 None => Ok(Some(
-                    "No ready TriviaQA question yet — try !triviaqa classify.".to_owned(),
+                    "⏳ No ready TriviaQA question yet.\n💡 Try !triviaqa classify.".to_owned(),
                 )),
                 Some((id, q)) => {
                     let mut lines = vec![
@@ -167,7 +167,7 @@ async fn cmd_triviaqa(
                         format!("✅ {}", q.correct_answer),
                     ];
                     lines.extend(q.incorrect_answers.iter().map(|a| format!("❌ {a}")));
-                    lines.push(format!("Bad? !triviaqa reject {id}"));
+                    lines.push(format!("👎 Bad? !triviaqa reject {id}"));
                     Ok(Some(lines.join("\n")))
                 }
             }
@@ -183,7 +183,7 @@ async fn cmd_triviaqa(
             for _ in 0..n.div_ceil(triviaqa::BATCH_SIZE) {
                 let Some(outcome) = triviaqa::classify_batch(ctx).await else {
                     return Ok(Some(
-                        "❌ The LLM is not reachable — check [explainer] api_key/model and the logs."
+                        "❌ The LLM is not reachable.\n🔧 Check [explainer] api_key/model and the logs."
                             .to_owned(),
                     ));
                 };
@@ -207,7 +207,7 @@ async fn cmd_triviaqa(
             {
                 Ok(Some(format!("🗑️ TriviaQA #{id} will not be asked.")))
             } else {
-                Ok(Some(format!("TriviaQA #{id} not found.")))
+                Ok(Some(format!("🔍 TriviaQA #{id} not found.")))
             }
         }
         Some(_) => Ok(Some(usage.to_owned())),
@@ -224,7 +224,7 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
         Ok(n) => {
             let total = ctx.state.lock().await.cached_questions.len();
             Ok(Some(format!(
-                "✅ Fetched {n} questions from OpenTDB.  Cache: {cached_before} → {total}."
+                "✅ Fetched {n} questions from OpenTDB.\n🗃️ Cache: {cached_before} → {total}."
             )))
         }
         Err(e) => Ok(Some(format!("❌ Prefetch failed: {e}"))),
@@ -255,7 +255,7 @@ async fn cmd_resetstats(
         )),
         Err(e) => {
             error!("reset_stats failed: {e}");
-            Ok(Some("❌ Reset failed — check the logs.".to_owned()))
+            Ok(Some("❌ Reset failed. Check the logs.".to_owned()))
         }
     }
 }
@@ -273,7 +273,7 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if board.is_empty() {
-        return Ok(Some("No scores yet.".to_owned()));
+        return Ok(Some("🤷 No scores yet.".to_owned()));
     }
     let question_count = ctx.db.question_count().await.unwrap_or(0);
     Ok(Some(crate::leaderboard::leaderboard_text(
@@ -295,7 +295,7 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         }
         Ok(None) => {
             return Ok(Some(
-                "You haven't answered any quiz questions yet.".to_owned(),
+                "🤷 You haven't answered any quiz questions yet.".to_owned(),
             ))
         }
         Ok(Some(s)) => s,
@@ -387,7 +387,7 @@ async fn cmd_categories(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if stats.is_empty() {
-        return Ok(Some("No questions asked yet.".to_owned()));
+        return Ok(Some("🤷 No questions asked yet.".to_owned()));
     }
 
     let total_q: i64 = stats.iter().map(|s| s.questions_asked).sum();
@@ -452,7 +452,7 @@ async fn cmd_catconfig(ctx: &BotContext) -> Result<Option<String>> {
     } else {
         lines.push(String::new());
         lines.push(format!(
-            "All {}/{} active.",
+            "✅ All {}/{} active.",
             all_groups.len(),
             all_groups.len()
         ));
@@ -524,8 +524,8 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     }
 
     lines.push(String::new());
-    lines.push("Answer: 🇦 🇧 🇨 🇩 · or type !a !b !c !d".to_owned());
-    lines.push("Change answer any time before the timer ends.".to_owned());
+    lines.push("👆 Answer: 🇦 🇧 🇨 🇩 or type !a !b !c !d".to_owned());
+    lines.push("🔄 You can change it until the timer ends.".to_owned());
 
     Ok(Some(lines.join("\n")))
 }
@@ -562,7 +562,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
 
     if board.is_empty() && near.is_empty() {
         return Ok(Some(
-            "Not enough data yet · min. 3 correct answers per player.".to_owned(),
+            "⏳ Not enough data yet.\nEach player needs 3 correct answers.".to_owned(),
         ));
     }
 
@@ -572,7 +572,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     ];
 
     if board.is_empty() {
-        lines.push("No one has 3 correct answers yet.".to_owned());
+        lines.push("🤷 No one has 3 correct answers yet.".to_owned());
     } else {
         for (i, e) in board.iter().enumerate() {
             let medal = match i {
@@ -590,7 +590,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
 
     if !near.is_empty() {
         lines.push(String::new());
-        lines.push("Almost there:".to_owned());
+        lines.push("🔜 Almost there:".to_owned());
         for e in &near {
             let needed = 3 - e.correct_count;
             lines.push(format!(
@@ -762,25 +762,25 @@ async fn cmd_cancelquiz(
 fn help_text() -> String {
     "🧠 **Quiz Bot**
 
-!scores / !leaderboard · ranking
-!mystats · your stats + rank
-!gameinfo · schedule and format
-!categories · category group breakdown
-!catconfig · active/excluded groups
-!fastest · speed leaderboard
-!help · this message
+🏆 !scores · ranking
+📊 !mystats · your stats and rank
+🗓️ !gameinfo · schedule and format
+📚 !categories · category groups
+🗂️ !catconfig · active groups
+⚡ !fastest · speed ranking
+❔ !help · this message
 
-**Admin:**
-!startquiz [triviaqa|opentdb|mixed] · start now (optionally from one source)
-!triviaqa · AI-prepared questions: status · sample · classify · reject
-!admin set question_source triviaqa|opentdb|mixed · switch the source
-!schedulequiz HH:MM · schedule once
-!schedulequiz · list pending
-!cancelquiz HH:MM · cancel
-!prefetch · pre-fetch questions
-!resetstats confirm · wipe all history
+🛠️ **Admin**
+▶️ !startquiz [triviaqa|opentdb|mixed]
+🤖 !triviaqa · status, sample, classify, reject
+🔀 !admin set question_source …
+⏰ !schedulequiz HH:MM · schedule once
+📅 !schedulequiz · list pending
+🚫 !cancelquiz HH:MM · cancel
+📥 !prefetch · fetch questions ahead
+🧹 !resetstats confirm · wipe history
 
-Answer: 🇦 🇧 🇨 🇩 · or type !a !b !c !d
-Change answer any time before the timer ends."
+👆 Answer: 🇦 🇧 🇨 🇩 or type !a !b !c !d
+🔄 You can change it until the timer ends."
         .to_owned()
 }

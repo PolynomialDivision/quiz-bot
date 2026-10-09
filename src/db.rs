@@ -1,6 +1,6 @@
 //! SQLite persistence layer via rusqlite + spawn_blocking.
 //!
-//! The database file lives at `{STORE_PATH}/quiz.db` — same directory as
+//! The database file lives at `{STORE_PATH}/quiz.db`: same directory as
 //! state.json.  No separate process or configuration required.
 
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ pub struct LeaderboardEntry {
     pub total_correct: i64,
     pub total_questions: i64,
     pub rounds_played: i64,
-    /// Wilson score lower bound (95 % CI) — the sort key used by the leaderboard.
+    /// Wilson score lower bound (95 % CI). The sort key used by the leaderboard.
     /// Ranges 0..1; penalises small sample sizes so occasional lucky players
     /// don't outrank consistent regulars.
     pub wilson_score: f64,
@@ -170,7 +170,7 @@ impl Db {
         Ok(())
     }
 
-    /// `generation_version` (which prompt produced a row's classification —
+    /// `generation_version` (which prompt produced a row's classification,
     /// rows from an older one are re-classified) and `rejected_reason` (the
     /// LLM or an admin found the question unsuitable; never served).
     fn migrate_triviaqa_generation_columns(conn: &mut Connection) -> Result<()> {
@@ -237,7 +237,7 @@ impl Db {
     /// Add and backfill `questions.normalized_text`, used to catch
     /// near-duplicate questions that differ only in punctuation/whitespace
     /// (e.g. OpenTDB entries for the same fact that quote the answer
-    /// differently — `Who painted "The Starry Night"?` vs `Who painted the
+    /// differently: `Who painted "The Starry Night"?` vs `Who painted the
     /// Starry Night?`). Plain SQL can't strip punctuation portably, so the
     /// column is populated here rather than in a .sql migration.
     fn migrate_normalized_text_column(conn: &mut Connection) -> Result<()> {
@@ -359,7 +359,7 @@ impl Db {
 
     /// All known display names, keyed by user ID. Used to render mention
     /// pills with a friendly label in contexts (e.g. command replies) that
-    /// have no live room query to draw fresher names from — see
+    /// have no live room query to draw fresher names from. See
     /// `format::mentionify_with_names`.
     pub async fn player_display_names(&self) -> Result<HashMap<String, String>> {
         self.run(|conn| {
@@ -537,15 +537,15 @@ impl Db {
 
 // ── TriviaQA pool ─────────────────────────────────────────────────────────────
 //
-// A static local corpus (ingested once — see `crate::triviaqa`), distinct
+// A static local corpus (ingested once, see `crate::triviaqa`), distinct
 // from `questions` (the "what has actually been asked" history that both
 // OpenTDB and TriviaQA share for cross-source deduplication).
 
 /// One TriviaQA question/answer pair, plus any previously-generated and
 /// cached classification (`category_group`/`difficulty`, reusing the bot's
-/// existing OpenTDB-derived vocabulary — see `fetcher::CATEGORY_GROUPS`) and
+/// existing OpenTDB-derived vocabulary, see `fetcher::CATEGORY_GROUPS`) and
 /// distractors. All three are `None`/empty until first classified, which
-/// happens together in one LLM call — see `crate::triviaqa`.
+/// happens together in one LLM call. See `crate::triviaqa`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriviaQaRow {
     pub id: i64,
@@ -644,7 +644,7 @@ impl Db {
     }
 
     /// Up to `limit` random rows ready to serve: classified by `version`,
-    /// not rejected, in one of `groups` (any if empty) and — if given — of
+    /// not rejected, in one of `groups` (any if empty) and (if given) of
     /// `difficulty`.
     pub async fn triviaqa_ready(
         &self,
@@ -935,16 +935,16 @@ impl Db {
             .await
     }
 
-    /// True if a question matching `question_text` — exact text, or
-    /// [`normalize_question_text`]-equal (catches near-duplicates that only
-    /// differ in punctuation/whitespace, e.g. quoted vs. unquoted titles) —
+    /// True if a question matching `question_text` (exact text, or
+    /// [`normalize_question_text`]-equal, which catches near-duplicates that only
+    /// differ in punctuation/whitespace, e.g. quoted vs. unquoted titles)
     /// was asked within the last `cooldown_days` days.
     ///
     /// Matches older than the cooldown don't count: without an expiry,
     /// dedup against unbounded history means small OpenTDB category pools
     /// (some have well under 100 questions) permanently exhaust and every
     /// draw becomes a forced repeat. Aging matches out lets the pool
-    /// recycle instead — see `fetcher::QUESTION_REUSE_COOLDOWN_DAYS`.
+    /// recycle instead. See `fetcher::QUESTION_REUSE_COOLDOWN_DAYS`.
     pub async fn question_recently_asked(
         &self,
         question_text: &str,
@@ -1169,7 +1169,7 @@ fn rank_entries(entries: Vec<(String, Option<String>, i64, i64, i64)>) -> Vec<Le
             .unwrap_or(std::cmp::Ordering::Equal)
             // Same lower bound, more evidence behind it.
             .then(b.total_questions.cmp(&a.total_questions))
-            // Only a stable order within a tie — ties share a rank when shown
+            // Only a stable order within a tie: ties share a rank when shown
             // (see `leaderboard::shared_ranks`).
             .then(a.user_id.cmp(&b.user_id))
     });
@@ -1236,7 +1236,7 @@ impl Db {
         .await
     }
 
-    /// Users with 1 or 2 correct answers — close to the 3-sample speed threshold.
+    /// Users with 1 or 2 correct answers: close to the 3-sample speed threshold.
     pub async fn speed_near_threshold(&self) -> Result<Vec<SpeedNearEntry>> {
         self.run(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -1422,7 +1422,7 @@ mod tests {
         let db = test_db().await;
         insert_question_aged(&db, r#"Who painted "The Starry Night"?"#, 0).await;
 
-        // Same fact, quoted differently — must still be caught so the bot
+        // Same fact, quoted differently: must still be caught so the bot
         // doesn't ask what is effectively the same question twice.
         assert!(db
             .question_recently_asked("Who painted the Starry Night?", 60)
@@ -1446,8 +1446,8 @@ mod tests {
         let db = test_db().await;
         insert_question_aged(&db, "Who painted the Mona Lisa?", 90).await;
 
-        // Asked 90 days ago; a 60-day cooldown must not still block it —
-        // this is the reuse policy that keeps small category pools from
+        // Asked 90 days ago; a 60-day cooldown must not still block it.
+        // This is the reuse policy that keeps small category pools from
         // permanently exhausting.
         assert!(!db
             .question_recently_asked("Who painted the Mona Lisa?", 60)
@@ -1477,7 +1477,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_survives_a_simulated_restart() {
-        // Not ":memory:" — a real file, closed and reopened, to prove
+        // Not ":memory:". A real file, closed and reopened, to prove
         // dedup history is backed by disk rather than lost on process
         // restart.
         let path = std::env::temp_dir().join(format!(
@@ -1490,7 +1490,7 @@ mod tests {
             let db = Db::open(&path).await.unwrap();
             db.migrate().await.unwrap();
             insert_question_aged(&db, "Who painted the Mona Lisa?", 0).await;
-        } // `db` dropped here — simulates the process exiting.
+        } // `db` dropped here: simulates the process exiting.
 
         {
             let db = Db::open(&path).await.unwrap();
@@ -1525,7 +1525,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        // All 10 inserts must have landed — concurrent access must not
+        // All 10 inserts must have landed: concurrent access must not
         // silently drop or corrupt rows.
         assert_eq!(db.question_count().await.unwrap(), 10);
         for i in 0..3 {

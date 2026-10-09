@@ -59,7 +59,7 @@ pub struct ActiveQuiz {
     /// Per-user answer records.  `record_answer` handles change-tracking.
     pub answers: HashMap<String, AnswerRecord>,
     pub correct_index: u8,
-    /// How many answers the question offers (2 for true/false) — anything
+    /// How many answers the question offers (2 for true/false). Anything
     /// beyond, like 🇨 on a true/false question, is not an answer.
     pub n_choices: u8,
 }
@@ -73,7 +73,7 @@ pub enum AnswerOutcome {
     New,
     /// The user had already answered; this changed their recorded choice.
     Replaced { previous: u8 },
-    /// The user had already answered this same choice — a no-op duplicate.
+    /// The user had already answered this same choice. A no-op duplicate.
     Unchanged,
 }
 
@@ -122,7 +122,7 @@ pub enum ReactionResult {
     /// It targeted the active question and was recorded.
     Accepted(AnswerOutcome),
     /// A quiz question is active, but this reaction targets a different
-    /// (older) event — e.g. a late reaction to a previous question.
+    /// (older) event, e.g. a late reaction to a previous question.
     WrongQuestion,
     /// No quiz question is currently active at all.
     NoActiveQuestion,
@@ -133,8 +133,8 @@ pub enum ReactionResult {
 
 /// Apply an incoming answer reaction to whatever question is currently
 /// active, if any. Pure aside from mutating `active_quiz` in place (no I/O),
-/// so the acceptance rules — matching the active question, ignoring a stale
-/// one, ignoring reactions with nothing active — are unit-testable without a
+/// so the acceptance rules (matching the active question, ignoring a stale
+/// one, ignoring reactions with nothing active) are unit-testable without a
 /// live Matrix room or event.
 pub fn apply_reaction(
     active_quiz: &mut Option<ActiveQuiz>,
@@ -218,9 +218,10 @@ fn question_text(
     let bar = time_bar(remaining_secs, total_secs);
     let mut lines = vec![
         format!(
-            "❓ Q{q_num}/{n_questions} | {icon} {} · {} | ⏳ {remaining_secs}s {bar}",
+            "❓ Q{q_num}/{n_questions} · {icon} {} · {}",
             fetched.difficulty, fetched.category,
         ),
+        format!("⏳ {remaining_secs}s {bar}"),
         String::new(),
         fetched.question.clone(),
         String::new(),
@@ -228,7 +229,7 @@ fn question_text(
     for (i, choice) in choices.iter().enumerate() {
         lines.push(format!("{}  {}", CHOICE_EMOJIS[i], choice));
     }
-    // No "React with …" footer — the bot adds reactions directly so users just tap.
+    // No "React with …" footer: the bot adds reactions directly so users just tap.
     lines.join("\n")
 }
 
@@ -243,7 +244,7 @@ fn make_edit(event_id: OwnedEventId, text: &str) -> RoomMessageEventContent {
 /// without. Observed in production: a homeserver-side hiccup (sync/auth
 /// 503s) can fail a single request for ~30 s before recovering on its own.
 /// Without a retry here, that single failed request used to abort the
-/// entire round via `?` — losing every remaining question and leaving the
+/// entire round via `?`: losing every remaining question and leaving the
 /// round's DB record permanently unfinished. Mirrors the retry shape already
 /// used for OpenTDB requests in fetcher.rs.
 async fn send_question_with_retry(
@@ -256,7 +257,7 @@ async fn send_question_with_retry(
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s, 8 s, 16 s
-            warn!("Posting question failed — retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
+            warn!("Posting question failed, retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
         match room.send(content.clone()).await {
@@ -275,7 +276,7 @@ async fn send_question_with_retry(
 /// Fetch one page of reactions related to `q_event_id`, retrying transient
 /// failures. This query is the one mechanism that recovers a reaction the
 /// live sync stream missed (e.g. it arrived while `start_quiz` was already
-/// draining `active_quiz` for evaluation) — a single failed request here
+/// draining `active_quiz` for evaluation). A single failed request here
 /// must not silently disable it. Mirrors the retry shape used elsewhere
 /// (see `send_question_with_retry`).
 ///
@@ -283,8 +284,8 @@ async fn send_question_with_retry(
 /// filtering only by relation type (`m.annotation`) rather than by the
 /// plaintext `m.reaction` event type. In an encrypted room, reactions travel
 /// wrapped as `m.room.encrypted` at the wire level, so a plaintext
-/// event-type filter — as this used to do via a raw, non-decrypting API
-/// call — matches nothing and silently returns an empty page. Filtering
+/// event-type filter (as this used to do via a raw, non-decrypting API
+/// call) matches nothing and silently returns an empty page. Filtering
 /// client-side (below) after decryption works regardless of room encryption.
 async fn fetch_relations_page(
     room: &Room,
@@ -302,7 +303,7 @@ async fn fetch_relations_page(
             let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s
             warn!(
                 question_event_id = %q_event_id,
-                "Reaction reconciliation query failed — retry {attempt}/{MAX_ATTEMPTS} in {delay}s"
+                "Reaction reconciliation query failed: retry {attempt}/{MAX_ATTEMPTS} in {delay}s"
             );
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
@@ -348,7 +349,7 @@ async fn reconcile_reactions(
             Err(e) => {
                 warn!(
                     question_event_id = %q_event_id,
-                    "Reaction reconciliation failed after retries — evaluating with \
+                    "Reaction reconciliation failed after retries: evaluating with \
                      live-stream answers only: {e}"
                 );
                 break;
@@ -368,7 +369,7 @@ async fn reconcile_reactions(
                 continue;
             };
             let Some(orig) = ev.as_original() else {
-                continue; // Redacted — the user un-reacted; correctly excluded.
+                continue; // Redacted. The user un-reacted; correctly excluded.
             };
             // Skip the bot's own 🇦🇧🇨🇩 reactions it posted for tap-to-answer.
             if client
@@ -393,7 +394,7 @@ async fn reconcile_reactions(
                     .unwrap_or_else(chrono::Utc::now);
             // `Room::relations` defaults to backward (most-recent-first)
             // order, so the first entry seen per sender is their latest
-            // reaction — relevant if a client doesn't auto-redact a
+            // reaction: relevant if a client doesn't auto-redact a
             // superseded reaction before sending the new one.
             server_answers
                 .entry(orig.sender.as_str().to_owned())
@@ -420,7 +421,7 @@ async fn reconcile_reactions(
     if !fully_synced {
         // Only a partial (or no) view of the server's reaction state is
         // available. Trusting it would risk *dropping* answers the live
-        // stream already recorded correctly — worse than doing nothing.
+        // stream already recorded correctly: worse than doing nothing.
         return;
     }
 
@@ -451,7 +452,7 @@ struct ServerAnswer {
 /// What `merge_reconciled_answers` changed, for logging.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReconciliationSummary {
-    /// Users present on the server but missing from the live stream —
+    /// Users present on the server but missing from the live stream,
     /// e.g. a reaction that arrived just before the deadline and hadn't
     /// been processed (or was processed after `active_quiz` was already
     /// drained) when the countdown ended.
@@ -477,7 +478,7 @@ impl ReconciliationSummary {
 /// corrected here take the reaction's server timestamp as `submitted_at`.
 ///
 /// The stream never sees `m.room.redaction` events, so it can hold a stale
-/// reaction answer after the user removed it — the server's current
+/// reaction answer after the user removed it. The server's current
 /// reaction set is authoritative. Rules:
 ///  • Reaction answer + user gone from server  → remove (they un-reacted)
 ///  • Text answer (!a/!b/…) + not on server    → keep (text can't be un-sent)
@@ -501,7 +502,7 @@ fn merge_reconciled_answers(
         answers
             .entry(user_id.clone())
             .and_modify(|r| {
-                // Don't touch text answers — they're always final.
+                // Don't touch text answers: they're always final.
                 if r.source != "text" && r.choice != server.choice {
                     r.choice = server.choice;
                     r.source = "reconciled";
@@ -610,23 +611,23 @@ pub async fn start_quiz(
 
     // ── Resolve the preloaded question set ────────────────────────────────────
     //
-    // The round runs entirely off this set — no on-demand fetching happens
+    // The round runs entirely off this set. No on-demand fetching happens
     // once the round starts. If OpenTDB couldn't supply the full count within
     // its retry/time budget (see `fetch_round_questions`), we shorten the
     // round to what's actually usable instead of discovering the shortfall
     // mid-round. A round that comes up completely empty is skipped outright.
     let questions: Vec<state::FetchedQuestion> = prefetch_handle.await.unwrap_or_default();
     let Some(round_len) = resolve_round_length(questions.len(), n_questions) else {
-        error!("Round prefetch returned no usable questions — skipping this round");
+        error!("Round prefetch returned no usable questions, skipping this round");
         room.send(RoomMessageEventContent::text_plain(
-            "⚠️ Couldn't prepare any questions for this round (no question source available) — skipping.",
+            "⚠️ Couldn't prepare any questions for this round.\n📭 No question source is available, so I'm skipping it.",
         ))
         .await
         .ok();
         return Ok(());
     };
     if round_len < n_questions {
-        warn!("Round prefetch supplied {round_len}/{n_questions} questions — shortening round");
+        warn!("Round prefetch supplied {round_len}/{n_questions} questions, shortening round");
     }
 
     // ── Create round in DB ────────────────────────────────────────────────────
@@ -684,11 +685,11 @@ pub async fn start_quiz(
                     q_num,
                     round_len,
                     questions_asked,
-                    "Ending round early — could not post question after retries: {e:#}"
+                    "Ending round early: could not post question after retries: {e:#}"
                 );
                 room.send(RoomMessageEventContent::text_plain(format!(
-                    "⚠️ Lost connection to Matrix while posting Q{q_num}/{round_len} — \
-                     ending round early ({questions_asked} question{} completed).",
+                    "⚠️ Lost connection to Matrix while posting Q{q_num}/{round_len}.\n\
+                     🏁 Ending the round early ({questions_asked} question{} completed).",
                     if questions_asked == 1 { "" } else { "s" }
                 )))
                 .await
@@ -700,7 +701,7 @@ pub async fn start_quiz(
 
         // ── Insert question in DB ─────────────────────────────────────────────
         // The question is already in the room, so a DB error must not end
-        // the round — it is still evaluated, just not recorded.
+        // the round. It is still evaluated, just not recorded.
         let question_id = match ctx
             .db
             .insert_question(&db::QuestionParams {
@@ -722,7 +723,7 @@ pub async fn start_quiz(
             Err(e) => {
                 error!(
                     round_id,
-                    q_num, "DB insert_question failed — question not recorded: {e:#}"
+                    q_num, "DB insert_question failed: question not recorded: {e:#}"
                 );
                 None
             }
@@ -851,7 +852,7 @@ pub async fn start_quiz(
         // ── Result message ────────────────────────────────────────────────────
         let mut result_lines = vec![format!("✅ {correct_emoji} **{correct_text}**")];
         if answers.is_empty() {
-            result_lines.push("No answers.".to_owned());
+            result_lines.push("🤷 No answers.".to_owned());
         } else if correct_users.is_empty() {
             result_lines.push("Nobody got it right 😅".to_owned());
         } else {
@@ -937,7 +938,8 @@ pub async fn start_quiz(
                     }
 
                     // Post the explanation text as a reply (shows quote box).
-                    let mut content = RoomMessageEventContent::text_plain(&result.text);
+                    let mut content =
+                        RoomMessageEventContent::text_plain(format!("💡 {}", result.text));
                     content.relates_to = Some(Relation::Thread(Thread::reply(
                         result_event_id.clone(),
                         result_event_id,
@@ -975,14 +977,14 @@ pub async fn start_quiz(
 
         if round_scores.is_empty() {
             summary_lines.push(String::new());
-            summary_lines.push("No answers this round.".to_owned());
+            summary_lines.push("🤷 No answers this round.".to_owned());
         } else {
             summary_lines.push(String::new());
             summary_lines.push("🎯 This round:".to_owned());
             summary_lines.extend(round_podium_lines(&round_scores, questions_asked));
         }
 
-        // Kept so its player names can be added to the mention map below —
+        // Kept so its player names can be added to the mention map below:
         // `leaderboard_text` embeds raw mxids that only this round's podium
         // (via `fetch_names`) would otherwise resolve.
         let mut monthly_board: Option<Vec<db::MonthlyLeaderboardEntry>> = None;
@@ -1024,7 +1026,7 @@ pub async fn start_quiz(
             .unwrap_or_default();
         names.extend(fetch_names(&room, &user_ids).await);
         let mut content = crate::format::mentionify_with_names(&summary_lines.join("\n"), &names);
-        // Notify this round's players only — the appended monthly board lists
+        // Notify this round's players only. The appended monthly board lists
         // everyone who played this month, and they shouldn't be pinged by a
         // round they sat out.
         content.mentions = Some(round_mentions(round_scores.keys()));
@@ -1044,7 +1046,7 @@ fn round_mentions<'a>(users: impl Iterator<Item = &'a String>) -> Mentions {
 
 /// The round's ranking lines. Equal scores share a rank (the name order
 /// within a tie only keeps output stable); everyone placed in the top five
-/// is listed — a tie for fifth is not cut off halfway — within a sane length
+/// is listed (a tie for fifth is not cut off halfway) within a sane length
 /// for a busy room.
 fn round_podium_lines(
     round_scores: &HashMap<String, (u32, u32)>,

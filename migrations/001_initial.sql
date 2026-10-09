@@ -1,5 +1,5 @@
 -- Quiz-bot SQLite schema (applied once on startup via execute_batch)
--- All CREATE statements use IF NOT EXISTS — safe to re-run on every boot.
+-- All CREATE statements use IF NOT EXISTS: safe to re-run on every boot.
 
 CREATE TABLE IF NOT EXISTS players (
     user_id       TEXT PRIMARY KEY,

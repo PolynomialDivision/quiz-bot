@@ -2,7 +2,7 @@
 -- configured dataset URL (see src/triviaqa.rs) rather than re-downloaded
 -- on every startup. Distractors (wrong answers) are generated on demand by
 -- the LLM and cached here so a question that later cycles back in (after
--- its reuse cooldown expires — see questions.normalized_text) doesn't pay
+-- its reuse cooldown expires, see questions.normalized_text) doesn't pay
 -- for a fresh LLM call.
 --
 -- Deliberately separate from `questions` (the "what has this bot actually
@@ -15,7 +15,7 @@
 -- questions plug into the same category filtering / difficulty selection /
 -- round diversity logic as OpenTDB ones. Both are classified by the LLM
 -- (same call that generates distractors) the first time a row is sampled,
--- and cached here — NULL until then.
+-- and cached here: NULL until then.
 CREATE TABLE IF NOT EXISTS triviaqa_pool (
     id                       INTEGER PRIMARY KEY,
     question_text            TEXT    NOT NULL UNIQUE,

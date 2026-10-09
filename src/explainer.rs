@@ -21,7 +21,8 @@ After each question you receive the question text and its correct answer (source
 Your job is to help players understand and remember the answer.
 
 Write a short, engaging explanation (2–4 sentences) covering why the answer is correct and an \
-interesting fact or context. No sections, no headers, no bullet points — just natural prose.
+interesting fact or context. No sections, no headers, no bullet points: just natural prose. \
+Never use em dashes; use a comma, a colon or a new sentence instead.
 
 On the very last line write exactly:
 IMAGE_SEARCH: <keyword>
@@ -68,7 +69,15 @@ fn parse_response(raw: String) -> (String, Option<String>) {
         text_lines.pop();
     }
 
-    (text_lines.join("\n"), search_term)
+    (without_long_dashes(&text_lines.join("\n")), search_term)
+}
+
+/// Models like the long dash even when told not to; the chat should not
+/// read like a machine wrote it.
+fn without_long_dashes(text: &str) -> String {
+    text.replace(" — ", ", ")
+        .replace(" —", ",")
+        .replace('—', ", ")
 }
 
 // ── Wikimedia Commons image search ───────────────────────────────────────────
@@ -295,4 +304,18 @@ pub async fn explain(
     };
 
     Some(ExplainerResult { text, image_url })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_dashes_are_taken_out_of_explanations() {
+        let (text, search) = parse_response(
+            "Paris is the capital — and the largest city.\nIMAGE_SEARCH: Paris".to_owned(),
+        );
+        assert_eq!(text, "Paris is the capital, and the largest city.");
+        assert_eq!(search.as_deref(), Some("Paris"));
+    }
 }

@@ -25,7 +25,7 @@ pub struct State {
     /// Pre-fetched questions from OpenTDB waiting to be used.
     #[serde(default)]
     pub cached_questions: VecDeque<FetchedQuestion>,
-    /// OpenTDB session token — tracks which questions have been served so we
+    /// OpenTDB session token: tracks which questions have been served so we
     /// don't repeat until all are exhausted.
     #[serde(default)]
     pub opentdb_token: Option<String>,
@@ -77,7 +77,7 @@ mod tests {
     #[tokio::test]
     async fn opentdb_token_survives_a_save_and_load_round_trip() {
         // The OpenTDB session token must be requested at most once per
-        // bot lifetime, not once per question — this is what lets a fresh
+        // bot lifetime, not once per question. This is what lets a fresh
         // `State::load` after a restart pick the persisted token back up
         // instead of `ensure_token` requesting a new one.
         let path = temp_path("token-roundtrip");

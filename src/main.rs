@@ -55,7 +55,7 @@ pub struct BotContext {
 
 /// Run one `!command` and build the reply, or `None` when there is nothing
 /// to say. Command replies (leaderboards, speed stats, …) embed raw mxids
-/// for any player they mention — resolve them to display names via the same
+/// for any player they mention: resolve them to display names via the same
 /// mention pipeline the round score uses.
 async fn command_reply(
     ctx: &BotContext,
@@ -71,9 +71,9 @@ async fn command_reply(
             content.mentions = Some(matrix_sdk::ruma::events::Mentions::new());
             Some(content)
         }
-        Err(e) if e.is::<mxbot_common::admin::NotAdmin>() => Some(format::mentionify(
-            "❌ This command requires admin privileges.",
-        )),
+        Err(e) if e.is::<mxbot_common::admin::NotAdmin>() => {
+            Some(format::mentionify("⛔ Only admins can do that."))
+        }
         Ok(None) => None,
         Err(e) => {
             error!("Command error: {e}");
@@ -125,9 +125,12 @@ async fn main() -> Result<()> {
         .store_path(&store_path)
         .settings(settings.store().clone())
         .admin_help(
-            "!startquiz [triviaqa|opentdb|mixed] · !triviaqa · !schedulequiz · !cancelquiz · \
-             !prefetch · !resetstats · !catconfig\n\
-             Settings: question_source (mixed|opentdb|triviaqa), triviaqa_share (0.0–1.0)",
+            "🧠 !startquiz · !triviaqa · !schedulequiz\n\
+             🚫 !cancelquiz · 📥 !prefetch · 🧹 !resetstats · 🗂️ !catconfig\n\
+             \n\
+             ⚙️ Settings:\n\
+             question_source: mixed, opentdb or triviaqa\n\
+             triviaqa_share: 0.0 to 1.0",
         )
         .start(&config.matrix, &config.security)
         .await?;
@@ -217,7 +220,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Reaction handler — quiz answers ───────────────────────────────────────
+    // ── Reaction handler: quiz answers ───────────────────────────────────────
     client.add_event_handler({
         let ctx = ctx.clone();
         let bot_user_id = bot_user_id.clone();
@@ -227,7 +230,7 @@ async fn main() -> Result<()> {
             async move {
                 // Routine, high-volume, and uninteresting: the bot's own
                 // tap-to-answer reactions and anything outside the quiz
-                // room. Not logged — logging every one would drown out the
+                // room. Not logged: logging every one would drown out the
                 // reactions that actually matter below.
                 if ev.sender == bot_user_id {
                     return;
@@ -245,8 +248,8 @@ async fn main() -> Result<()> {
                     "🇧" => 1,
                     "🇨" => 2,
                     "🇩" => 3,
-                    // Not an answer reaction (e.g. 👍 on some other message) —
-                    // this is the overwhelming majority of room reactions, so
+                    // Not an answer reaction (e.g. 👍 on some other message).
+                    // This is the overwhelming majority of room reactions, so
                     // stays silent too.
                     _ => return,
                 };
@@ -254,8 +257,8 @@ async fn main() -> Result<()> {
                 let reacted_to = ev.content.relates_to.event_id.clone();
                 let sender = ev.sender.as_str().to_owned();
 
-                // From here on, a real answer-shaped reaction was received —
-                // every outcome is logged so a lost answer can be traced.
+                // From here on, a real answer-shaped reaction was received.
+                // Every outcome is logged so a lost answer can be traced.
                 let mut aq = ctx.active_quiz.lock().await;
                 let result =
                     quiz::apply_reaction(&mut aq, &reacted_to, sender.clone(), choice_index);
@@ -276,7 +279,7 @@ async fn main() -> Result<()> {
                             key,
                             received_at = %ev.origin_server_ts.get(),
                             previous_choice = previous,
-                            "Reaction accepted — replaced previous answer"
+                            "Reaction accepted: replaced previous answer"
                         )
                     }
                     quiz::ReactionResult::Accepted(quiz::AnswerOutcome::Unchanged) => info!(
@@ -284,28 +287,28 @@ async fn main() -> Result<()> {
                         reacted_to = %reacted_to,
                         sender = %sender,
                         key,
-                        "Reaction ignored — duplicate of the sender's existing answer"
+                        "Reaction ignored: duplicate of the sender's existing answer"
                     ),
                     quiz::ReactionResult::WrongQuestion => info!(
                         reaction_event_id = %ev.event_id,
                         reacted_to = %reacted_to,
                         sender = %sender,
                         key,
-                        "Reaction ignored — targets a different (stale) question"
+                        "Reaction ignored: targets a different (stale) question"
                     ),
                     quiz::ReactionResult::NoActiveQuestion => info!(
                         reaction_event_id = %ev.event_id,
                         reacted_to = %reacted_to,
                         sender = %sender,
                         key,
-                        "Reaction ignored — no quiz question is currently active"
+                        "Reaction ignored: no quiz question is currently active"
                     ),
                     quiz::ReactionResult::NotAChoice => info!(
                         reaction_event_id = %ev.event_id,
                         reacted_to = %reacted_to,
                         sender = %sender,
                         key,
-                        "Reaction ignored — the question has no such answer"
+                        "Reaction ignored: the question has no such answer"
                     ),
                 }
             }

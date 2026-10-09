@@ -4,7 +4,7 @@
 //!  - An OpenTDB **session token** (`token=...` on every question request):
 //!    OpenTDB itself won't hand back a question already served to that
 //!    token, until the token's pool for the query is exhausted
-//!    (`response_code = 4`), at which point it's reset (not replaced —
+//!    (`response_code = 4`), at which point it's reset (not replaced,
 //!    reset keeps the same token, just clears its "seen" list) so the same
 //!    token keeps being reused indefinitely. The token is persisted in
 //!    `state.json` and requested at most once (see [`ensure_token`]).
@@ -46,8 +46,8 @@ pub const QUESTION_REUSE_COOLDOWN_DAYS: i64 = 60;
 // OpenTDB enforces roughly one request per 5 s per IP, across *all* endpoints
 // and tokens. Every call site used to manage its own ad hoc delays (a fixed
 // sleep between round categories, a sleep only after an explicit rate-limit
-// response, …), which meant bursts of near-simultaneous requests — e.g. one
-// `fetch_one` call skipping several duplicate questions — routinely blew
+// response, …), which meant bursts of near-simultaneous requests (e.g. one
+// `fetch_one` call skipping several duplicate questions) routinely blew
 // through the limit. OpenTDB then returned response_code 5 for every request
 // in the burst, which silently ate through each call's bounded retry budget
 // before a single one succeeded. Serializing every request through one gate
@@ -117,7 +117,7 @@ pub fn normalise(s: &str) -> String {
 /// Map OpenTDB's raw category names back to the bot's balanced groups.
 ///
 /// Also accepts the group labels themselves (e.g. "History", "Science &
-/// Technology") as input, not just OpenTDB's specific sub-category names —
+/// Technology") as input, not just OpenTDB's specific sub-category names:
 /// needed so a source with no sub-categories of its own (TriviaQA, which
 /// classifies straight into one of these 12 groups; see `crate::triviaqa`)
 /// maps back to itself instead of falling through to `None`.
@@ -193,7 +193,7 @@ pub fn category_is_active(category: &str, excluded: &[String]) -> bool {
 /// GET `url`, parse as `ApiResponse`, retrying on network/parse errors.
 /// Gives up after `MAX_NET_RETRIES` attempts with exponential backoff.
 /// Response-code errors (e.g. rate-limit, bad token) are returned as-is
-/// for the caller to handle — only transport-level failures are retried here.
+/// for the caller to handle, only transport-level failures are retried here.
 async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
     const MAX_NET_RETRIES: u32 = 5;
     let mut last_err = anyhow::anyhow!("no attempts made");
@@ -302,11 +302,11 @@ fn category_can_follow(
 // such operation is ever in flight.
 
 /// Serializes OpenTDB token creation and reset. Held only while a network
-/// round trip for the token itself is in flight — ordinary question
+/// round trip for the token itself is in flight: ordinary question
 /// requests (the hot path) never touch this lock.
 static TOKEN_OP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Short, non-reversible identifier for correlating token log lines —
+/// Short, non-reversible identifier for correlating token log lines,
 /// never log the token itself, since it's a live credential against a
 /// third-party API (anyone holding it can drain our request budget).
 fn token_fingerprint(token: &str) -> String {
@@ -315,7 +315,7 @@ fn token_fingerprint(token: &str) -> String {
     format!("{:08x}", hasher.finish() as u32)
 }
 
-/// `GET {base}?command=request` — ask OpenTDB for a brand-new session token.
+/// `GET {base}?command=request`: ask OpenTDB for a brand-new session token.
 async fn request_token_at(base: &str) -> anyhow::Result<TokenResponse> {
     throttle().await;
     Ok(reqwest::get(format!("{base}?command=request"))
@@ -324,7 +324,7 @@ async fn request_token_at(base: &str) -> anyhow::Result<TokenResponse> {
         .await?)
 }
 
-/// `GET {base}?command=reset&token=...` — clear a token's "already served"
+/// `GET {base}?command=reset&token=...`: clear a token's "already served"
 /// memory so it can be reused. The token string itself is unchanged.
 async fn reset_token_at(base: &str, token: &str) -> anyhow::Result<TokenResponse> {
     throttle().await;
@@ -340,11 +340,11 @@ async fn reset_token_at(base: &str, token: &str) -> anyhow::Result<TokenResponse
 /// just filled it while we were waiting), and only call `fetch` if it's
 /// still empty.
 ///
-/// Not used by production code — `ensure_token` needs the exact same
+/// Not used by production code: `ensure_token` needs the exact same
 /// shape but operates on `ctx.state` (a `Mutex<State>`, not a bare
 /// `Mutex<Option<String>>`), so it's hand-written rather than calling
 /// this. This exists purely so the double-checked-locking algorithm
-/// itself — the thing that makes concurrent `ensure_token` calls safe —
+/// itself (the thing that makes concurrent `ensure_token` calls safe)
 /// has a direct, network-free, non-BotContext test: see
 /// `token_tests::acquire_token_single_flights_concurrent_callers`.
 #[cfg(test)]
@@ -370,7 +370,7 @@ where
 }
 
 /// Return the stored session token, requesting a fresh one only if none is
-/// cached yet. Concurrent callers are serialized by `TOKEN_OP_LOCK` — see
+/// cached yet. Concurrent callers are serialized by `TOKEN_OP_LOCK`. See
 /// the module-level doc comment on ``Token management``.
 ///
 /// `token_url` is injectable so tests can point this at a local mock
@@ -400,12 +400,12 @@ async fn ensure_token(ctx: &BotContext, token_url: &str) -> anyhow::Result<Strin
 }
 
 /// Reset a token after its question pool is exhausted (`response_code = 4`).
-/// The token string is unchanged — only its "already served" memory is
-/// cleared — so callers keep using the same value afterward; nothing needs
+/// The token string is unchanged (only its "already served" memory is
+/// cleared) so callers keep using the same value afterward; nothing needs
 /// to be re-persisted to `state.json`. Serialized by `TOKEN_OP_LOCK` so two
 /// concurrent code-4 responses for the same token don't both reset it.
 ///
-/// Takes no `BotContext`/state at all — by construction, a reset can never
+/// Takes no `BotContext`/state at all. By construction, a reset can never
 /// clear the cached token (the earlier bug: the old code did exactly that
 /// right after a successful reset, discarding a token that was still
 /// perfectly valid and forcing a wasted extra "request new token" call).
@@ -419,7 +419,7 @@ async fn reset_token(token: &str, token_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Clear the cached token, but only if it still matches `token` — a
+/// Clear the cached token, but only if it still matches `token`. A
 /// concurrent caller may have already replaced it with a fresh one while
 /// this now-stale request was in flight, and we must not discard that.
 /// Used when OpenTDB reports the token invalid/expired (`response_code = 3`).
@@ -434,7 +434,7 @@ async fn clear_token_if_matches(ctx: &BotContext, token: &str) -> anyhow::Result
             "Cleared invalid/expired OpenTDB session token"
         );
     } else {
-        debug!("Skipped clearing OpenTDB token — already replaced by a concurrent caller");
+        debug!("Skipped clearing OpenTDB token, already replaced by a concurrent caller");
     }
     Ok(())
 }
@@ -527,14 +527,14 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 );
                 return Ok(n);
             }
-            // Code 3: token expired after 6 h inactivity — clear it and retry.
+            // Code 3: token expired after 6 h inactivity, clear it and retry.
             3 if !token_refreshed => {
                 warn!("OpenTDB session token expired, requesting a new one");
                 clear_token_if_matches(ctx, &token).await?;
                 token_refreshed = true;
             }
-            3 => warn!("OpenTDB token still not found after refresh — retrying"),
-            // Code 4: every question for the current query has been seen —
+            3 => warn!("OpenTDB token still not found after refresh, retrying"),
+            // Code 4: every question for the current query has been seen,
             // reset it. Reset keeps the same token value, so it stays
             // cached in state.json; nothing to persist here.
             4 if !token_refreshed => {
@@ -542,10 +542,10 @@ pub async fn prefetch(ctx: &BotContext) -> anyhow::Result<usize> {
                 reset_token(&token, TOKEN_URL).await?;
                 token_refreshed = true;
             }
-            4 => warn!("OpenTDB token still exhausted after reset — retrying"),
-            // Code 5: rate-limited — the backoff delay at loop top handles the wait.
-            5 => warn!("OpenTDB rate-limited — will retry after backoff"),
-            c => warn!("OpenTDB API error (response_code {c}) — retrying"),
+            4 => warn!("OpenTDB token still exhausted after reset, retrying"),
+            // Code 5: rate-limited. The backoff delay at loop top handles the wait.
+            5 => warn!("OpenTDB rate-limited, will retry after backoff"),
+            c => warn!("OpenTDB API error (response_code {c}), retrying"),
         }
     }
 
@@ -751,18 +751,18 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
 
                     if attempt == MAX_SKIP {
                         // Every candidate this call drew was within the reuse
-                        // cooldown — pool for this category is genuinely tight
+                        // cooldown: pool for this category is genuinely tight
                         // right now. Resurface whichever has gone longest
                         // without being asked rather than a fresher repeat.
                         let (chosen, chosen_at) =
                             best_duplicate.expect("set above on this iteration");
                         warn!(
                             "Reusing duplicate question for category {category} \
-                             (last asked {chosen_at:?}) — pool within cooldown window"
+                             (last asked {chosen_at:?}), pool within cooldown window"
                         );
                         return Ok(chosen);
                     }
-                    // Duplicate — try again.
+                    // Duplicate: try again.
                     info!(
                         "Skipping duplicate for category {category} ({}/{})",
                         attempt + 1,
@@ -772,16 +772,16 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                 }
                 anyhow::bail!("OpenTDB returned empty results for category {category}");
             }
-            // Code 3: token expired — clear and retry once.
+            // Code 3: token expired, clear and retry once.
             3 if !token_refreshed => {
                 warn!("OpenTDB token not found (expired) for category {category}, refreshing");
                 clear_token_if_matches(ctx, &token).await?;
                 token_refreshed = true;
             }
             3 => anyhow::bail!("OpenTDB token not found even after refresh"),
-            // Code 4: token exhausted — reset and retry once. Reset keeps
+            // Code 4: token exhausted, reset and retry once. Reset keeps
             // the same token value (it just clears the "already served"
-            // memory), so — unlike code 3 — the cached token must NOT be
+            // memory), so (unlike code 3) the cached token must NOT be
             // discarded here: doing so would throw away a token that was
             // just successfully reset and force a wasted extra round trip
             // to request a brand-new one on the next attempt.
@@ -791,13 +791,13 @@ async fn fetch_one(ctx: &BotContext, category: u32) -> anyhow::Result<FetchedQue
                 token_refreshed = true;
             }
             4 => anyhow::bail!("OpenTDB token still exhausted after reset"),
-            // Code 5: rate-limited — wait and retry.
+            // Code 5: rate-limited, wait and retry.
             5 => {
-                warn!("OpenTDB rate-limited on category {category} — waiting 6s");
+                warn!("OpenTDB rate-limited on category {category}, waiting 6s");
                 tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
             }
             c => {
-                warn!("OpenTDB API error (code {c}) for category {category} — retrying");
+                warn!("OpenTDB API error (code {c}) for category {category}, retrying");
             }
         }
     }
@@ -843,8 +843,8 @@ pub async fn fetch_round_questions(
     // time: per-slot fallbacks (cache miss → alternate category → alternate
     // category) can each cost several throttled requests, and this runs
     // during the pre-quiz reminder window, so it must not run indefinitely.
-    // Any slots left unfilled when the budget expires are simply omitted —
-    // the caller shortens the round rather than fetching on demand later.
+    // Any slots left unfilled when the budget expires are simply omitted.
+    // The caller shortens the round rather than fetching on demand later.
     const ROUND_PREFETCH_BUDGET: Duration = Duration::from_secs(180);
     let deadline = Instant::now() + ROUND_PREFETCH_BUDGET;
 
@@ -862,7 +862,7 @@ pub async fn fetch_round_questions(
             warn!(
                 gathered = questions.len(),
                 requested = n,
-                "Round prefetch budget ({:?}) exhausted — proceeding with questions gathered so far",
+                "Round prefetch budget ({:?}) exhausted, proceeding with questions gathered so far",
                 ROUND_PREFETCH_BUDGET
             );
             break;
@@ -882,7 +882,7 @@ pub async fn fetch_round_questions(
                     continue;
                 }
                 Err(e) => {
-                    info!("TriviaQA: no question for this slot ({e:#}) — falling back to OpenTDB");
+                    info!("TriviaQA: no question for this slot ({e:#}): falling back to OpenTDB");
                 }
             }
         }
@@ -926,7 +926,7 @@ pub async fn fetch_round_questions(
             }
             Err(e) => {
                 warn!(
-                    "fetch_one failed for category {}: {e} — falling back to cache",
+                    "fetch_one failed for category {}: {e}, falling back to cache",
                     choice.category_id
                 );
                 match next_question_avoiding(ctx, &avoid_groups, previous_group.as_deref()).await {
@@ -945,7 +945,7 @@ pub async fn fetch_round_questions(
         warn!(
             gathered = questions.len(),
             requested = n,
-            "Round prefetch produced fewer questions than requested — round will be shortened"
+            "Round prefetch produced fewer questions than requested: round will be shortened"
         );
     } else {
         info!(gathered = questions.len(), "Round prefetch complete");
@@ -1061,26 +1061,26 @@ async fn cached_question_excluding(
 /// previous round.  Fetches a fresh batch if the cache runs empty.
 ///
 /// After MAX_SKIP consecutive duplicates we give up deduplication and return
-/// the next available question — this prevents an infinite loop when the entire
+/// the next available question. This prevents an infinite loop when the entire
 /// OpenTDB pool has been exhausted.
 pub async fn next_question(
     ctx: &BotContext,
     source: QuestionSource,
 ) -> anyhow::Result<FetchedQuestion> {
     // No within-round exclusion set here (unlike the main per-category loop
-    // in `fetch_round_questions`) — this path is called one question at a
+    // in `fetch_round_questions`). This path is called one question at a
     // time with no visibility into the rest of the round, same as OpenTDB's
     // own dedup here, which likewise relies only on cross-round DB history.
     if triviaqa::should_offer(ctx, source) {
         match triviaqa::next_question(ctx, &HashSet::new(), None).await {
             Ok(q) => return Ok(q),
-            Err(e) => info!("TriviaQA: no question available ({e:#}) — falling back to OpenTDB"),
+            Err(e) => info!("TriviaQA: no question available ({e:#}): falling back to OpenTDB"),
         }
     }
 
     const MAX_SKIP: usize = 30;
     // Best duplicate seen so far, used only if every candidate this call
-    // pops turns out to be within the reuse cooldown — see `fetch_one`.
+    // pops turns out to be within the reuse cooldown. See `fetch_one`.
     let mut best_duplicate: Option<(FetchedQuestion, Option<DateTime<Utc>>)> = None;
 
     for attempt in 0..=MAX_SKIP {
@@ -1152,12 +1152,12 @@ pub async fn next_question(
         }
 
         if attempt == MAX_SKIP {
-            // Entire reachable pool is within the cooldown window — reuse
+            // Entire reachable pool is within the cooldown window: reuse
             // rather than hang, but prefer whichever duplicate has gone
             // longest without being asked.
             let (chosen, chosen_at) = best_duplicate.expect("set above on this iteration");
             warn!(
-                "Skipped {MAX_SKIP} duplicate questions — pool within cooldown window, \
+                "Skipped {MAX_SKIP} duplicate questions: pool within cooldown window, \
                  reusing the least-recently-asked one (last asked {chosen_at:?})."
             );
             return Ok(chosen);
@@ -1323,7 +1323,7 @@ mod tests {
 #[cfg(test)]
 mod token_tests {
     //! Exercises the real `ensure_token` / `reset_token` /
-    //! `clear_token_if_matches` functions — not a reimplementation —
+    //! `clear_token_if_matches` functions (not a reimplementation)
     //! against a local mock OpenTDB server (`wiremock`) and a real,
     //! network-free `BotContext` (matrix-sdk's own `MockClientBuilder`,
     //! gated behind its `testing` feature).
@@ -1352,8 +1352,8 @@ mod token_tests {
         quiz_times = ["12:00"]
     "#;
 
-    /// A real `BotContext` — real in-memory DB, real (network-free) matrix
-    /// Client, real `State` backed by `state_path` — so `ensure_token(ctx)`
+    /// A real `BotContext` (real in-memory DB, real (network-free) matrix
+    /// Client, real `State` backed by `state_path`) so `ensure_token(ctx)`
     /// runs exactly as it does in production.
     async fn test_ctx(state_path: std::path::PathBuf) -> BotContext {
         let client = matrix_sdk::test_utils::client::MockClientBuilder::new(None)
@@ -1417,7 +1417,7 @@ mod token_tests {
 
         assert_eq!(first, "tok-abc");
         assert_eq!(second, "tok-abc");
-        // wiremock verifies `.expect(1)` on drop — a second HTTP call would
+        // wiremock verifies `.expect(1)` on drop. A second HTTP call would
         // fail this test.
     }
 
@@ -1442,7 +1442,7 @@ mod token_tests {
             let ctx = test_ctx(state_path.clone()).await;
             let token = ensure_token(&ctx, &base).await.unwrap();
             assert_eq!(token, "tok-persisted");
-        } // ctx (and its in-memory state) dropped — simulates process exit.
+        } // ctx (and its in-memory state) dropped: simulates process exit.
 
         {
             // Fresh BotContext loading state from the same file, as happens
@@ -1486,7 +1486,7 @@ mod token_tests {
         assert_eq!(token, "tok-xyz");
 
         // The real `reset_token` used by fetch_one/prefetch's code-4
-        // handler — it takes no `ctx`/state at all, so by construction it
+        // handler: it takes no `ctx`/state at all, so by construction it
         // cannot clear the cached token (the bug that was fixed: the old
         // code did exactly that right after a successful reset, discarding
         // a token that was still valid and forcing a wasted second
@@ -1566,7 +1566,7 @@ mod token_tests {
 
     #[tokio::test]
     async fn token_request_at_parses_a_non_zero_response_code_without_erroring() {
-        // `request_token_at` is a pure fetch-and-parse — it hands the
+        // `request_token_at` is a pure fetch-and-parse. It hands the
         // response code back for the caller to interpret, rather than
         // deciding for itself what's an error.
         let server = MockServer::start().await;
@@ -1600,7 +1600,7 @@ mod token_tests {
 
         let err = ensure_token(&ctx, &base).await.unwrap_err();
         assert!(format!("{err:#}").contains("code 2"), "error was: {err:#}");
-        // A failed token request must not poison the cache — a later
+        // A failed token request must not poison the cache. A later
         // retry should still be possible.
         assert_eq!(ctx.state.lock().await.opentdb_token, None);
     }
@@ -1654,7 +1654,7 @@ mod token_tests {
             .and(query_param("command", "request"))
             // A small delay widens the window for two callers to race past
             // the first (unlocked) cache check before either has written
-            // the result back — the scenario `TOKEN_OP_LOCK` must prevent
+            // the result back. The scenario `TOKEN_OP_LOCK` must prevent
             // from producing two independent token requests.
             .respond_with(
                 ResponseTemplate::new(200)

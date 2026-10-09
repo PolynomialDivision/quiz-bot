@@ -1,7 +1,7 @@
 //! Minimal Groq (OpenAI-compatible) chat completions client, shared by
 //! `explainer` (post-question background info + image search keyword) and
 //! `triviaqa` (classification + multiple-choice distractor generation).
-//! Callers own their own system prompt and response parsing — this module is
+//! Callers own their own system prompt and response parsing. This module is
 //! only the HTTP call, retry, and error handling.
 
 use std::sync::LazyLock;
@@ -23,7 +23,7 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 /// Per-call options.
 #[derive(Clone, Copy)]
 pub struct Options {
-    /// Upper bound for the reply — for reasoning models (gpt-oss) this
+    /// Upper bound for the reply. For reasoning models (gpt-oss) this
     /// includes the hidden reasoning, so leave headroom.
     pub max_tokens: u32,
     /// Ask for a single JSON object (`response_format: json_object`).
@@ -47,7 +47,7 @@ struct ApiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     /// Only sent to reasoning models: keeps their (billed, slow) thinking
-    /// short — classification and short answers need little of it.
+    /// short: classification and short answers need little of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
 }
@@ -87,7 +87,7 @@ fn is_reasoning_model(model: &str) -> bool {
 
 /// POST a chat completion to Groq, retrying transient failures (network
 /// errors, rate limits, 5xx, empty content) with exponential backoff.
-/// Returns `None` — after logging why — on permanent errors (bad key,
+/// Returns `None` (after logging why) on permanent errors (bad key,
 /// unknown model, invalid request) or once `MAX_ATTEMPTS` is exhausted;
 /// callers decide how to degrade (skip the explanation, fall back to another
 /// question source, …).
@@ -140,7 +140,7 @@ pub async fn complete(
 
         let status = resp.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            error!("Groq: auth error {status} — check explainer.api_key in config");
+            error!("Groq: auth error {status}, check explainer.api_key in config");
             return None;
         }
         if !status.is_success() {
@@ -148,7 +148,7 @@ pub async fn complete(
             // Unknown model / malformed request: retrying cannot help.
             if status.as_u16() == 404 || body.contains("model_not_found") {
                 error!(
-                    "Groq: model {model:?} is not available — fix explainer.model in config \
+                    "Groq: model {model:?} is not available, fix explainer.model in config \
                      (see https://console.groq.com/docs/models): {body}"
                 );
                 return None;
@@ -177,7 +177,7 @@ pub async fn complete(
             .unwrap_or_default();
 
         if content.trim().is_empty() {
-            warn!("Groq: empty content (attempt {attempt}/{MAX_ATTEMPTS}) — raise max_tokens?");
+            warn!("Groq: empty content (attempt {attempt}/{MAX_ATTEMPTS}), raise max_tokens?");
             continue;
         }
 

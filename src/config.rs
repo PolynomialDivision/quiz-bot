@@ -153,15 +153,15 @@ impl Default for TriviaConfig {
 
 #[derive(Deserialize)]
 pub struct TriviaQaConfig {
-    /// Off by default — TriviaQA questions need an LLM call (via
+    /// Off by default: TriviaQA questions need an LLM call (via
     /// `[explainer].api_key`) to generate wrong answers, and the dataset
     /// must be downloaded once before it can supply any questions.
     #[serde(default)]
     pub enabled: bool,
-    /// Where to download the dataset from on first use (once — see
+    /// Where to download the dataset from on first use (once: see
     /// `crate::triviaqa`). Point this straight at the official release
-    /// (e.g. https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz)
-    /// — the bot reads `.tar.gz` archives natively, picking the
+    /// (e.g. https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz):
+    /// the bot reads `.tar.gz` archives natively, picking the
     /// `*-dev.json` split out of the bundle (see
     /// `triviaqa::PREFERRED_ARCHIVE_ENTRIES`), so no local extraction or
     /// re-hosting is needed. Plain JSON or gzip-compressed JSON matching
@@ -174,9 +174,9 @@ pub struct TriviaQaConfig {
     #[serde(default = "default_triviaqa_max_pool_size")]
     pub max_pool_size: usize,
     /// Fraction of quiz questions drawn from TriviaQA when enabled and the
-    /// pool has usable questions available (0.0–1.0). The rest — and any
-    /// slot TriviaQA can't fill (pool exhausted, LLM distractor generation
-    /// failed) — falls back to OpenTDB. Default 0.3.
+    /// pool has usable questions available (0.0–1.0). The rest (and any
+    /// slot TriviaQA can't fill: pool exhausted, LLM distractor generation
+    /// failed) falls back to OpenTDB. Default 0.3.
     #[serde(default = "default_triviaqa_mix_ratio")]
     pub mix_ratio: f64,
 }
@@ -269,7 +269,7 @@ impl QuizSettings {
 
 #[derive(Deserialize, Default)]
 pub struct ExplainerConfig {
-    /// Groq API key — leave empty to disable post-question explanations.
+    /// Groq API key: leave empty to disable post-question explanations.
     pub api_key: Option<String>,
     /// Groq model to use for explanations (default: llama-3.3-70b-versatile).
     #[serde(default = "default_explainer_model")]

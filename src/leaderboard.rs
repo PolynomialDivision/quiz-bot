@@ -105,7 +105,7 @@ pub fn shared_ranks<T>(items: &[T], tied: impl Fn(&T, &T) -> bool) -> Vec<usize>
     ranks
 }
 
-/// 🥇/🥈/🥉 for the top three ranks, "4." etc. below — tied players get the
+/// 🥇/🥈/🥉 for the top three ranks, "4." etc. below: tied players get the
 /// same marker.
 pub fn rank_marker(rank: usize) -> String {
     match rank {
@@ -140,7 +140,7 @@ pub fn mention_names(entries: &[MonthlyLeaderboardEntry]) -> HashMap<String, Str
 /// Render the leaderboard as plain text with each player's raw Matrix user
 /// ID embedded (e.g. `🥇 @alice:example.org · 12/15 ...`) rather than a
 /// display name. Callers MUST pass the result through `format::mentionify`
-/// or `format::mentionify_with_names` before sending — that is what turns
+/// or `format::mentionify_with_names` before sending. That is what turns
 /// the embedded IDs into proper mention pills (and, given a name map from
 /// `mention_names`, labels them with the player's display name). This keeps
 /// leaderboard output using the exact same mention path as the in-round
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn leaderboard_text_embeds_raw_mxids_for_the_mention_pipeline() {
         // `leaderboard_text` is a contract for callers that route the result
-        // through `format::mentionify`/`mentionify_with_names` — it must not
+        // through `format::mentionify`/`mentionify_with_names`. It must not
         // bake in display names itself, or those callers would double up on
         // (or bypass) the shared mention formatting.
         let text = leaderboard_text("All-time", 653, &[entry("Yakari", 98, 130)]);
@@ -291,7 +291,7 @@ mod tests {
         let (plain, html) = bodies(&content);
         let html = html.expect("should have HTML body");
 
-        // Plain body reads exactly as before — mentionify replaces each
+        // Plain body reads exactly as before: mentionify replaces each
         // embedded mxid with its display name in the plain text too.
         assert_eq!(
             plain,
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn display_names_are_escaped_in_html_and_sanitized_in_plain_text() {
-        // A real mxid never contains whitespace/control characters — only
+        // A real mxid never contains whitespace/control characters, only
         // the free-text display name does, so give it a clean user_id here
         // (unlike `entry()`, which derives both from the same input).
         let messy = MonthlyLeaderboardEntry {
@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn same_percentage_with_more_questions_is_not_a_tie() {
-        // 3/4 and 30/40 are both 75 %, but the Wilson bound — the ranking
-        // key — trusts the larger sample more. That is a real difference.
+        // 3/4 and 30/40 are both 75 %, but the Wilson bound (the ranking
+        // key) trusts the larger sample more. That is a real difference.
         let big = entry("Big", 30, 40);
         let small = entry("Small", 3, 4);
         assert!(big.wilson_score > small.wilson_score);
