@@ -205,7 +205,7 @@ async fn api_get_with_retry(url: &str) -> anyhow::Result<ApiResponse> {
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
         throttle().await;
-        match reqwest::get(url).await {
+        match http().get(url).send().await {
             Ok(resp) => match resp.json::<ApiResponse>().await {
                 Ok(api) => return Ok(api),
                 Err(e) => {
@@ -315,10 +315,25 @@ fn token_fingerprint(token: &str) -> String {
     format!("{:08x}", hasher.finish() as u32)
 }
 
+/// An HTTP client with timeouts for OpenTDB calls: a server that stops
+/// answering must not stall question fetching forever. Built per call like
+/// `reqwest::get` before it. Tests run with a paused clock, where any
+/// timeout would fire at once, so they get none.
+fn http() -> reqwest::Client {
+    let builder = reqwest::Client::builder();
+    #[cfg(not(test))]
+    let builder = builder
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30));
+    builder.build().unwrap_or_default()
+}
+
 /// `GET {base}?command=request`: ask OpenTDB for a brand-new session token.
 async fn request_token_at(base: &str) -> anyhow::Result<TokenResponse> {
     throttle().await;
-    Ok(reqwest::get(format!("{base}?command=request"))
+    Ok(http()
+        .get(format!("{base}?command=request"))
+        .send()
         .await?
         .json()
         .await?)
@@ -328,7 +343,9 @@ async fn request_token_at(base: &str) -> anyhow::Result<TokenResponse> {
 /// memory so it can be reused. The token string itself is unchanged.
 async fn reset_token_at(base: &str, token: &str) -> anyhow::Result<TokenResponse> {
     throttle().await;
-    Ok(reqwest::get(format!("{base}?command=reset&token={token}"))
+    Ok(http()
+        .get(format!("{base}?command=reset&token={token}"))
+        .send()
         .await?
         .json()
         .await?)

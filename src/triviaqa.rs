@@ -262,6 +262,18 @@ fn parse_dataset(bytes: &[u8], max_entries: usize) -> anyhow::Result<Vec<TriviaQ
     Ok(rows)
 }
 
+/// The dataset is large, so no overall time limit: but a connection that
+/// can't be made or stops sending data is given up instead of hanging.
+/// (Tests run with a paused clock, where timeouts would fire at once.)
+fn download_client() -> reqwest::Client {
+    let builder = reqwest::Client::builder();
+    #[cfg(not(test))]
+    let builder = builder
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(120));
+    builder.build().unwrap_or_default()
+}
+
 /// Download `url` with a small bounded retry. This only ever runs once
 /// (see `ensure_ingested`), so it's not worth the full throttled-retry
 /// machinery `fetcher.rs` uses for the live, rate-limited OpenTDB API.
@@ -275,7 +287,7 @@ async fn download(url: &str) -> anyhow::Result<Vec<u8>> {
             warn!("TriviaQA: download retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
             tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
-        match reqwest::get(url).await {
+        match download_client().get(url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                 Ok(b) => return Ok(b.to_vec()),
                 Err(e) => last_err = e.into(),

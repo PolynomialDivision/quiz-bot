@@ -10,6 +10,11 @@ device_id     = "REPLACE_ME"
 # Users allowed to invite the bot ("all" = anyone, [] = nobody).
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@admin:example.org"]
+# Rooms the bot may join: room IDs, [] for none, or "all" for every room.
+# Required: without it the bot refuses to start.
+allowed_rooms = ["!REPLACE_ME:example.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
 # Only these users may run admin commands, also privately in a direct chat
 # with the bot (!startquiz, !prefetch).
 admin_users = ["@admin:example.org"]
