@@ -19,6 +19,10 @@ allowed_rooms = ["!REPLACE_ME:example.org"]
 # with the bot (!startquiz, !prefetch).
 admin_users = ["@admin:example.org"]
 # encryption_strategy = "identity_based"  # AllDevices | IdentityBased (default) | OnlyTrusted
+# Whose devices count: "cross_signed" = every device you signed with your
+# own identity (a new identity is accepted), "verified" = only after
+# !admin verify (a new identity needs !reset-trust and a new verification).
+trust = "cross_signed"
 
 [schedule]
 # Matrix room where all quiz messages and bot replies are posted.
@@ -123,6 +127,5 @@ max_concurrent = 8
 enabled = true
 # Only accept admin commands in end-to-end encrypted direct chats.
 require_encryption = true
-# Only accept admin commands from devices the bot has verified (recommended
-# once you and the bot have verified each other).
+# Only accept admin commands from a device that counts under `trust` above.
 require_verified_device = false
