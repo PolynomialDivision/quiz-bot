@@ -49,12 +49,7 @@ fn due_fire_date(now: NaiveDateTime, fire_secs: i64) -> Option<NaiveDate> {
 }
 
 async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx.config.schedule.timezone;
     let local_now = chrono::Utc::now().with_timezone(&tz);
     let local_date = local_now.date_naive();
     let now = local_now.naive_local();
@@ -67,14 +62,10 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         .max()
         .unwrap_or(0) as i64;
 
-    for time_str in &ctx.config.schedule.quiz_times {
-        let (qh, qm) = match ScheduleConfig::parse_quiz_time(time_str) {
-            Some(t) => t,
-            None => {
-                warn!("Invalid quiz_times entry {:?}, skipping", time_str);
-                continue;
-            }
-        };
+    for quiz_time in &ctx.config.schedule.quiz_times {
+        let (qh, qm) = (quiz_time.hour, quiz_time.minute);
+        // The slot's key in `last_quiz_dates`, as "HH:MM".
+        let time_str = &quiz_time.to_string();
 
         // Fire `offset` seconds before the quiz so the reminder lands on time.
         let fire_secs = fire_secs(qh, qm, offset);
@@ -216,16 +207,14 @@ async fn post_previous_month(
             .get_room(&ctx.room_id)
             .ok_or_else(|| anyhow::anyhow!("bot is not in leaderboard room"))?;
         let txn_id: OwnedTransactionId = transaction_id.clone().into();
-        let response = room
-            .send(crate::leaderboard::monthly_content(
-                month,
-                question_count,
-                &entries,
-            ))
-            .with_transaction_id(txn_id)
-            .await?;
+        let event_id = mxbot_common::send::send_with_retry_txn(
+            &room,
+            crate::leaderboard::monthly_content(month, question_count, &entries),
+            &txn_id,
+        )
+        .await?;
         ctx.db
-            .complete_monthly_post(&period, response.response.event_id.as_str())
+            .complete_monthly_post(&period, event_id.as_str())
             .await?;
         info!(
             period,

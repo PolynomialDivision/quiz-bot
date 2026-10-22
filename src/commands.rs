@@ -469,7 +469,11 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     let times_str = if s.quiz_times.is_empty() {
         "not scheduled".to_owned()
     } else {
-        s.quiz_times.join(", ")
+        s.quiz_times
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let mut lines = vec![
@@ -644,12 +648,7 @@ async fn cmd_schedulequiz(
         None => return Ok(Some(format!("❌ Invalid: \"{time_arg}\" · use HH:MM"))),
     };
 
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx.config.schedule.timezone;
     let local_now = chrono::Utc::now().with_timezone(&tz);
     let offset = ctx
         .config

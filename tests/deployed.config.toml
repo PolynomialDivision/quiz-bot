@@ -1,0 +1,50 @@
+# A copy of the config house-infra renders (stacks/matrix-bots/secrets/quiz-bot.config.toml.j2), placeholder secrets. Must keep loading.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@quiz-bot:example.org"
+device_id = "HOUSEINFRAQUIZBOT"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_inviters = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_rooms = ["!Kd5NOiDsK-_Q_Ime_mWyI-4sbfNDVBvP8cDLBU6To0c"]
+dm_rooms = ["!Kd5NOiDsK-_Q_Ime_mWyI-4sbfNDVBvP8cDLBU6To0c"]
+encryption_strategy = "identity_based"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = false
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[schedule]
+room_id = "!Kd5NOiDsK-_Q_Ime_mWyI-4sbfNDVBvP8cDLBU6To0c"   # its own room (make matrix-rooms)
+quiz_times = ["12:00", "20:00"]
+questions_per_round = 5
+answer_timeout_secs = 60
+inter_question_secs = 10
+reminder_before_secs = [300, 60]
+timezone = "Europe/Berlin"
+
+[trivia]
+excluded_categories = ["Sports", "Celebrities"]
+batch_size = 10
+
+[trivia.triviaqa]
+# Only the default; admins switch at runtime: !admin set question_source mixed|opentdb|triviaqa
+enabled = true
+dataset_url = "https://nlp.cs.washington.edu/triviaqa/data/triviaqa-unfiltered.tar.gz"
+
+[explainer]
+api_key = "placeholder"
+model = "openai/gpt-oss-120b"

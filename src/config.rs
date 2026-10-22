@@ -1,5 +1,5 @@
-pub use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use serde::{Deserialize, Serialize};
+pub use mxbot_common::config::{MatrixConfig, SecurityConfig, TimeOfDay};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -17,8 +17,9 @@ pub struct Config {
 pub struct ScheduleConfig {
     pub room_id: String,
     /// One or more "HH:MM" times (in the configured timezone) to run the quiz.
-    /// e.g. `quiz_times = ["18:00", "21:30"]`
-    pub quiz_times: Vec<String>,
+    /// e.g. `quiz_times = ["18:00", "21:30"]`. A malformed time is refused
+    /// at startup.
+    pub quiz_times: Vec<TimeOfDay>,
     /// Seconds to collect reactions before revealing the answer.
     #[serde(default = "default_answer_timeout")]
     pub answer_timeout_secs: u64,
@@ -39,21 +40,20 @@ pub struct ScheduleConfig {
     )]
     pub reminder_before_secs: Vec<u64>,
     /// IANA timezone used for quiz scheduling (e.g. "Europe/Berlin").
-    #[serde(default = "default_timezone")]
-    pub timezone: String,
+    /// Default: UTC. An unknown name is refused at startup.
+    #[serde(
+        default = "default_timezone",
+        deserialize_with = "deserialize_timezone"
+    )]
+    pub timezone: chrono_tz::Tz,
 }
 
 impl ScheduleConfig {
-    /// Parse `"HH:MM"` into `(hour, minute)`.  Returns `None` on invalid input.
+    /// Parse `"HH:MM"` (typed with `!schedulequiz`, or stored with a
+    /// one-time quiz) into `(hour, minute)`.  Returns `None` on invalid input.
     pub fn parse_quiz_time(s: &str) -> Option<(u32, u32)> {
-        let (h, m) = s.split_once(':')?;
-        let hour: u32 = h.trim().parse().ok()?;
-        let minute: u32 = m.trim().parse().ok()?;
-        if hour < 24 && minute < 60 {
-            Some((hour, minute))
-        } else {
-            None
-        }
+        let time: TimeOfDay = s.parse().ok()?;
+        Some((time.hour, time.minute))
     }
 }
 
@@ -99,8 +99,20 @@ where
     }
     d.deserialize_any(V)
 }
-fn default_timezone() -> String {
-    "UTC".to_owned()
+fn default_timezone() -> chrono_tz::Tz {
+    chrono_tz::UTC
+}
+
+/// An IANA timezone name such as "Europe/Berlin".
+fn deserialize_timezone<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<chrono_tz::Tz, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    name.trim().parse().map_err(|_| {
+        serde::de::Error::custom(format!(
+            "unknown timezone {name:?} (expected an IANA name such as \"Europe/Berlin\")"
+        ))
+    })
 }
 
 #[derive(Deserialize)]
@@ -300,6 +312,42 @@ mod tests {
         .is_err());
         assert_eq!(QuestionSource::parse("AI"), Some(QuestionSource::Triviaqa));
         assert_eq!(QuestionSource::parse("x"), None);
+    }
+
+    /// The config house-infra renders today (stacks/matrix-bots/secrets/
+    /// quiz-bot.config.toml.j2, with placeholder secrets) still loads.
+    #[test]
+    fn the_deployed_config_parses() {
+        let config: Config = toml::from_str(include_str!("../tests/deployed.config.toml")).unwrap();
+        let s = &config.schedule;
+        assert_eq!(s.quiz_times, [TimeOfDay::new(12, 0), TimeOfDay::new(20, 0)]);
+        assert_eq!(s.timezone, chrono_tz::Europe::Berlin);
+        assert_eq!(s.reminder_before_secs, [300, 60]);
+        assert!(config.trivia.triviaqa.enabled);
+        config.security.validate().unwrap();
+    }
+
+    fn schedule(extra: &str) -> Result<ScheduleConfig, toml::de::Error> {
+        toml::from_str(&format!("room_id = \"!room:example.org\"\n{extra}"))
+    }
+
+    #[test]
+    fn quiz_times_and_timezone_are_checked_at_load() {
+        let s = schedule("quiz_times = [\"12:00\", \"8:30\"]").unwrap();
+        assert_eq!(s.quiz_times, [TimeOfDay::new(12, 0), TimeOfDay::new(8, 30)]);
+        assert_eq!(s.timezone, chrono_tz::UTC);
+        for bad in ["24:00", "12:60", "noon", "12", ""] {
+            let Err(e) = schedule(&format!("quiz_times = [\"12:00\", \"{bad}\"]")) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(e.to_string().contains("time"), "{bad}: {e}");
+        }
+        let Err(e) = schedule("quiz_times = []\ntimezone = \"Europe/Berln\"") else {
+            panic!("a misspelt timezone was accepted");
+        };
+        assert!(e.to_string().contains("unknown timezone"), "{e}");
+        assert_eq!(ScheduleConfig::parse_quiz_time(" 9:05 "), Some((9, 5)));
+        assert_eq!(ScheduleConfig::parse_quiz_time("9"), None);
     }
 
     #[test]

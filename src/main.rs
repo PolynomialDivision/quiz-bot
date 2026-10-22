@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mxbot_common::{
     admin::Dispatch,
     matrix_sdk::{
@@ -15,6 +15,7 @@ use mxbot_common::{
         },
         Client, Room, RoomState,
     },
+    send::send_with_retry,
     send::{in_thread, thread_root},
     settings::Settings,
     Bot,
@@ -88,11 +89,6 @@ async fn main() -> Result<()> {
 
     let config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
-    config
-        .schedule
-        .timezone
-        .parse::<chrono_tz::Tz>()
-        .with_context(|| format!("Invalid schedule timezone {:?}", config.schedule.timezone))?;
     let config = Arc::new(config);
 
     let store_path = mxbot_common::config::store_path_from_env();
@@ -173,7 +169,7 @@ async fn main() -> Result<()> {
                         };
                         if let Some(reply) = command_reply(&ctx, &ev.sender, text.body.trim()).await
                         {
-                            room.send(reply).await.ok();
+                            send_with_retry(&room, reply).await.ok();
                         }
                         return;
                     }
@@ -211,9 +207,12 @@ async fn main() -> Result<()> {
                 // Regular commands.
                 if let Some(reply) = command_reply(&ctx, &ev.sender, body).await {
                     if let Some(r) = client.get_room(&ctx.room_id) {
-                        r.send(in_thread(reply, thread_root(&ev), ev.event_id.clone()))
-                            .await
-                            .ok();
+                        send_with_retry(
+                            &r,
+                            in_thread(reply, thread_root(&ev), ev.event_id.clone()),
+                        )
+                        .await
+                        .ok();
                     }
                 }
             }

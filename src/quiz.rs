@@ -1,4 +1,5 @@
 use mxbot_common::matrix_sdk;
+use mxbot_common::send::{send_with_retry, send_with_retry_txn};
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
@@ -245,30 +246,35 @@ fn make_edit(event_id: OwnedEventId, text: &str) -> RoomMessageEventContent {
 /// 503s) can fail a single request for ~30 s before recovering on its own.
 /// Without a retry here, that single failed request used to abort the
 /// entire round via `?`: losing every remaining question and leaving the
-/// round's DB record permanently unfinished. Mirrors the retry shape already
-/// used for OpenTDB requests in fetcher.rs.
+/// round's DB record permanently unfinished.
+///
+/// mxbot-common's `send_with_retry_txn` retries transient failures (429,
+/// 5xx, network) for about 15 s; a few such runs cover the ~30 s hiccup.
+/// Every attempt reuses one transaction ID, so a retry after a lost
+/// response can't post the question twice. Permanent errors are not
+/// retried.
 async fn send_question_with_retry(
     room: &Room,
     content: &RoomMessageEventContent,
 ) -> anyhow::Result<OwnedEventId> {
-    const MAX_ATTEMPTS: u32 = 5;
-    let mut last_err = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            let delay = 2u64.pow(attempt - 1).min(30); // 1 s, 2 s, 4 s, 8 s, 16 s
-            warn!("Posting question failed, retry {attempt}/{MAX_ATTEMPTS} in {delay}s");
-            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-        }
-        match room.send(content.clone()).await {
-            Ok(resp) => return Ok(resp.response.event_id),
-            Err(e) => last_err = Some(e),
+    const RUNS: u32 = 3;
+    let txn_id = matrix_sdk::ruma::TransactionId::new();
+    let mut run = 1;
+    loop {
+        match send_with_retry_txn(room, content.clone(), &txn_id).await {
+            Ok(event_id) => return Ok(event_id),
+            Err(e) if run < RUNS && mxbot_common::send::classify_error(&e).0 => {
+                warn!("Posting question failed ({e}), trying again ({run}/{RUNS})");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                run += 1;
+            }
+            Err(e) => {
+                return Err(e).context(format!(
+                    "failed to post question (attempt run {run}/{RUNS})"
+                ))
+            }
         }
     }
-
-    Err(last_err.expect("loop runs MAX_ATTEMPTS >= 1 time")).context(format!(
-        "failed to post question after {MAX_ATTEMPTS} attempts"
-    ))
 }
 
 // ── Reaction reconciliation ───────────────────────────────────────────────────
@@ -580,6 +586,10 @@ pub async fn start_quiz(
         } else {
             "questions"
         };
+        // The quiz starts `reminders[0]` from now, however long the
+        // reminder sends take (retries included).
+        let starts_at =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(reminders[0]);
         for i in 0..reminders.len() {
             let secs_before = reminders[i];
             let time_str = format_countdown(secs_before);
@@ -588,24 +598,20 @@ pub async fn start_quiz(
             let html  = format!("🧠 <strong>Quiz starting in {time_str}!</strong> @room<br>{n_questions} {qs} incoming.");
             let mut mentions = Mentions::new();
             mentions.room = true;
-            room.send(RoomMessageEventContent::text_html(plain, html).add_mentions(mentions))
-                .await
-                .ok();
-            let sleep_secs = if i + 1 < reminders.len() {
-                reminders[i] - reminders[i + 1] // gap to next reminder
-            } else {
-                reminders[i] // final wait until quiz starts
-            };
-            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+            send_with_retry(
+                &room,
+                RoomMessageEventContent::text_html(plain, html).add_mentions(mentions),
+            )
+            .await
+            .ok();
+            // Until the next reminder, or after the last one until the quiz.
+            let before_start = reminders.get(i + 1).copied().unwrap_or(0);
+            tokio::time::sleep_until(starts_at - tokio::time::Duration::from_secs(before_start))
+                .await;
         }
     }
 
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx.config.schedule.timezone;
     let local_date = chrono::Utc::now().with_timezone(&tz).date_naive();
     let leaderboard_month = crate::leaderboard::YearMonth::containing(local_date);
 
@@ -619,10 +625,9 @@ pub async fn start_quiz(
     let questions: Vec<state::FetchedQuestion> = prefetch_handle.await.unwrap_or_default();
     let Some(round_len) = resolve_round_length(questions.len(), n_questions) else {
         error!("Round prefetch returned no usable questions, skipping this round");
-        room.send(RoomMessageEventContent::text_plain(
+        send_with_retry(&room, RoomMessageEventContent::text_plain(
             "⚠️ Couldn't prepare any questions for this round.\n📭 No question source is available, so I'm skipping it.",
-        ))
-        .await
+        )).await
         .ok();
         return Ok(());
     };
@@ -644,7 +649,7 @@ pub async fn start_quiz(
             triggered_by: &triggered_by,
             config_answer_timeout: timeout as i32,
             config_questions_per_round: n_questions as i32,
-            config_timezone: &ctx.config.schedule.timezone,
+            config_timezone: ctx.config.schedule.timezone.name(),
             config_category_id: ctx.config.trivia.category.map(|c| c as i32),
             config_difficulty: ctx.config.trivia.difficulty.as_deref(),
         })
@@ -687,11 +692,14 @@ pub async fn start_quiz(
                     questions_asked,
                     "Ending round early: could not post question after retries: {e:#}"
                 );
-                room.send(RoomMessageEventContent::text_plain(format!(
-                    "⚠️ Lost connection to Matrix while posting Q{q_num}/{round_len}.\n\
+                send_with_retry(
+                    &room,
+                    RoomMessageEventContent::text_plain(format!(
+                        "⚠️ Lost connection to Matrix while posting Q{q_num}/{round_len}.\n\
                      🏁 Ending the round early ({questions_asked} question{} completed).",
-                    if questions_asked == 1 { "" } else { "s" }
-                )))
+                        if questions_asked == 1 { "" } else { "s" }
+                    )),
+                )
                 .await
                 .ok();
                 break;
@@ -731,10 +739,10 @@ pub async fn start_quiz(
 
         // ── Bot reacts so users can just tap ──────────────────────────────────
         for emoji in &CHOICE_EMOJIS[..choices.len()] {
-            room.send(ReactionEventContent::new(Annotation::new(
-                q_event_id.clone(),
-                emoji.to_string(),
-            )))
+            send_with_retry(
+                &room,
+                ReactionEventContent::new(Annotation::new(q_event_id.clone(), emoji.to_string())),
+            )
             .await
             .ok();
         }
@@ -751,23 +759,33 @@ pub async fn start_quiz(
         }
 
         // ── Countdown ─────────────────────────────────────────────────────────
+        // Against a deadline: a slow (retried) edit doesn't lengthen the
+        // time to answer.
         const EDIT_INTERVAL: u64 = 15;
+        let answers_close = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout);
         let mut remaining = timeout;
         while remaining > EDIT_INTERVAL {
-            tokio::time::sleep(tokio::time::Duration::from_secs(EDIT_INTERVAL)).await;
             remaining -= EDIT_INTERVAL;
-            room.send(make_edit(
-                q_event_id.clone(),
-                &question_text(q_num, round_len, &fetched, &choices, timeout, remaining),
-            ))
+            tokio::time::sleep_until(answers_close - tokio::time::Duration::from_secs(remaining))
+                .await;
+            send_with_retry(
+                &room,
+                make_edit(
+                    q_event_id.clone(),
+                    &question_text(q_num, round_len, &fetched, &choices, timeout, remaining),
+                ),
+            )
             .await
             .ok();
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
-        room.send(make_edit(
-            q_event_id.clone(),
-            &question_text(q_num, round_len, &fetched, &choices, timeout, 0),
-        ))
+        tokio::time::sleep_until(answers_close).await;
+        send_with_retry(
+            &room,
+            make_edit(
+                q_event_id.clone(),
+                &question_text(q_num, round_len, &fetched, &choices, timeout, 0),
+            ),
+        )
         .await
         .ok();
 
@@ -880,16 +898,15 @@ pub async fn start_quiz(
             if let Err(e) = ctx.db.update_display_names(&names).await {
                 warn!("DB update_display_names failed: {e}");
             }
-            let send_result = room
-                .send(crate::format::mentionify_with_names(
-                    &result_lines.join("\n"),
-                    &names,
-                ))
-                .await;
+            let send_result = send_with_retry(
+                &room,
+                crate::format::mentionify_with_names(&result_lines.join("\n"), &names),
+            )
+            .await;
 
             // If configured, post a quiz explanation (+ image) as a thread reply.
             if let (Ok(resp), Some(api_key)) = (send_result, ctx.config.explainer.api_key.clone()) {
-                let result_event_id = resp.response.event_id;
+                let result_event_id = resp;
                 let model = ctx.config.explainer.model.clone();
                 let question = fetched.question.clone();
                 let answer = fetched.correct_answer.clone();
@@ -932,7 +949,7 @@ pub async fn start_quiz(
                                 img_msg.relates_to = Some(Relation::Thread(
                                     Thread::without_fallback(result_event_id.clone()),
                                 ));
-                                room2.send(img_msg).await.ok();
+                                send_with_retry(&room2, img_msg).await.ok();
                             }
                         }
                     }
@@ -944,7 +961,7 @@ pub async fn start_quiz(
                         result_event_id.clone(),
                         result_event_id,
                     )));
-                    room2.send(content).await.ok();
+                    send_with_retry(&room2, content).await.ok();
                 });
             }
         }
@@ -1030,7 +1047,7 @@ pub async fn start_quiz(
         // everyone who played this month, and they shouldn't be pinged by a
         // round they sat out.
         content.mentions = Some(round_mentions(round_scores.keys()));
-        room.send(content).await.ok();
+        send_with_retry(&room, content).await.ok();
     }
 
     info!("Quiz round finished ({questions_asked} questions)");
