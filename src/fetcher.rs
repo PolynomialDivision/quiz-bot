@@ -55,6 +55,15 @@ pub const QUESTION_REUSE_COOLDOWN_DAYS: i64 = 60;
 // more retries.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(5_500);
 
+/// The spacing `throttle()` actually enforces. Unit tests talk to local mock
+/// servers, never to OpenTDB, and share the one process-wide gate, so they
+/// would otherwise queue 5.5 s behind each other; the spacing math itself is
+/// covered by the `remaining_wait` tests against `MIN_REQUEST_INTERVAL`.
+#[cfg(not(test))]
+const THROTTLE_INTERVAL: Duration = MIN_REQUEST_INTERVAL;
+#[cfg(test)]
+const THROTTLE_INTERVAL: Duration = Duration::ZERO;
+
 static LAST_REQUEST: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 /// How much longer to wait before the next request is allowed, given when
@@ -69,7 +78,7 @@ fn remaining_wait(previous_request: Instant, now: Instant, min_interval: Duratio
 async fn throttle() {
     let mut last = LAST_REQUEST.lock().await;
     if let Some(prev) = *last {
-        let wait = remaining_wait(prev, Instant::now(), MIN_REQUEST_INTERVAL);
+        let wait = remaining_wait(prev, Instant::now(), THROTTLE_INTERVAL);
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
