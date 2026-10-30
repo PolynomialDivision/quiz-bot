@@ -37,6 +37,7 @@ use std::io::Read;
 use std::sync::LazyLock;
 
 use anyhow::Context;
+use mxbot_common::supervise::Alive;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -682,8 +683,9 @@ pub async fn classify_batch(ctx: &BotContext) -> Option<BatchOutcome> {
 
 /// Background task: keep `READY_TARGET` classified questions in stock, so a
 /// round never waits for the LLM. Idles while the source is `opentdb`.
-pub async fn keep_stocked(ctx: BotContext) {
+pub async fn keep_stocked(ctx: BotContext, alive: Alive) {
     loop {
+        alive.tick();
         let wait = match stock_step(&ctx).await {
             Some(true) => 30,
             _ => 600,

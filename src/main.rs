@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use mxbot_common::{
@@ -18,6 +18,7 @@ use mxbot_common::{
     send::send_with_retry,
     send::{in_thread, thread_root},
     settings::Settings,
+    supervise::supervise_ticking,
     Bot,
 };
 use tokio::sync::Mutex;
@@ -318,8 +319,16 @@ async fn main() -> Result<()> {
     bot.initial_sync().await;
     info!("Initial sync complete");
 
-    tokio::spawn(triviaqa::keep_stocked(ctx.clone()));
-    tokio::spawn(scheduler::run(ctx, client.clone()));
+    // Rounds up to 10 minutes apart, each a few LLM calls with retries (or
+    // the one-time dataset download).
+    supervise_ticking("question stock", Duration::from_secs(60 * 60), |alive| {
+        triviaqa::keep_stocked(ctx.clone(), alive)
+    });
+    // A round every 20 seconds; the monthly leaderboard post retries for a
+    // few minutes at most.
+    supervise_ticking("quiz scheduler", Duration::from_secs(10 * 60), |alive| {
+        scheduler::run(ctx, client.clone(), alive)
+    });
 
     bot.run().await
 }

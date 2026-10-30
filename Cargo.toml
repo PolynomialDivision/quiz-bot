@@ -29,3 +29,8 @@ toml        = "0.8"
 wiremock    = "0.6"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["testing"] }
 tokio       = { version = "1", features = ["test-util"] }
+
+# A panic anywhere ends the bot and Docker restarts it, as a supervised task
+# that ends does (mxbot_common::supervise).
+[profile.release]
+panic = "abort"

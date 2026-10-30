@@ -1,7 +1,7 @@
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use chrono_tz::Tz;
 use matrix_sdk::{ruma::OwnedTransactionId, Client};
-use mxbot_common::matrix_sdk;
+use mxbot_common::{matrix_sdk, supervise::Alive};
 use tracing::{error, info, warn};
 
 use crate::{config::ScheduleConfig, state::ScheduledOnce, BotContext};
@@ -13,12 +13,13 @@ const FIRE_GRACE_SECS: i64 = 5 * 60;
 
 /// Background task: check every 20 seconds whether it's time to fire any
 /// configured quiz slot.
-pub async fn run(ctx: BotContext, client: Client) {
+pub async fn run(ctx: BotContext, client: Client, alive: Alive) {
     info!("Quiz scheduler started");
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        alive.tick();
         if let Err(e) = tick(&ctx, &client).await {
             error!("Scheduler error: {e}");
         }
