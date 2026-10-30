@@ -1,4 +1,5 @@
 use mxbot_common::matrix_sdk;
+use mxbot_common::media;
 use mxbot_common::send::{send_with_retry, send_with_retry_txn};
 use std::{collections::HashMap, sync::Arc};
 
@@ -10,8 +11,11 @@ use matrix_sdk::{
             reaction::ReactionEventContent,
             relation::{Annotation, Thread},
             room::{
-                message::{Relation, ReplacementMetadata, RoomMessageEventContent},
-                ImageInfo,
+                message::{
+                    ImageMessageEventContent, MessageType, Relation, ReplacementMetadata,
+                    RoomMessageEventContent,
+                },
+                ImageInfo, MediaSource,
             },
         },
         OwnedEventId, UInt,
@@ -911,7 +915,6 @@ pub async fn start_quiz(
                 let question = fetched.question.clone();
                 let answer = fetched.correct_answer.clone();
                 let room2 = room.clone();
-                let client2 = client.clone();
                 tokio::spawn(async move {
                     let Some(result) =
                         crate::explainer::explain(&question, &answer, &api_key, &model).await
@@ -925,30 +928,19 @@ pub async fn start_quiz(
                         if let Some((bytes, ct)) =
                             crate::explainer::fetch_image_bytes(&img_url).await
                         {
-                            use matrix_sdk::ruma::events::room::message::{
-                                ImageMessageEventContent, MessageType,
-                            };
                             let mime: mime::Mime = ct.parse().unwrap_or(mime::IMAGE_JPEG);
                             let dims = crate::explainer::image_dimensions(&bytes);
                             let size = bytes.len();
-                            if let Ok(upload) = client2.media().upload(&mime, bytes, None).await {
-                                let mut img_content = ImageMessageEventContent::plain(
+                            // Encrypted for an encrypted room.
+                            if let Ok(source) = media::upload(&room2, &mime, bytes).await {
+                                let img_msg = explainer_image_content(
                                     answer.clone(),
-                                    upload.content_uri,
+                                    source,
+                                    ct,
+                                    size,
+                                    dims,
+                                    result_event_id.clone(),
                                 );
-                                let mut info = ImageInfo::new();
-                                info.mimetype = Some(ct);
-                                info.size = UInt::new(size as u64);
-                                if let Some((w, h)) = dims {
-                                    info.width = UInt::new(w as u64);
-                                    info.height = UInt::new(h as u64);
-                                }
-                                img_content.info = Some(Box::new(info));
-                                let mut img_msg =
-                                    RoomMessageEventContent::new(MessageType::Image(img_content));
-                                img_msg.relates_to = Some(Relation::Thread(
-                                    Thread::without_fallback(result_event_id.clone()),
-                                ));
                                 send_with_retry(&room2, img_msg).await.ok();
                             }
                         }
@@ -1097,9 +1089,82 @@ fn round_podium_lines(
     lines
 }
 
+/// The explainer's image under the result, in its thread: the answer as body, the type as
+/// the server sent it, size and dimensions when known.
+fn explainer_image_content(
+    answer: String,
+    source: MediaSource,
+    content_type: String,
+    size: usize,
+    dims: Option<(u32, u32)>,
+    result_event_id: OwnedEventId,
+) -> RoomMessageEventContent {
+    let mut img_content = ImageMessageEventContent::new(answer, source);
+    let mut info = ImageInfo::new();
+    info.mimetype = Some(content_type);
+    info.size = UInt::new(size as u64);
+    if let Some((w, h)) = dims {
+        info.width = UInt::new(w as u64);
+        info.height = UInt::new(h as u64);
+    }
+    img_content.info = Some(Box::new(info));
+    let mut img_msg = RoomMessageEventContent::new(MessageType::Image(img_content));
+    img_msg.relates_to = Some(Relation::Thread(Thread::without_fallback(result_event_id)));
+    img_msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_explainer_image_in_a_plain_room_is_a_thread_image_with_a_url() {
+        let content = explainer_image_content(
+            "Lisbon".to_owned(),
+            MediaSource::Plain("mxc://example.org/abc".into()),
+            "image/jpeg".to_owned(),
+            5000,
+            Some((640, 480)),
+            "$result:example.org".try_into().unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            serde_json::json!({
+                "msgtype": "m.image",
+                "body": "Lisbon",
+                "url": "mxc://example.org/abc",
+                "info": { "mimetype": "image/jpeg", "size": 5000, "w": 640, "h": 480 },
+                "m.relates_to": { "rel_type": "m.thread", "event_id": "$result:example.org" }
+            })
+        );
+    }
+
+    #[test]
+    fn the_explainer_image_in_an_encrypted_room_carries_the_key_not_a_url() {
+        let file = serde_json::from_value(serde_json::json!({
+            "url": "mxc://example.org/enc",
+            "key": {
+                "kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR",
+                "k": "qcHVMSgYg-71CauWBezXI5qkaRb0LuIy-Wx5kIaHMIA", "ext": true
+            },
+            "iv": "X85+XgHN+HEAAAAAAAAAAA",
+            "hashes": { "sha256": "5qG4fFnbbVdlAB1Q72JDKwCagV6Dbkx9uds4rSak37c" },
+            "v": "v2"
+        }))
+        .unwrap();
+        let content = explainer_image_content(
+            "Lisbon".to_owned(),
+            MediaSource::Encrypted(Box::new(file)),
+            "image/png".to_owned(),
+            42,
+            None,
+            "$result:example.org".try_into().unwrap(),
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.get("url").is_none(), "{json}");
+        assert_eq!(json["file"]["url"], "mxc://example.org/enc");
+        assert_eq!(json["m.relates_to"]["rel_type"], "m.thread");
+    }
 
     #[test]
     fn resolve_round_length_caps_at_questions_gathered() {
