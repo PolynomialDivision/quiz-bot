@@ -589,7 +589,7 @@ fn parse_batch(raw: &str, rows: &[TriviaQaRow]) -> Vec<(i64, Verdict)> {
 }
 
 /// Outcome of one `classify_batch` call.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BatchOutcome {
     pub ready: usize,
     pub rejected: usize,
@@ -684,31 +684,74 @@ pub async fn classify_batch(ctx: &BotContext) -> Option<BatchOutcome> {
 /// Background task: keep `READY_TARGET` classified questions in stock, so a
 /// round never waits for the LLM. Idles while the source is `opentdb`.
 pub async fn keep_stocked(ctx: BotContext, alive: Alive) {
+    // For the status file: a step at least every 10 minutes.
+    alive.expect_every(std::time::Duration::from_secs(600));
     loop {
         alive.tick();
-        let wait = match stock_step(&ctx).await {
-            Some(true) => 30,
-            _ => 600,
-        };
-        tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+        let step = stock_step(&ctx).await;
+        step.report(&alive);
+        tokio::time::sleep(tokio::time::Duration::from_secs(step.wait_secs())).await;
     }
 }
 
-/// One step of `keep_stocked`: `Some(true)` if it classified a batch and
-/// more are needed.
-async fn stock_step(ctx: &BotContext) -> Option<bool> {
+/// What one step of `keep_stocked` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StockStep {
+    /// TriviaQA is off (the `opentdb` source, or no Groq key).
+    Off,
+    /// Nothing to classify: the stock is full, or the pool is empty.
+    Full,
+    /// Reading the stock failed.
+    StatsFailed,
+    /// The LLM (or reading the pool) was unavailable.
+    ClassifyFailed,
+    /// A batch was classified.
+    Classified(BatchOutcome),
+}
+
+impl StockStep {
+    /// Again after 30 s when a batch was classified and more are needed, else 10 min.
+    fn wait_secs(self) -> u64 {
+        match self {
+            StockStep::Classified(o) if o.ready + o.rejected + o.failed > 0 => 30,
+            _ => 600,
+        }
+    }
+
+    /// For the status file: classified questions ok, every question failing a failure,
+    /// nothing to do idle.
+    fn report(self, alive: &Alive) {
+        match self {
+            StockStep::Off | StockStep::Full => alive.idle(),
+            StockStep::StatsFailed => alive.failed("reading the question stock failed"),
+            StockStep::ClassifyFailed => alive.failed("classifying a batch failed"),
+            StockStep::Classified(o) if o.ready + o.rejected > 0 => alive.ok(),
+            StockStep::Classified(o) if o.failed > 0 => {
+                alive.failed(format!("classifying {} questions failed", o.failed));
+            }
+            StockStep::Classified(_) => alive.idle(),
+        }
+    }
+}
+
+/// One step of `keep_stocked`.
+async fn stock_step(ctx: &BotContext) -> StockStep {
     if ctx.settings.get().question_source == QuestionSource::Opentdb
         || ctx.config.explainer.api_key.is_none()
     {
-        return None;
+        return StockStep::Off;
     }
     ensure_ingested(ctx.clone()).await;
-    let stats = ctx.db.triviaqa_stats(GENERATION_VERSION).await.ok()?;
+    let Ok(stats) = ctx.db.triviaqa_stats(GENERATION_VERSION).await else {
+        return StockStep::StatsFailed;
+    };
     if stats.total == 0 || stats.ready >= READY_TARGET {
-        return Some(false);
+        return StockStep::Full;
     }
-    let outcome = classify_batch(ctx).await?;
-    Some(outcome.ready + outcome.rejected + outcome.failed > 0)
+    match classify_batch(ctx).await {
+        Some(outcome) => StockStep::Classified(outcome),
+        None => StockStep::ClassifyFailed,
+    }
 }
 
 // ── Public: offer a question for a round slot ────────────────────────────────
@@ -847,6 +890,52 @@ pub async fn preview(
 #[cfg(test)]
 mod triviaqa_tests {
     use super::*;
+
+    #[test]
+    fn a_stock_step_waits_and_reports_as_before() {
+        use mxbot_common::supervise::{report, snapshot, Outcome};
+        let batch = |ready, rejected, failed| BatchOutcome {
+            ready,
+            rejected,
+            failed,
+        };
+        assert_eq!(StockStep::Classified(batch(1, 0, 0)).wait_secs(), 30);
+        assert_eq!(StockStep::Classified(batch(0, 0, 2)).wait_secs(), 30);
+        assert_eq!(StockStep::Classified(batch(0, 0, 0)).wait_secs(), 600);
+        for other in [
+            StockStep::Off,
+            StockStep::Full,
+            StockStep::StatsFailed,
+            StockStep::ClassifyFailed,
+        ] {
+            assert_eq!(other.wait_secs(), 600);
+        }
+        let last = |step: StockStep| {
+            let alive = report("stock step under test");
+            step.report(&alive);
+            snapshot()
+                .into_iter()
+                .find(|t| t.name == "stock step under test")
+                .unwrap()
+                .last_outcome
+        };
+        assert_eq!(last(StockStep::Off), Some(Outcome::Idle));
+        assert_eq!(last(StockStep::Full), Some(Outcome::Idle));
+        assert_eq!(
+            last(StockStep::Classified(batch(0, 0, 0))),
+            Some(Outcome::Idle)
+        );
+        assert_eq!(
+            last(StockStep::Classified(batch(2, 1, 1))),
+            Some(Outcome::Ok)
+        );
+        assert_eq!(
+            last(StockStep::Classified(batch(0, 0, 3))),
+            Some(Outcome::Failed)
+        );
+        assert_eq!(last(StockStep::StatsFailed), Some(Outcome::Failed));
+        assert_eq!(last(StockStep::ClassifyFailed), Some(Outcome::Failed));
+    }
 
     // ── parse_dataset ────────────────────────────────────────────────────
 

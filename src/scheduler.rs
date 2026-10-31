@@ -17,13 +17,63 @@ pub async fn run(ctx: BotContext, client: Client, alive: Alive) {
     info!("Quiz scheduler started");
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // For the status file: a round should succeed every 20 seconds.
+    alive.expect_every(std::time::Duration::from_secs(20));
     loop {
         interval.tick().await;
         alive.tick();
-        if let Err(e) = tick(&ctx, &client).await {
-            error!("Scheduler error: {e}");
+        match tick(&ctx, &client).await {
+            Ok(true) => alive.ok(),
+            Ok(false) => alive.idle(),
+            Err(e) => {
+                error!("Scheduler error: {e}");
+                alive.failed(format!("scheduler round failed: {e}"));
+            }
         }
+        alive.next_due(next_fire(&ctx));
     }
+}
+
+/// When the next recurring quiz fires (its first reminder), for the status file.
+fn next_fire(ctx: &BotContext) -> Option<std::time::SystemTime> {
+    let tz: Tz = ctx.config.schedule.timezone;
+    let now = chrono::Utc::now().with_timezone(&tz).naive_local();
+    let offset = max_reminder(ctx);
+    let fires = ctx
+        .config
+        .schedule
+        .quiz_times
+        .iter()
+        .map(|t| fire_secs(t.hour, t.minute, offset));
+    next_fire_after(now, fires)?
+        .and_local_timezone(tz)
+        .earliest()
+        .map(|at| std::time::SystemTime::from(at.with_timezone(&chrono::Utc)))
+}
+
+/// The first fire moment strictly after `now`, today or tomorrow.
+fn next_fire_after(now: NaiveDateTime, fires: impl Iterator<Item = i64>) -> Option<NaiveDateTime> {
+    fires
+        .map(|secs| {
+            let today = fire_moment(now.date(), secs);
+            if today > now {
+                today
+            } else {
+                today + chrono::Duration::days(1)
+            }
+        })
+        .min()
+}
+
+/// The earliest reminder before a quiz, in seconds: when a slot fires.
+fn max_reminder(ctx: &BotContext) -> i64 {
+    ctx.config
+        .schedule
+        .reminder_before_secs
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0) as i64
 }
 
 /// Seconds after local midnight at which a quiz starting at `qh:qm` fires
@@ -49,19 +99,14 @@ fn due_fire_date(now: NaiveDateTime, fire_secs: i64) -> Option<NaiveDate> {
         })
 }
 
-async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
+/// One scheduler round; `true` when it started a quiz.
+async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<bool> {
     let tz: Tz = ctx.config.schedule.timezone;
     let local_now = chrono::Utc::now().with_timezone(&tz);
     let local_date = local_now.date_naive();
     let now = local_now.naive_local();
-    let offset = ctx
-        .config
-        .schedule
-        .reminder_before_secs
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0) as i64;
+    let offset = max_reminder(ctx);
+    let mut started = false;
 
     for quiz_time in &ctx.config.schedule.quiz_times {
         let (qh, qm) = (quiz_time.hour, quiz_time.minute);
@@ -109,6 +154,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let ctx2 = ctx.clone();
         let client2 = client.clone();
         let slot = time_str.clone();
+        started = true;
         tokio::spawn(async move {
             if let Err(e) = crate::quiz::start_quiz(ctx2, client2, false, Some(slot), None).await {
                 error!("Quiz error: {e}");
@@ -156,6 +202,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         }
 
         info!("One-time quiz firing for {}", entry.quiz_time);
+        started = true;
         let ctx2 = ctx.clone();
         let client2 = client.clone();
         tokio::spawn(async move {
@@ -171,7 +218,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         post_previous_month(ctx, client, tz, local_date).await?;
     }
 
-    Ok(())
+    Ok(started)
 }
 
 async fn remove_once(ctx: &BotContext, entry: &ScheduledOnce) {
@@ -265,6 +312,24 @@ mod tests {
             Some(day("2026-09-25"))
         );
         assert_eq!(due_fire_date(at("2026-09-25", "20:00:00"), fire), None);
+    }
+
+    #[test]
+    fn the_next_fire_is_the_first_slot_after_now() {
+        let fires = || [fire_secs(20, 0, 300), fire_secs(12, 0, 0)].into_iter();
+        assert_eq!(
+            next_fire_after(at("2026-09-25", "10:00:00"), fires()),
+            Some(at("2026-09-25", "12:00:00"))
+        );
+        assert_eq!(
+            next_fire_after(at("2026-09-25", "19:55:00"), fires()),
+            Some(at("2026-09-26", "12:00:00")),
+            "strictly after"
+        );
+        assert_eq!(
+            next_fire_after(at("2026-09-25", "10:00:00"), [].into_iter()),
+            None
+        );
     }
 
     #[test]
