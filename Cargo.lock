@@ -2337,7 +2337,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "mxbot-common"
 version = "0.2.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#9ad7448d67c3f439a053f68dee16631f3f086525"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#bbc2c265181bbfaa238ecc40cefbb4cdec44a735"
 dependencies = [
  "anyhow",
  "futures-util",
